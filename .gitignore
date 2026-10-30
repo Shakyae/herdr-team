@@ -1,0 +1,56 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local runtime data and logs
+*.log
+logs/
+state/
+.local/
+
+# Local configuration and secrets (retain published config/team.yaml)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.p8
+*.keystore
+id_rsa*
+id_ed25519*
+credentials.json
+service-account*.json
+.npmrc
+.pypirc
+
+# Agent-local data, install state and caches
+.agents/
+.claude/
+.codex/
+.hermes/
+.config/
+.cache/
+runs/
+artifacts/
+skills-lock.json
+node_modules/
+build/
+dist/
+*.egg-info/
+*.zip
+*.tmp
+*.bak
+
+# OS and editor files
+.DS_Store
+*.DS_Store
+.idea/
+.vscode/

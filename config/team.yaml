@@ -1,0 +1,42 @@
+{
+  "version": 2,
+  "defaults": {
+    "orchestration": {"max_rounds": 5, "max_retries": 1, "max_parallel": 3, "task_timeout_seconds": 300},
+    "governance": {"autonomy": "workspace-write", "escalate": "critical", "approval": "boundary", "report": "final"},
+    "layout": {"mode": "side", "arrange": "auto"},
+    "execution": {"worktree": "auto"}
+  },
+  "agents": {
+    "claude": {"kind": "claude", "launch_args": []},
+    "hermes-work": {"kind": "hermes", "profile": "work", "launch_args": ["chat"]}
+  },
+  "stages": {
+    "plan_brief": {"actor": "lead", "gate": "brief plan recorded"},
+    "plan": {"actor": "lead", "gate": "goals, dependencies and acceptance criteria recorded"},
+    "plan_review": {"actor": "reviewer", "gate": "independent plan review passed"},
+    "implement": {"actor": "developer", "gate": "implementation evidence collected"},
+    "self_test": {"actor": "developer", "gate": "self-test evidence collected"},
+    "independent_test": {"actor": "tester", "gate": "independent test result collected"},
+    "code_review": {"actor": "reviewer", "gate": "independent code review passed"},
+    "accept": {"actor": "lead", "gate": "lead verifies objective and any required approvals"},
+    "investigate": {"actor": "researcher", "gate": "sources, dates and claims reported"},
+    "challenge": {"actor": "critic", "gate": "independent counterarguments and gaps reported"},
+    "verify": {"actor": "lead", "gate": "lead resolves important factual uncertainty"},
+    "synthesize": {"actor": "lead", "gate": "evidence-based research synthesis"},
+    "security_audit": {"actor": "security", "gate": "risk assessment with reproducibility labels"},
+    "evidence_audit": {"actor": "evidence", "gate": "sources and traceability independently checked"},
+    "audit_synthesis": {"actor": "lead", "gate": "lead reconciles findings and severity"},
+    "diagnose": {"actor": "operator", "gate": "operator reports observations and next options"},
+    "analyze": {"actor": "analyst", "gate": "analyst independently evaluates operator findings"},
+    "guided_verify": {"actor": "lead", "gate": "lead checks goal and decides whether another round is needed"}
+  },
+  "templates": {
+    "dev-lite": {"category": "development", "description": "Light development with code review, no mandatory plan review", "roles": {"developer": "claude", "reviewer": "claude"}, "workflow": ["plan_brief", "implement", "self_test", "code_review", "accept"]},
+    "dev-review": {"category": "development", "description": "Plan review plus code review", "roles": {"developer": "claude", "reviewer": "claude"}, "workflow": ["plan", "plan_review", "implement", "self_test", "code_review", "accept"]},
+    "dev-test": {"category": "development", "description": "Independent testing without mandatory reviewer", "roles": {"developer": "claude", "tester": "claude"}, "workflow": ["plan_brief", "implement", "self_test", "independent_test", "accept"]},
+    "full": {"extends": "dev-review", "category": "development", "description": "Plan review, implementation, independent test, code review", "roles": {"tester": "claude"}, "workflow": ["plan", "plan_review", "implement", "self_test", "independent_test", "code_review", "accept"]},
+    "research": {"category": "research", "description": "Research and independent critical challenge", "roles": {"researcher": "claude", "critic": "claude"}, "workflow": ["investigate", "challenge", "verify", "synthesize"], "governance": {"autonomy": "read-only"}, "execution": {"worktree": "off"}},
+    "audit": {"category": "audit", "description": "Security and evidence assessment", "roles": {"security": "claude", "evidence": "claude"}, "workflow": ["security_audit", "evidence_audit", "audit_synthesis"], "governance": {"autonomy": "read-only"}, "execution": {"worktree": "off"}},
+    "hermes-guide": {"category": "guided-execution", "description": "Hermes is the primary coached operator, Claude supports analysis", "roles": {"operator": "hermes-work", "analyst": "claude"}, "workflow": ["diagnose", "analyze", "guided_verify"], "orchestration": {"max_rounds": 8}, "governance": {"autonomy": "read-only"}, "execution": {"worktree": "off"}}
+  }
+}

@@ -1,0 +1,21 @@
+[project]
+name = "herdr-team"
+version = "4.2.0b1"
+description = "A supervised Herdr multi-agent collaboration skill for CLI agents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Shakyae" }]
+dependencies = []
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[project.urls]
+Repository = "https://github.com/Shakyae/herdr-team"
+
+[project.optional-dependencies]
+yaml = [
+    "pyyaml>=6.0,<7",
+]
