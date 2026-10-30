@@ -12,6 +12,11 @@ dependencies = []
 url = "https://pypi.org/simple"
 default = true
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
 [project.urls]
 Repository = "https://github.com/Shakyae/herdr-team"
 
