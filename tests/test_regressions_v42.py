@@ -250,6 +250,95 @@ class AdversarialTests(unittest.TestCase):
             h.read_cfg(path)
 
 
+REAL_HERDR_095_AGENT = {
+    "agent": "claude",
+    "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude",
+                      "value": "d3086539-ab07-42c9-8c68-5e653463594f"},
+    "agent_status": "done",
+    "completion_seq": 78,
+    "cwd": "/Users/shakya/dev/herdr-team",
+    "focused": False,
+    "foreground_cwd": "/Users/shakya/dev/herdr-team",
+    "interactive_ready": True,
+    "name": "developer-w2",
+    "pane_id": "w2:p2",
+    "revision": 5,
+    "state_change_seq": 78,
+    "tab_id": "w2:t1",
+    "terminal_id": "term_65f0d947e6e8a9",
+    "workspace_id": "w2",
+}
+
+
+class AgentFieldMappingTests(unittest.TestCase):
+    """Herdr 0.9.5 emits agent/agent_status; legacy kind/status must still work."""
+
+    def test_real_095_shape_kind_and_status(self):
+        for status in ('idle', 'done', 'working', 'blocked', 'unknown'):
+            agent = dict(REAL_HERDR_095_AGENT, agent_status=status)
+            with self.subTest(status=status):
+                self.assertEqual(h.agent_kind_of(agent), 'claude')
+                self.assertEqual(h.agent_status_of(agent), status)
+
+    def test_wrapped_agent_get_result_shape(self):
+        wrapped = {'agent': REAL_HERDR_095_AGENT}
+        self.assertEqual(h.agent_kind_of(wrapped), 'claude')
+        self.assertEqual(h.agent_status_of(wrapped), 'done')
+        # Idempotent: unwrapping an already-unwrapped Agent must not treat the
+        # string field "agent" as a nested object.
+        self.assertIs(h.agent_data(REAL_HERDR_095_AGENT), REAL_HERDR_095_AGENT)
+
+    def test_legacy_fields_still_supported(self):
+        legacy = {'kind': 'claude', 'status': 'idle', 'pane_id': 'w1:p2'}
+        self.assertEqual(h.agent_kind_of(legacy), 'claude')
+        self.assertEqual(h.agent_status_of(legacy), 'idle')
+        self.assertEqual(h.agent_kind_of({'agent_kind': 'hermes'}), 'hermes')
+
+    def test_new_fields_take_precedence_over_legacy(self):
+        both = {'agent': 'claude', 'kind': 'hermes', 'agent_status': 'done', 'status': 'blocked'}
+        self.assertEqual(h.agent_kind_of(both), 'claude')
+        self.assertEqual(h.agent_status_of(both), 'done')
+
+    def test_agent_session_kind_is_not_agent_kind(self):
+        only_session = {'agent_session': REAL_HERDR_095_AGENT['agent_session'], 'pane_id': 'w2:p2'}
+        self.assertIsNone(h.agent_kind_of(only_session))
+        self.assertEqual(h.agent_status_of(only_session), 'unknown')
+
+    def test_missing_fields_fail_closed(self):
+        self.assertIsNone(h.agent_kind_of({'pane_id': 'w2:p2'}))
+        self.assertEqual(h.agent_status_of({'pane_id': 'w2:p2'}), 'unknown')
+        self.assertEqual(h.agent_status_of({'agent_status': ''}), 'unknown')
+        self.assertEqual(h.agent_status_of(None), 'unknown')
+        self.assertIsNone(h.agent_kind_of(None))
+
+    def test_verify_existing_accepts_real_095_agent(self):
+        cwd = str(Path(REAL_HERDR_095_AGENT['cwd']).resolve())
+        role = {'agent_name': 'developer-w2', 'pane_id': 'w2:p2', 'kind': 'claude', 'cwd': cwd}
+        with patch.object(h, 'lookup_agent', return_value=REAL_HERDR_095_AGENT):
+            self.assertTrue(h.verify_existing(role))
+
+    def test_verify_existing_rejects_missing_kind(self):
+        role = {'agent_name': 'developer-w2', 'pane_id': 'w2:p2', 'kind': 'claude'}
+        found = {k: v for k, v in REAL_HERDR_095_AGENT.items() if k != 'agent'}
+        with patch.object(h, 'lookup_agent', return_value=found):
+            with self.assertRaisesRegex(h.Error, 'no verifiable kind'):
+                h.verify_existing(role)
+
+    def test_verify_existing_skips_cwd_check_when_absent(self):
+        role = {'agent_name': 'developer-w2', 'pane_id': 'w2:p2', 'kind': 'claude',
+                'cwd': '/some/other/checkout'}
+        found = {k: v for k, v in REAL_HERDR_095_AGENT.items() if k != 'cwd'}
+        with patch.object(h, 'lookup_agent', return_value=found):
+            self.assertTrue(h.verify_existing(role))
+
+    def test_verify_existing_still_rejects_cwd_mismatch(self):
+        role = {'agent_name': 'developer-w2', 'pane_id': 'w2:p2', 'kind': 'claude',
+                'cwd': '/some/other/checkout'}
+        with patch.object(h, 'lookup_agent', return_value=REAL_HERDR_095_AGENT):
+            with self.assertRaisesRegex(h.Error, 'CWD mismatch'):
+                h.verify_existing(role)
+
+
 class WorktreeSafetyTests(unittest.TestCase):
     def test_dirty_head_rejected_before_worktree_create(self):
         cfg,_=h.read_cfg(h.DEFAULT_CONFIG)

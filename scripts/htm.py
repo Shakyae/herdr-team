@@ -314,9 +314,41 @@ def herdr(*args, timeout=40):
 
 
 def agent_data(obj):
-    if isinstance(obj, dict):
-        return obj.get("agent", obj)
+    # Herdr wraps the Agent object as {"agent": {...}} for `agent get`.
+    # An Agent object itself also carries the string field "agent" (the kind),
+    # so only unwrap when the value is actually a mapping. Idempotent.
+    if isinstance(obj, dict) and isinstance(obj.get("agent"), dict):
+        return obj["agent"]
     return obj
+
+
+def agent_kind_of(obj):
+    """Agent kind: Herdr 0.9.5 `agent`, falling back to legacy `kind`/`agent_kind`.
+
+    Returns None when no field is present (callers must fail closed).
+    """
+    obj = agent_data(obj)
+    if not isinstance(obj, dict):
+        return None
+    kind = obj.get("agent")
+    if isinstance(kind, str) and kind:
+        return kind
+    return obj.get("kind") or obj.get("agent_kind")
+
+
+def agent_status_of(obj):
+    """Agent status: Herdr 0.9.5 `agent_status`, falling back to legacy `status`.
+
+    Missing/blank status is reported as "unknown" (callers treat that as
+    uncertain, never as success).
+    """
+    obj = agent_data(obj)
+    if not isinstance(obj, dict):
+        return "unknown"
+    status = obj.get("agent_status")
+    if not (isinstance(status, str) and status):
+        status = obj.get("status")
+    return status if isinstance(status, str) and status else "unknown"
 
 
 def lookup_agent(name):
@@ -336,7 +368,7 @@ def verify_existing(team_role):
         raise Error(f"Agent {team_role['agent_name']} has no verifiable pane ID; refusing reuse")
     if observed_pane != team_role["pane_id"]:
         raise Error(f"Agent {team_role['agent_name']} is live in unexpected pane {observed_pane}; refusing reuse")
-    kind = found.get("kind") or found.get("agent_kind")
+    kind = agent_kind_of(found)
     if not kind:
         raise Error(f"Agent {team_role['agent_name']} has no verifiable kind")
     if kind != team_role["kind"]:
@@ -698,7 +730,7 @@ def run_dispatch(args):
     if not verify_existing(role):
         raise Error(f"Agent {role['agent_name']} is not live; do not send to an unknown terminal")
     live = lookup_agent(role["agent_name"])
-    live_status = live.get("status", "unknown") if isinstance(live, dict) else "unknown"
+    live_status = agent_status_of(live)
     if live_status not in ("idle", "done"):
         raise Error(f"Agent {role['agent_name']} is {live_status}; inspect before sending a new task")
     stamp = uuid.uuid4().hex[:10]
@@ -762,7 +794,7 @@ def run_dispatch(args):
                     "next": "run collect --run-id ... --dispatch-id ... before retry or passing the stage"}
         # A successful wait is only a lifecycle observation. Report identity is
         # independently verified before settling.
-        st = agent_data(result).get("status", "unknown") if isinstance(agent_data(result), dict) else "unknown"
+        st = agent_status_of(result)
         with locked():
             run = require_run(args.run_id)
             rec = next(x for x in run["dispatches"] if x["id"] == stamp)
@@ -792,7 +824,7 @@ def run_collect(args):
     role = get_role(run, rec["role"])
     if not verify_existing(role): raise Error("Registered Agent is no longer live")
     agent = lookup_agent(role["agent_name"])
-    st = agent.get("status", "unknown") if isinstance(agent, dict) else "unknown"
+    st = agent_status_of(agent)
     with locked():
         run = require_run(args.run_id)
         rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
@@ -939,7 +971,7 @@ def run_cancel(args):
             if not verify_existing(role):
                 raise Error("Worker disappeared. Do not release its reservation before manual reconciliation")
             info = lookup_agent(role["agent_name"])
-            status = info.get("status", "unknown") if isinstance(info, dict) else "unknown"
+            status = agent_status_of(info)
             if status not in ("idle", "done", "blocked"):
                 raise Error(f"Worker {role['agent_name']} is {status}; cannot safely release reservation")
         run["status"] = "cancelled"
@@ -1011,7 +1043,7 @@ def main():
                 actual = lookup_agent(r["agent_name"])
                 live.append({"role": r["role"], "agent_name": r["agent_name"],
                              "registered_pane": r["pane_id"], "live": bool(actual),
-                             "observed_state": actual.get("status", "unknown") if isinstance(actual, dict) else "missing"})
+                             "observed_state": agent_status_of(actual) if isinstance(actual, dict) else "missing"})
             emit({"template": team["template"], "stored_status": team["status"], "agents": live,
                   "worktree": team.get("worktree")}); return 0
         if args.cmd == "run":
