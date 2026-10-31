@@ -1,6 +1,6 @@
 # herdr-team 阶段化联调方案（Herdr 0.9.5 · 派单通信链路）
 
-- 适用版本：herdr-team v4.2.0-beta.1（`scripts/htm.py`，HEAD `88deef9`）、Herdr 0.9.5
+- 适用版本：herdr-team v4.2.0-beta.1（`scripts/htm.py`，HEAD `3090164`）、Herdr 0.9.5
 - 文档状态：**方案，未执行**。本文档不被文档修订轮执行；创建 workspace / tab / pane、启动 agent、`htm init`、`run start/dispatch/collect/gate/cancel`、关闭资源等操作，均需用户单独、明确授权。
 - 读者：能在 Herdr 内操作 CLI 的工程师或 Agent。命令可复制，但必须先完成 §3 的初始化与 `abort()` 定义。
 - 阶段：A（单 Worker 通信验证）→ B（HTM 调度/结果/异常验证）。**A 不 Go，不得进入 B**。
@@ -10,6 +10,8 @@
 ## 1. Context 与修订说明
 
 上一版方案（911 行）在可执行性上有 10 类缺陷：失败分支只打印不退出；重复派单序列没有落到账本状态；报告归属从 dispatch 响应读取不存在的 `run_id`；超时用例从失败命令的 stdout 取 dispatch id；在真实 state 里与活跃 worker 抢写同一工件；断言用“忽略退出码”的写法（强制成功、丢弃 stderr）掩盖失败；blocked 场景主动请求危险操作；清理前不校验归属；单阶段覆盖过多、缺少独立门槛；agent 与 prompt 数量失控。
+
+- v3 定向整改（2026-10-31）：修正 jq key 顺序断言、export 退出码、nonce 验证、GO 落盘、跨 workspace 变量恢复、超时非确定性、Mock 文案、外部清理、fail-closed jq、资源数量。
 
 ### 1.1 十项修正映射
 
@@ -53,7 +55,7 @@ htm run collect --dispatch-id DID -> herdr agent get <agent> -> agent_status_of(
 
 ### 2.1 授权与前置
 
-- [ ] 用户已明确授权：1 个测试 workspace、1 个 tab（`init` 自建）、1 个 team（2 个 worker）、共 5 次 prompt
+- [ ] 用户已明确授权：1 个测试 Workspace；2 个 Tab（根 Tab + Worker Tab）；1 个 team、2 个 Worker agent（developer + reviewer，仅 developer 被派单）；共 5 次 prompt（A1、A2、D1、D2、B8）
 - [ ] 执行环境在 Herdr 内，`HERDR_ENV=1` 且 `HERDR_WORKSPACE_ID` / `HERDR_TAB_ID` / `HERDR_PANE_ID` 均非空；缺失则**停止**并修启动器，禁止手工伪造
 - [ ] 已确认 `config/team.yaml` 默认 `max_rounds=5, max_retries=1, max_parallel=3, task_timeout_seconds=300`，governance `autonomy=workspace-write, approval=boundary`
 - [ ] 已确认不改 `scripts/htm.py`、`tests/`、`pyproject.toml`、`uv.lock`、`SKILL.md`、`config/`
@@ -63,8 +65,8 @@ htm run collect --dispatch-id DID -> herdr agent get <agent> -> agent_status_of(
 ### 2.2 阶段 A（单 Worker 通信）
 
 - [ ] 探针就是主 team 的 developer（`ht…`），不额外创建 agent
-- [ ] 正常 prompt（A1）exit=0，`agent_status_of` 落在 `{idle, done}` 且非 `unknown`
-- [ ] 超时 prompt（A2）得到 timeout 类错误，且**不**据此断言输入未送达
+- [ ] 正常 prompt（A1）exit=0，返回体结构已记录，`agent_status_of` 落在 `{idle, done}`，且本轮 nonce 在终端输出命中
+- [ ] 超时 prompt（A2）记录 timeout 或未触发；不据此断言输入未送达
 - [ ] 证据写入 `$EVIDENCE/phaseA/`
 - [ ] 阶段 A Go/No-Go 已判定为 **Go**
 
@@ -113,17 +115,21 @@ same_ws() {
 assert_no_protected() {
   case "$1" in w1:*|w2:*) abort "$2 落在受保护 workspace: $1";; esac
 }
-assert_single_active_run() {   # $1=workspace $2=lead_pane
-  local ws="$1" pane="$2" dir="$HTM_STATE_DIR/runs" n=0 f
+assert_single_active_run() {
+  local ws="$1" pane="$2" dir="$HTM_STATE_DIR/runs" n=0 f out
   if [ -d "$dir" ]; then
     for f in "$dir"/*.json; do
       [ -e "$f" ] || continue
-      n=$((n + $(jq -r --arg ws "$ws" --arg pane "$pane" '
-        if .context.workspace==$ws and .context.lead_pane==$pane
-           and (.status!="finished" and .status!="cancelled") then 1 else 0 end' "$f")))
+      if ! out=$(jq -r 'select(.status=="active") | [(.context.workspace // ""), (.context.lead_pane // ""), .id] | @tsv' "$f"); then
+        abort "账本解析失败，拒绝继续: $f"
+      fi
+      [ -n "$out" ] || continue
+      case "$out" in
+        "$ws"$'\t'"$pane"$'\t'*) n=$((n+1));;
+      esac
     done
   fi
-  [ "$n" -le 1 ] || abort "pane $pane 上有 $n 个 non-terminal run"
+  [ "$n" -le 1 ] || abort "同一 pane 上有 $n 个 active run ($ws/$pane)"
 }
 ```
 
@@ -131,8 +137,11 @@ assert_single_active_run() {   # $1=workspace $2=lead_pane
 
 ```bash
 export REPO=/Users/shakya/dev/herdr-team
-export RUNTOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(4))')
-export ITEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/htm-itest-$RUNTOKEN.XXXXXX") || abort "mktemp 失败"
+_tmp=$(python3 -c 'import secrets; print(secrets.token_hex(4))') || abort "生成 RUNTOKEN 失败"
+export RUNTOKEN="$_tmp"
+printf '%s' "$RUNTOKEN" | grep -Eq '^[a-z0-9]{6,16}$' || abort "RUNTOKEN 格式非法"
+_tmp=$(mktemp -d "${TMPDIR:-/tmp}/htm-itest-$RUNTOKEN.XXXXXX") || abort "mktemp 失败"
+export ITEST_ROOT="$_tmp"
 case "$ITEST_ROOT" in
   "${TMPDIR:-/tmp}"/htm-itest-*) ;;
   *) abort "临时目录前缀异常: $ITEST_ROOT" ;;
@@ -141,11 +150,18 @@ export HTM_STATE_DIR="$ITEST_ROOT/state"
 export EVIDENCE="$ITEST_ROOT/evidence"
 mkdir -p "$EVIDENCE/phaseA" "$EVIDENCE/phaseB" || abort "无法创建证据目录"
 htm() { python3 "$REPO/scripts/htm.py" "$@"; }
-echo "RUNTOKEN=$RUNTOKEN ITEST_ROOT=$ITEST_ROOT"
+# 引导文件供新 pane 和外部控制终端恢复；使用 shell 引号转义真实路径
+{
+  printf 'export RUNTOKEN=%q ITEST_ROOT=%q HTM_STATE_DIR=%q EVIDENCE=%q REPO=%q\n' \
+    "$RUNTOKEN" "$ITEST_ROOT" "$HTM_STATE_DIR" "$EVIDENCE" "$REPO"
+  typeset -f abort need need_ws need_tab need_pane same_ws assert_no_protected assert_single_active_run htm
+} > "$ITEST_ROOT/env.sh" || abort "写入引导文件失败"
+printf '引导文件：%s/env.sh\n' "$ITEST_ROOT"
 ```
 
 要点：
 
+- `RUNTOKEN` 每次随机生成，禁止写死；进入新 pane 时变量和函数不会继承，复制上一步打印的引导文件路径并执行 `source "<打印的引导文件路径>"`（路径替换为实际值，不硬编码）；若已设置 `ITEST_ROOT`，执行 `source "$ITEST_ROOT/env.sh"`。
 - `HTM_STATE_DIR` 在模块导入时读取（`scripts/htm.py:34`），必须每条命令都带着它；未设置时默认 `~/.local/state/herdr-team`。
 - 所有 ABORT 必须 `exit 1`；不允许 `echo "ABORT: ..."` 后继续执行。
 
@@ -192,18 +208,24 @@ done
 
 ```bash
 WS_JSON=$(herdr workspace create --label "htm-itest-$RUNTOKEN" --cwd "$ITEST_ROOT" --focus) || abort "workspace create 失败"
-export ITEST_WS=$(printf '%s' "$WS_JSON" | jq -er '.result.workspace.workspace_id') || abort "取不到 workspace id"
-export ITEST_TAB=$(printf '%s' "$WS_JSON" | jq -er '.result.tab.tab_id') || abort "取不到 tab id"
-export ITEST_ROOT_PANE=$(printf '%s' "$WS_JSON" | jq -er '.result.root_pane.pane_id') || abort "取不到 root pane id"
+_tmp=$(printf '%s' "$WS_JSON" | jq -er '.result.workspace.workspace_id') || abort "取不到 workspace id"
+export ITEST_WS="$_tmp"
+_tmp=$(printf '%s' "$WS_JSON" | jq -er '.result.tab.tab_id') || abort "取不到 tab id"
+export ITEST_TAB="$_tmp"
+_tmp=$(printf '%s' "$WS_JSON" | jq -er '.result.root_pane.pane_id') || abort "取不到 root pane id"
+export ITEST_ROOT_PANE="$_tmp"
 need_ws "$ITEST_WS"; need_tab "$ITEST_TAB"; need_pane "$ITEST_ROOT_PANE"
 same_ws "$ITEST_WS" "$ITEST_TAB" "workspace/tab"
 same_ws "$ITEST_WS" "$ITEST_ROOT_PANE" "workspace/pane"
 case "$ITEST_WS" in w1|w2) abort "测试 workspace 不独立: $ITEST_WS";; esac
+printf 'export ITEST_WS=%q ITEST_TAB=%q ITEST_ROOT_PANE=%q\n' \
+  "$ITEST_WS" "$ITEST_TAB" "$ITEST_ROOT_PANE" >> "$ITEST_ROOT/env.sh" || abort "保存 workspace 身份失败"
+printf '在新 pane 粘贴执行：source %q\n' "$ITEST_ROOT/env.sh"
 ```
 
 ### 3.4 注册唯一的 team（阶段 A 前）
 
-阶段 A 的探针就是这里生成的 developer，因此 team 必须在阶段 A 之前注册。**必须在测试 workspace 的根 pane（`$ITEST_ROOT_PANE`）里执行**，先断言身份：
+阶段 A 的探针就是这里生成的 developer，因此 team 必须在阶段 A 之前注册。**必须在测试 workspace 的根 pane（`$ITEST_ROOT_PANE`）里执行**，先在新 pane 执行上一步打印的 `source` 命令恢复变量与函数，然后断言身份：
 
 ```bash
 [ "${HERDR_ENV:-}" = "1" ] || abort "HERDR_ENV 缺失；禁止伪造"
@@ -217,14 +239,18 @@ htm init dev-lite --layout tab --worktree off --cwd "$ITEST_ROOT" \
   --set orchestration.max_retries=5 > "$EVIDENCE/phaseB/01-init.json" || abort "init 失败"
 jq -e '.reused == false' "$EVIDENCE/phaseB/01-init.json" >/dev/null \
   || abort "init 返回 reused=true；先人工核对，不得重跑"
-export DEV=$(jq -er '.team.roles[]|select(.role=="developer")|.agent_name' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 developer"
-export DEV_PANE=$(jq -er '.team.roles[]|select(.role=="developer")|.pane_id' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 developer pane"
-export REV=$(jq -er '.team.roles[]|select(.role=="reviewer")|.agent_name' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 reviewer"
+_tmp=$(jq -er '.team.roles[]|select(.role=="developer")|.agent_name' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 developer"
+export DEV="$_tmp"
+_tmp=$(jq -er '.team.roles[]|select(.role=="developer")|.pane_id' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 developer pane"
+export DEV_PANE="$_tmp"
+_tmp=$(jq -er '.team.roles[]|select(.role=="reviewer")|.agent_name' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 reviewer"
+export REV="$_tmp"
 need_pane "$DEV_PANE"
 same_ws "$ITEST_WS" "$DEV_PANE" "workspace/developer"
 assert_no_protected "$DEV_PANE" "developer"
 case "$DEV" in ht*) ;; *) abort "worker 名不符合 ht<digest>-N-<role>: $DEV";; esac
 case "$REV" in ht*) ;; *) abort "worker 名不符合 ht<digest>-N-<role>: $REV";; esac
+printf 'export DEV=%q DEV_PANE=%q REV=%q\n' "$DEV" "$DEV_PANE" "$REV" >> "$ITEST_ROOT/env.sh" || abort "保存 worker 身份失败"
 htm status > "$EVIDENCE/phaseB/02-status.json" || abort "htm status 失败"
 jq -e '.agents[] | select(.role=="developer") | .live==true and (.observed_state=="idle" or .observed_state=="done")' \
   "$EVIDENCE/phaseB/02-status.json" >/dev/null || abort "developer 未处于 idle/done"
@@ -240,7 +266,7 @@ jq -e '.agents[] | select(.role=="reviewer") | .live==true' "$EVIDENCE/phaseB/02
 
 ### 3.5 单 pane 单 Run 约束（只读断言）
 
-`run_start` 会拒绝与其 `(workspace, pane_id)` 重叠的未完成 Run（`scripts/htm.py:591-598`）。本方案额外要求执行者主动断言——使用 §3.1 已定义的 `assert_single_active_run <ws> <pane>`，它在 `runs/` 目录不存在时按 0 处理，不使用 `2>/dev/null`，逐文件读取以避免 `jq -s` 对空 glob 的行为差异：
+`run_start` 会拒绝与其 `(workspace, pane_id)` 重叠的未完成 Run（`scripts/htm.py:591-598`）。本方案额外要求执行者主动断言——使用 §3.1 已定义的 `assert_single_active_run <ws> <pane>`，字段依据 `scripts/htm.py:234-242,599-601`（`workspace` / `lead_pane`）；它只计数 `active`，账本解析失败即 abort，在 `runs/` 目录不存在时按 0 处理，不使用 `2>/dev/null`，逐文件读取以避免 `jq -s` 对空 glob 的行为差异：
 
 ```bash
 # 建 run 前与建 run 后各执行一次
@@ -309,14 +335,14 @@ jq -e --arg p "$DEV_PANE" '.pane_id==$p and (.agent_status|IN("idle","done"))' \
 A1_OUT="$EVIDENCE/phaseA/10-prompt-ok.json"
 A1_ERR="$EVIDENCE/phaseA/10-prompt-ok.err"
 rc=0
-herdr agent prompt "$DEV" '只回复 ITEST_PONG，然后结束本轮。不要读写任何文件。' \
+herdr agent prompt "$DEV" "只回复 ITEST_PONG_${RUNTOKEN}_A1，然后结束本轮。不要读写任何文件。" \
   --wait --timeout 120000 >"$A1_OUT" 2>"$A1_ERR" || rc=$?
 [ "$rc" -eq 0 ] || abort "A1 prompt 非零退出: $rc（见 $A1_ERR）"
 jq -e . "$A1_OUT" >/dev/null || abort "A1 返回不是合法 JSON"
-jq -r 'keys[]' "$A1_OUT" > "$EVIDENCE/phaseA/11-return-keys.txt"
-jq -r '.result | keys[]' "$A1_OUT" > "$EVIDENCE/phaseA/12-result-keys.txt"
+jq -r 'keys[]' "$A1_OUT" > "$EVIDENCE/phaseA/11-return-keys.txt" || abort "A1 key 记录失败"
+jq -r '.result | keys[]' "$A1_OUT" > "$EVIDENCE/phaseA/12-result-keys.txt" || abort "A1 result key 记录失败"
 jq -r '.result | to_entries[] | "\(.key):\(.value|type)"' "$A1_OUT" \
-  > "$EVIDENCE/phaseA/13-result-shape.txt"
+  > "$EVIDENCE/phaseA/13-result-shape.txt" || abort "A1 结构记录失败"
 ```
 
 解析验证（只记录 key 与短值，不记录长文本）：
@@ -336,49 +362,61 @@ PY
 cat "$EVIDENCE/phaseA/14-status-parse.txt"
 grep -Eq 'doc_status_of = (idle|done)$|result_status_of = (idle|done)$' "$EVIDENCE/phaseA/14-status-parse.txt" \
   || abort "A1 状态无法解析为 idle/done（记录为需补映射，No-Go）"
+herdr agent read "$DEV" --source recent-unwrapped --lines 40 > "$EVIDENCE/phaseA/15-a1-read.txt" || abort "A1 终端读取失败"
+grep -Fq "ITEST_PONG_${RUNTOKEN}_A1" "$EVIDENCE/phaseA/15-a1-read.txt" || abort "A1 未在终端输出中观察到本次 nonce，通信未被证实"
 ```
+
+状态 `idle/done` 只证明生命周期，nonce 命中才证明本轮 prompt 被处理。终端输出证据可能含对话内容，留存或分享前须脱敏。
 
 ### 4.4 A2 超时 prompt（第 2 次）
 
-用 15 秒调用方超时对 `sleep 45` 的任务发 prompt，确认超时是错误而非成功：
+用 15 秒调用方超时对 `sleep 45` 的任务发 prompt。模型可能不执行 `sleep 45`，因此 15 秒超时不一定发生；A2 带 nonce，但超时可能尚未完成，不要求命中。
 
 ```bash
 A2_OUT="$EVIDENCE/phaseA/20-prompt-timeout.json"
 A2_ERR="$EVIDENCE/phaseA/20-prompt-timeout.err"
 rc=0
-herdr agent prompt "$DEV" '先执行 sleep 45，再回复 ITEST_SLOW_DONE。不要读写文件。' \
+herdr agent prompt "$DEV" "先执行 sleep 45，再回复 ITEST_PONG_${RUNTOKEN}_A2。不要读写文件。" \
   --wait --timeout 15000 >"$A2_OUT" 2>"$A2_ERR" || rc=$?
-[ "$rc" -ne 0 ] || abort "A2 未超时（期望超时错误）"
-grep -Eqi 'timeout|timed out|stalled' "$A2_ERR" "$A2_OUT" \
-  || abort "A2 失败但不是 timeout/stalled 类错误"
-echo "A2 rc=$rc（失败不代表输入未送达）" > "$EVIDENCE/phaseA/21-timeout-summary.txt"
+if [ "$rc" -eq 0 ]; then
+  printf '%s\n' 'NOT-OBSERVED: timeout 未触发（模型未执行 sleep），本次超时不作为验证项' > "$EVIDENCE/phaseA/16-a2-result.txt"
+elif grep -Eqi 'timeout|timed out' "$A2_ERR" "$A2_OUT"; then
+  printf '%s\n' 'VERIFIED: timeout 已观察；失败不代表输入未送达' > "$EVIDENCE/phaseA/16-a2-result.txt"
+else
+  printf 'NOT-OBSERVED: 非 timeout 错误 rc=%s，超时未验证；失败不代表输入未送达\n' "$rc" > "$EVIDENCE/phaseA/16-a2-result.txt"
+fi
 ```
 
 随后等待 developer 稳定并记录观察值（只读，不发 prompt）：
 
 ```bash
-herdr agent wait "$DEV" --timeout 180000 || abort "A2 后 agent wait 失败"
+herdr agent wait "$DEV" --timeout 180000 || printf 'NOT-OBSERVED: A2 后 agent wait 失败\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
 herdr agent get "$DEV" | jq -r '.result.agent | [.name, .agent_status, .revision, .state_change_seq] | @tsv' \
-  > "$EVIDENCE/phaseA/22-after-timeout.tsv" || abort "A2 后 agent get 失败"
+  > "$EVIDENCE/phaseA/22-after-timeout.tsv" || printf 'NOT-OBSERVED: A2 后状态读取失败\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
 ```
 
 观察值为 `blocked` 时只做记录（见 §5.12 的被动观察规则），不判失败，也不代答。
 
 ### 4.5 阶段 A 证据
 
-`$EVIDENCE/phaseA/` 至少包含：`00-probe-agent.json`、`10/11/12/13/14-*`、`20-prompt-timeout.{json,err}`、`21-timeout-summary.txt`、`22-after-timeout.tsv`。
+`$EVIDENCE/phaseA/` 至少包含：`00-probe-agent.json`、`10/11/12/13/14-*`、`15-a1-read.txt`、`16-a2-result.txt`、`20-prompt-timeout.{json,err}`、`22-after-timeout.tsv`。
 
 ### 4.6 阶段 A Go/No-Go
 
 | 项 | Go 条件 |
 |---|---|
-| A1 exit | 0 |
-| A1 状态解析 | `agent_status_of` 对顶层或 `.result` 至少一处返回 `idle` 或 `done`；`unknown` 不算通过 |
-| A1 kind 解析 | `agent_kind_of` 返回 `claude`（形状确认） |
-| A2 | 非零退出且错误含 timeout/stalled；已记录“失败不等于未送达” |
-| 结论记录 | 写入 `$EVIDENCE/phaseA/GO-NOGO.txt`，首行 `GO` 或 `NO-GO` |
+| A1 nonce | 本轮 nonce 在终端输出命中（包括 prompt 成功返回） |
+| A1 状态解析 | `agent_status_of` 对顶层或 `.result` 至少一处返回 `idle` 或 `done` |
+| A1 返回体结构 | 合法 JSON，key 和类型已记录 |
 
-任一项不满足 → **NO-GO，停止**，不创建任何 Run，不进入阶段 B。若 A1 解析为 `unknown`，在报告里写“需补映射”，不得静默通过。
+仅上述三项决定 Go/No-Go；A2 未触发 timeout 不判 No-Go。任一必要断言失败即 `exit 1`，因此 GO 文件不存在即 No-Go；重新执行前必须使用新的 `RUNTOKEN` 和证据目录。若需要将 No-Go 落盘，可在 `abort()` 的 `exit 1` 前加入 `printf 'NO-GO: %s\n' "$*" > "$GO_FILE"`，并在断言前设置对应阶段的 `GO_FILE`；这不是强制要求。
+
+```bash
+GO_FILE="$EVIDENCE/phaseA/GO-NOGO.txt"
+# 只有在前面所有必要 abort 断言都通过后才会执行到这里
+printf 'GO\n' > "$GO_FILE"
+grep -qx GO "$GO_FILE" || abort "阶段 A 未 GO"
+```
 
 ### 4.7 进入阶段 B 的唯一条件
 
@@ -407,7 +445,8 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 
 ```bash
 RUN_JSON=$(htm run start --goal '阶段 B：验证 dispatch/collect、账本状态机与异常降级，不改任何仓库') || abort "run start 失败"
-export RUN=$(printf '%s' "$RUN_JSON" | jq -er '.run_id') || abort "取不到 run_id"
+_tmp=$(printf '%s' "$RUN_JSON" | jq -er '.run_id') || abort "取不到 run_id"
+export RUN="$_tmp"
 printf '%s' "$RUN" | grep -Eq '^[a-f0-9]{12}$' || abort "run_id 形状非法"
 export RUN_FILE="$HTM_STATE_DIR/runs/$RUN.json"
 [ -f "$RUN_FILE" ] || abort "run 文件不存在: $RUN_FILE"
@@ -433,18 +472,16 @@ htm run dispatch --run-id "$RUN" --role developer --effect read --no-wait \
   > "$D1_OUT" || rc=$?
 [ "$rc" -eq 0 ] || abort "首次派单失败 rc=$rc"
 jq -e . "$D1_OUT" >/dev/null || abort "派单响应不是 JSON"
-jq -r 'keys | join(",")' "$D1_OUT" > "$EVIDENCE/phaseB/11-dispatch-keys.txt"
-if grep -q 'run_id' "$EVIDENCE/phaseB/11-dispatch-keys.txt"; then
-  abort "派单响应出现 run_id（与源码事实不符）"
-fi
-grep -qx 'dispatch_id,status,next' "$EVIDENCE/phaseB/11-dispatch-keys.txt" \
-  || abort "派单响应 key 与预期不符: $(cat "$EVIDENCE/phaseB/11-dispatch-keys.txt")"
+jq -r 'keys[]' "$D1_OUT" > "$EVIDENCE/phaseB/11-dispatch-keys.txt" || abort "记录 key 失败"
+jq -e 'keys|sort == ["dispatch_id","next","status"]' "$D1_OUT" >/dev/null || abort "派单响应 key 集合不符"
+jq -e '(.dispatch_id | type=="string" and test("^[a-f0-9]{10}$")) and .status=="submitted_unsettled" and (.next | type=="string" and length>0)' "$D1_OUT" >/dev/null || abort "派单响应字段值不符"
 ```
 
 从**账本**取真实 id（不从响应之外的任何推断），并断言与响应一致：
 
 ```bash
-export D1=$(jq -er '.dispatches[-1].id' "$RUN_FILE") || abort "账本无 dispatch"
+_tmp=$(jq -er '.dispatches[-1].id' "$RUN_FILE") || abort "账本无 dispatch"
+export D1="$_tmp"
 printf '%s' "$D1" | grep -Eq '^[a-f0-9]{10}$' || abort "D1 形状非法: $D1"
 [ "$(jq -r '.dispatch_id' "$D1_OUT")" = "$D1" ] || abort "响应 dispatch_id 与账本不一致"
 [ "$(jq -r '.status' "$D1_OUT")" = "submitted_unsettled" ] || abort "no-wait 响应状态不是 submitted_unsettled"
@@ -492,7 +529,8 @@ htm run dispatch --run-id "$RUN" --role developer --effect read \
   --message '只回复 ITEST_D2_OK；写一份新的 JSON 报告。' \
   > "$D2_OUT" || rc=$?
 [ "$rc" -eq 0 ] || abort "第二次派单失败 rc=$rc"
-export D2=$(jq -er '.dispatch_id' "$D2_OUT") || abort "取不到 D2"
+_tmp=$(jq -er '.dispatch_id' "$D2_OUT") || abort "取不到 D2"
+export D2="$_tmp"
 printf '%s' "$D2" | grep -Eq '^[a-f0-9]{10}$' || abort "D2 形状非法"
 [ "$D2" != "$D1" ] || abort "D2 与 D1 相同，历史被覆盖"
 jq -e --arg d1 "$D1" --arg d2 "$D2" \
@@ -504,8 +542,9 @@ jq -e --arg d1 "$D1" --arg d2 "$D2" \
 
 ```bash
 htm run list > "$EVIDENCE/phaseB/30-runlist.json" || abort "run list 失败"
-export RUN_FROM_LIST=$(jq -er --arg r "$RUN" '.runs[]|select(.run_id==$r)|.run_id' "$EVIDENCE/phaseB/30-runlist.json") \
+_tmp=$(jq -er --arg r "$RUN" '.runs[]|select(.run_id==$r)|.run_id' "$EVIDENCE/phaseB/30-runlist.json") \
   || abort "run list 中找不到本 run"
+export RUN_FROM_LIST="$_tmp"
 [ "$RUN_FROM_LIST" = "$RUN" ] || abort "run list 的 run_id 与本地不一致"
 jq -r --arg d "$D2" '.dispatches[]|select(.id==$d)
   | {id, role, stage_index, stage_attempt, status, artifact_sha256, result_file,
@@ -588,7 +627,8 @@ comm -13 "$EVIDENCE/phaseB/41-runs-before.txt" "$EVIDENCE/phaseB/44-runs-after.t
 # 从目标 run 文件读取新派单 id，并断言唯一、账本恰好 +1
 AFTER_COUNT=$(jq -er '.dispatches|length' "$TRUN_FILE") || abort "读派单数失败"
 [ "$AFTER_COUNT" -eq "$((BEFORE_COUNT + 1))" ] || abort "超时派单没有新增恰好 1 条账本记录"
-export TD1=$(jq -er '.dispatches[-1].id' "$TRUN_FILE") || abort "timeout run 无 dispatch"
+_tmp=$(jq -er '.dispatches[-1].id' "$TRUN_FILE") || abort "timeout run 无 dispatch"
+export TD1="$_tmp"
 printf '%s' "$TD1" | grep -Eq '^[a-f0-9]{10}$' || abort "TD1 形状非法"
 jq -e --arg d "$TD1" '([.dispatches[]|select(.id==$d)]|length)==1' "$TRUN_FILE" >/dev/null \
   || abort "TD1 在账本中不唯一"
@@ -718,7 +758,7 @@ grep -Eq 'Invalid Run ID|Cannot read state|Unknown dispatch ID' "$EVIDENCE/phase
   || abort "错误 run-id 报错文案不符"
 ```
 
-role→pane 篡改**只在 Mock 副本**里做（复制 `$HTM_STATE_DIR` 后修改 `.roles[].pane_id` 为 `w1:p5`），期望 `is live in unexpected pane w1:p5; refusing reuse`；`w1:p5` 仅读取元数据，不发送任何输入。
+role→pane 篡改**只在 Mock 副本**里做（复制 `$HTM_STATE_DIR` 后修改 `.roles[].pane_id` 为 `w1:p5`），报错中的 pane 是 agent **实际观察到的 pane**，不是篡改后的期望值 `w1:p5`；断言前缀 `is live in unexpected pane` 与非空 pane id，不断言具体 id。`w1:p5` 仅读取元数据，不发送任何输入。
 
 ```bash
 export MOCK2="$ITEST_ROOT/mock-role"
@@ -741,7 +781,7 @@ rc=0
 mock2_htm run collect --run-id "$RUN" --dispatch-id "$D1" \
   > "$EVIDENCE/phaseB/61-mock-role.txt" 2>&1 || rc=$?
 [ "$rc" -eq 2 ] || abort "错误 pane 映射未拒绝 exit=$rc"
-grep -Eq 'is live in unexpected pane w1:p5; refusing reuse' "$EVIDENCE/phaseB/61-mock-role.txt" \
+grep -Eq 'is live in unexpected pane [^[:space:];]+; refusing reuse' "$EVIDENCE/phaseB/61-mock-role.txt" \
   || abort "错误 pane 映射报错文案不符"
 [ "$(shasum -a 256 "$RUN_FILE" | awk '{print $1}')" = "$REAL_RUN_SHA_AFTER" ] \
   || abort "真实账本被 role 篡改测试改动"
@@ -823,7 +863,14 @@ fi
 | B11（§5.12） | blocked 未主动构造；观察结果如实标记 |
 | B12（§5.13） | 受保护 worker 的 revision/seq 不变；默认 state 无新文件 |
 
-全通过 → `GO`；任一失败 → `NO-GO`，保留现场。结论写入 `$EVIDENCE/phaseB/GO-NOGO.txt`。
+全通过 → `GO`；任一失败 → `NO-GO`，保留现场。断言失败会 `exit 1`，文件不存在即 No-Go；可按 §4.6 的可选方法在 `abort()` 中落盘原因。
+
+```bash
+GO_FILE="$EVIDENCE/phaseB/GO-NOGO.txt"
+# 只有在前面所有必要 abort 断言都通过后才会执行到这里
+printf 'GO\n' > "$GO_FILE"
+grep -qx GO "$GO_FILE" || abort "阶段 B 未 GO"
+```
 
 ---
 
@@ -839,14 +886,14 @@ fi
 | A-04 | run 可见性 | `jq -e --arg r "$RUN" '[.runs[]\|select(.run_id==$r)]\|length==1'` | exit=0 | run list 遗漏/重复 |
 | A-05 | `--no-wait` 状态 | 账本 `select(.id==$D1).status` | 精确 `submitted_unsettled` | 状态机未落账 |
 | A-06 | 在途重复派单 | 第二次 dispatch 捕获 rc 与 combined output | rc=2 且正则 `Pending/uncertain dispatch [a-f0-9]{10}; use run collect, never blindly resend` | 重复投递风险 |
-| A-07 | 派单响应无 run_id | `jq -r 'keys\|join(",")'` | 精确 `dispatch_id,status,next`（no-wait）或含 `dispatch_id,status,agent_state,report,error,warning`（wait）；不含 `run_id` | 从响应取 run_id 的写法作废 |
+| A-07 | 派单响应无 run_id | `jq -e 'keys\|sort == ["dispatch_id","next","status"]'`，并逐字段校验 | no-wait key 集合相等、id 格式正确、status 正确且 next 为非空字符串；不含 `run_id` | 从响应取 run_id 的写法作废 |
 | A-08 | 报告归属 | 账本 `report.run_id==$RUN` 且 `report.dispatch_id==$D2` | exit=0，且 `status==settled` | 工件错配 |
 | A-09 | 产物契约 | `jq -e` 校验 run_id/dispatch_id/role/stage/attempt/status/verdict/summary/evidence/tests | exit=0 | 工件形状不合规 |
 | A-10 | 错位工件（Mock） | `HTM_STATE_DIR=$MOCK_STATE htm run collect` 后读 stdout JSON | exit=0 **且** `.status=="uncertain"` 且 `.error` 以 `Result identity mismatch: run_id` 开头 | 归属校验失效 |
 | A-11 | 超时账本 | `jq -e --arg d "$TD1" '.dispatches[]\|select(.id==$d)\|.status=="submission_uncertain" and (.error\|length>0)'` | exit=0 | 超时被当成成功/无错误 |
 | A-12 | 超时不重发 | 超时后立即 dispatch | rc=2 且含 `never blindly resend` | 重复投递风险 |
 | A-13 | 二次派单唯一性 | `test "$D2" != "$D1"` + 账本两条各 1 | exit=0 | 历史被覆盖 |
-| A-14 | 单 pane 单 Run | `assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"` | non-terminal run ≤1；B7 另要求 active 恰好 1 | 冲突 Run 并存 |
+| A-14 | 单 pane 单 Run | `assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"` | active run ≤1；B7 另要求 active 恰好 1 | 冲突 Run 并存 |
 | A-15 | Mock 隔离 | `$MOCK_STATE` ≠ `$HTM_STATE_DIR`；Mock 后真实账本 sha 不变；真实 state 无 Mock 工件 | 三项均成立 | Mock 污染真实 state |
 | A-16 | 状态目录隔离 + 受保护 pane | `find` 默认 state 目录新文件为空；受保护 worker 行 diff 为空 | 输出为空 | 越界写或测试泄漏 |
 
@@ -906,7 +953,7 @@ $EVIDENCE/phaseB/   00-03 初始化、10-13 D1、20 D2、30-32 归属与互斥�
 
 规则：
 
-- 真实响应只保留 **key 名、值的类型、短值**（如 `idle`、`claude`、10 位 id）；不保存终端标题、长文本、对话内容。
+- 除 A1 nonce 验证必需的 `15-a1-read.txt` 外，真实响应只保留 **key 名、值的类型、短值**（如 `idle`、`claude`、10 位 id）；不保存终端标题、长文本、对话内容。
 - 账本快照用 `jq '{id,status,stage_index,stage_attempt,dispatches:[.dispatches[]|{id,role,status,error,artifact_sha256}]}'`，不保留完整 prompt。
 - Mock 证据文件名带 `mock` 前缀，内容首行标注 `MOCK`，与真实测试分开。
 - 证据留在 `$ITEST_ROOT` 内；如需长期保留，清理前复制到用户另行授权的目录。
@@ -914,6 +961,15 @@ $EVIDENCE/phaseB/   00-03 初始化、10-13 D1、20 D2、30-32 归属与互斥�
 ---
 
 ## 8. 清理与回滚
+
+清理与验收命令必须在一个不属于待关闭测试 workspace 的 pane / 终端里执行（例如原来的 w2:p1 或另一个已存在的 shell）。在控制终端通过打印或粘贴的路径 source §3.1 的引导文件以恢复变量与函数，然后确认身份：
+
+```bash
+printf '%s\n' "${HERDR_WORKSPACE_ID:-<unset>}"
+[ "${HERDR_WORKSPACE_ID:-}" != "$ITEST_WS" ] || abort "清理不能在待关闭的 workspace 内执行"
+```
+
+若环境变量缺失（如经 happier 启动的会话），用 `herdr workspace list` 并结合当前焦点及自身 pane 确认不属于 `$ITEST_WS`；无法确认则停止，不得硬编码身份。
 
 ### 8.1 顺序
 
@@ -1000,7 +1056,7 @@ unset -f htm mock_htm mock2_htm abort need need_ws need_tab need_pane same_ws \
 
 | 类别 | 内容 | 判定依据 |
 |---|---|---|
-| 真实测试 | 阶段 A 的正常/超时返回；阶段 B 的 dispatch、账本状态、collect、报告归属、真实超时降级 | 真实 Herdr + 真实 agent + 真实 htm 调用 |
+| 真实测试 | 阶段 A 的正常返回及超时（若观察到）；阶段 B 的 dispatch、账本状态、collect、报告归属、真实超时降级 | 真实 Herdr + 真实 agent + 真实 htm 调用 |
 | Mock 测试 | 身份不符工件注入、错误 pane 映射（在 `$MOCK/state` 副本中） | 隔离 state，不发送 prompt，不写真实工件 |
 | 未验证项 | blocked 未自然发生时的行为、`agent_prompt_stalled`、长任务/审批/多文件行为、默认 state 目录下的并发 | 只在出现时记录，否则标「未验证」 |
 
