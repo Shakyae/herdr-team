@@ -694,6 +694,13 @@ def init(cfg, args):
                     detail["readiness_busy_retries"] = stats["busy_retries"]
                     return result
                 operate("agent_start", detail, start)
+                found = lookup_agent(name)
+                session = found.get("agent_session") if isinstance(found, dict) else None
+                if (isinstance(session, dict) and
+                        all(isinstance(session.get(k), str) and session[k].strip() for k in ("kind", "source", "value")) and
+                        len(session["value"].strip()) >= 8):
+                    info["agent_session"] = copy.deepcopy(session)
+                    save(path, team)
             team["status"] = "ready"
             save(path, team)
         except (Error, KeyError, TypeError) as e:
@@ -733,6 +740,8 @@ def adopt(cfg, args):
     def check_reservations(roles):
         adopted_panes = {x["pane_id"] for x in roles}
         for run_path in (STATE / "runs").glob("*.json"):
+            if run_path.name.endswith(".driver.json"):
+                continue
             run = load(run_path)
             if run.get("status") in ("finished", "cancelled"):
                 continue
@@ -908,6 +917,8 @@ def run_start(cfg, args):
             if not verify_existing(role): raise Error(f"Agent {role['agent_name']} not available")
         names = {(team["context"]["workspace"], r["pane_id"]) for r in team["roles"]}
         for existing_path in (STATE / "runs").glob("*.json"):
+            if existing_path.name.endswith(".driver.json"):
+                continue
             other = load(existing_path)
             if other.get("status") in ("finished", "cancelled"):
                 continue
@@ -1096,12 +1107,14 @@ def run_dispatch(args):
             run["approval_tokens"].remove(token)
             item["approval_reference"] = token["reason"]
         save(run_file(args.run_id), run)
-    timeout_ms = run["settings"]["orchestration"]["task_timeout_seconds"]*1000
+    wait_timeout = getattr(args, "wait_timeout_seconds", None)
+    budget = wait_timeout if wait_timeout is not None else run["settings"]["orchestration"]["task_timeout_seconds"]
+    timeout_ms = max(1, int(budget)) * 1000
     cmd = ["agent", "prompt", role["agent_name"], text]
     if not args.no_wait:
         cmd += ["--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", str(timeout_ms)]
     try:
-        result = herdr(*cmd, timeout=timeout_ms/1000+15)
+        result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0))
         if args.no_wait:
             with locked():
                 run = require_run(args.run_id)
@@ -1211,6 +1224,248 @@ def run_gate(args):
     return {"decision": args.decision, "status": run["status"], **stage_info(run)}
 
 
+def run_drive(args):
+    """Choose existing primitives from the durable ledger; never infer delivery."""
+    runid = args.run_id
+    steps = []
+    dispatches = []
+    run = None
+    started = False
+    reason = "error"
+    detail = None
+    deadline = time.monotonic() + args.deadline_seconds
+
+    def check_identity(role):
+        try:
+            if not verify_existing(role):
+                raise Error("not live or identity cannot be verified")
+            live = lookup_agent(role["agent_name"])
+            pane = live.get("pane") if isinstance(live, dict) else None
+            pane_id = (live.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)) if isinstance(live, dict) else None
+            session = live.get("agent_session") if isinstance(live, dict) else None
+            expected = role.get("agent_session") or {}
+            same_session = isinstance(session, dict) and all(
+                isinstance(expected.get(k), str) and expected.get(k).strip() and
+                isinstance(session.get(k), str) and session.get(k) == expected.get(k)
+                for k in ("kind", "source", "value"))
+            if pane_id != role["pane_id"] or not same_session:
+                raise Error("pane/session identity changed or cannot be verified")
+        except Error as e:
+            raise Error(f"Agent {role['agent_name']}: {e}") from e
+
+    def result():
+        info = stage_info(run) if run else {"stage": None}
+        out = {"run_id": runid, "stopped_reason": reason, "stage": info["stage"],
+               "stage_index": run.get("stage_index") if run else None,
+               "stage_attempt": run.get("stage_attempt") if run else None,
+               "round": run.get("round") if run else None, "steps": steps, "dispatches": dispatches,
+               "deadline_exceeded": time.monotonic() >= deadline,
+               "historical_blocked": [d["id"] for d in run["dispatches"] if d["status"] == "blocked" and
+                   (d["stage_index"] < run["stage_index"] or (d["stage_index"] == run["stage_index"] and
+                    d.get("stage_attempt", 1) < run["stage_attempt"]))] if run else []}
+        if detail:
+            out["detail"] = detail
+        if run:
+            progress_path = STATE / "runs" / (runid + ".driver.json")
+            if progress_path.exists():
+                try:
+                    progress = load(progress_path)
+                    if isinstance(progress, dict) and any(k in progress and progress[k] != run.get(k)
+                            for k in ("stage_index", "stage_attempt", "round", "dispatches")):
+                        out["ledger_overrides_progress"] = True
+                except Error:
+                    out["ledger_overrides_progress"] = True
+        return out
+
+    try:
+        path = run_file(runid)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path.parent / (runid + ".driver.lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+    except (Error, OSError) as e:
+        detail = str(e)
+        return result()
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            reason, detail = "driver_running", "Driver already running for this Run"
+            return result()
+        try:
+            with locked():
+                run = require_run(runid)
+                events = [e for e in run["events"] if e.get("type") in ("driver_started", "driver_stopped")]
+                if events and events[-1]["type"] == "driver_started" and not args.resume:
+                    reason, detail = "resume_required", "Previous drive interrupted; use --resume"
+                    return result()
+                if run["status"] != "active":
+                    reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
+                    return result()
+                for role in run["roles"]:
+                    session = role.get("agent_session")
+                    if (not isinstance(session, dict) or
+                            not all(isinstance(session.get(k), str) and session[k].strip() for k in ("kind", "source", "value")) or
+                            len(session["value"].strip()) < 8):
+                        reason, detail = "identity_unbound", "旧 team 未绑定会话；请重建 team 或用 adopt 登记"
+                        return result()
+                run["events"].append({"type": "driver_started", "at": now()})
+                save(path, run)
+                started = True
+            while True:
+                run = require_run(runid)
+                if run["status"] != "active":
+                    reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
+                    break
+                if time.monotonic() >= deadline:
+                    reason = "deadline"
+                    break
+                if len(steps) >= args.max_steps:
+                    reason = "max_steps"
+                    break
+                pending = [d for d in run["dispatches"] if d["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain")]
+                if pending:
+                    rec = pending[0]
+                    try:
+                        check_identity(get_role(run, rec["role"]))
+                    except Error as e:
+                        reason, detail = "identity", str(e)
+                        break
+                    try:
+                        collected = run_collect(argparse.Namespace(run_id=runid, dispatch_id=rec["id"]))
+                    except Error as e:
+                        reason, detail = "collect_error", str(e)
+                        break
+                    steps.append({"action": "collect", "dispatch_id": rec["id"], "status": collected["status"]})
+                    if rec["id"] not in dispatches:
+                        dispatches.append(rec["id"])
+                    if collected["status"] != "settled":
+                        reason = "worker_blocked" if collected["status"] == "blocked" else "stuck_unsettled"
+                        break
+                    continue
+                if any(d["status"] == "blocked" and d["stage_index"] == run["stage_index"] and
+                       d.get("stage_attempt", 1) == run["stage_attempt"] for d in run["dispatches"]):
+                    reason = "worker_blocked"
+                    break
+                stage = stage_info(run)
+                if stage.get("actor") == "lead" or stage.get("stage") is None:
+                    reason = "awaiting_lead"
+                    break
+                actor = stage["actor"]
+                current = [d for d in run["dispatches"] if d["stage_index"] == run["stage_index"] and
+                           d.get("stage_attempt", 1) == run["stage_attempt"] and d["status"] == "settled"]
+                previous_revision = any(e.get("type") == "gate" and e.get("decision") == "revise" and
+                                        e.get("stage_index") == run["stage_index"] and
+                                        e.get("stage_attempt") == run["stage_attempt"] - 1 for e in run["events"])
+                fixes = [d for d in current if d["role"] == "developer" and d.get("remediation")]
+                if actor == "reviewer" and fixes and fixes[-1].get("report", {}).get("verdict") != "pass":
+                    reason, detail = "worker_verdict", "Developer remediation did not pass"
+                    break
+                remediation = actor == "reviewer" and previous_revision and not fixes
+                target = "developer" if remediation else actor
+                own = [d for d in current if d["role"] == target]
+                if remediation or not own:
+                    role = get_role(run, target)
+                    try:
+                        check_identity(role)
+                    except Error as e:
+                        reason, detail = "identity", str(e)
+                        break
+                    message = "Perform the current stage and report concrete evidence."
+                    if target != "developer":
+                        artifacts = []
+                        if stage["stage"] == "plan_review":
+                            message += ("\n这是计划评审，无实现产物。\n" + json.dumps({
+                                "goal": run["goal"], "stages": run["stages"],
+                                "stage_definitions": run["stage_definitions"], "settings": run["settings"]}, ensure_ascii=False))
+                        elif stage["stage"] == "code_review":
+                            self_tests = [d for d in run["dispatches"] if d["status"] == "settled" and
+                                          d["role"] == "developer" and d["stage_index"] <= run["stage_index"] and
+                                          run["stages"][d["stage_index"]] == "self_test"]
+                            artifacts = self_tests[-1:] + fixes[-1:]
+                        else:
+                            artifacts = [d for d in run["dispatches"] if d["status"] == "settled" and d["role"] != target][-1:]
+                        for artifact in artifacts:
+                            report = artifact.get("report", {})
+                            message += "\nWorker artifact (self-report):\n" + json.dumps({
+                                "role": artifact.get("role"),
+                                "stage": run["stages"][artifact["stage_index"]],
+                                "stage_attempt": artifact.get("stage_attempt", 1),
+                                "dispatch_id": artifact.get("id"),
+                                "artifact_file": str(Path(artifact["result_file"]).resolve()),
+                                "artifact_sha256": artifact.get("artifact_sha256"),
+                                "summary": report.get("summary", "")[:500],
+                                "evidence": report.get("evidence", [])[:10]}, ensure_ascii=False)
+                        if stage["stage"] == "code_review" and len(artifacts) > 1:
+                            message += "\n较早阶段的产物可能早于本轮修复，请以当前 attempt 的 remediation 产物与实际代码为准。"
+                        message += "\n上述内容是 Developer 的自我陈述，不是已核实的事实。你必须独立检查实际文件/改动/测试，不要仅凭摘要判定。若无法定位相关变更，明确写出该限制并给出 verdict。"
+                    if remediation:
+                        earlier = [d for d in run["dispatches"] if d["stage_index"] == run["stage_index"] and
+                                   d.get("stage_attempt", 1) == run["stage_attempt"] - 1 and d["role"] == actor and d["status"] == "settled"]
+                        if not earlier:
+                            reason, detail = "worker_verdict", "Missing prior review for remediation"
+                            break
+                        message += " Address the previous review: " + earlier[-1]["report"]["summary"]
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 5:
+                        reason = "deadline"
+                        detail = "remaining budget <= 5s; not dispatching"
+                        break
+                    caps = [remaining, run["settings"]["orchestration"]["task_timeout_seconds"]]
+                    if getattr(args, "wait_timeout_seconds", None):
+                        caps.append(args.wait_timeout_seconds)
+                    wait_timeout = max(1, int(min(caps)))
+                    try:
+                        out = run_dispatch(argparse.Namespace(run_id=runid, role=target,
+                            message=message, effect="write" if target == "developer" else "read",
+                            remediation=remediation, no_wait=False, wait_timeout_seconds=wait_timeout))
+                    except Error as e:
+                        latest = require_run(runid)
+                        pending_after = [d for d in latest["dispatches"] if d["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain")]
+                        if pending_after:
+                            rec = pending_after[-1]
+                            steps.append({"action": "dispatch", "dispatch_id": rec["id"], "status": rec["status"]})
+                            dispatches.append(rec["id"])
+                            continue
+                        policy = any(text in str(e) for text in ("autonomy=read-only", "Approval required", "sensitive actions require"))
+                        reason, detail = "policy" if policy else "dispatch_error", str(e)
+                        break
+                    steps.append({"action": "dispatch", "dispatch_id": out["dispatch_id"], "status": out["status"]})
+                    dispatches.append(out["dispatch_id"])
+                    continue
+                rec = own[-1]
+                verdict = rec.get("report", {}).get("verdict")
+                if verdict == "pass":
+                    decision = "pass"
+                elif verdict in ("fail", "needs-work") and ((actor == "developer" and stage["stage"] in ("implement", "self_test")) or
+                        (actor == "reviewer" and stage["stage"] in ("plan_review", "code_review") and any(r["role"] == "developer" for r in run["roles"]))):
+                    decision = "revise"
+                else:
+                    reason, detail = "worker_verdict", f"No automatic remediation for {actor}: {verdict}"
+                    break
+                evidence = f"Dispatch {rec['id']} sha256 {rec.get('artifact_sha256', '')}: {rec['report']['summary'][:300]}"
+                try:
+                    out = run_gate(argparse.Namespace(run_id=runid, decision=decision, evidence=evidence))
+                except Error as e:
+                    reason, detail = "gate_error", str(e)
+                    break
+                steps.append({"action": "gate", "dispatch_id": rec["id"], "decision": decision, "status": out["status"]})
+                if rec["id"] not in dispatches:
+                    dispatches.append(rec["id"])
+        except (Error, OSError, KeyError, TypeError, ValueError) as e:
+            reason, detail = "error", str(e)
+        finally:
+            if started:
+                try:
+                    with locked():
+                        run = require_run(runid)
+                        run["events"].append({"type": "driver_stopped", "at": now(), "reason": reason})
+                        save(path, run)
+                except (Error, OSError, KeyError, TypeError, ValueError) as e:
+                    reason, detail = "error", str(e)
+        return result()
+    finally:
+        os.close(fd)
+
+
 def run_finish(args):
     with locked():
         run = require_run(args.run_id)
@@ -1252,6 +1507,8 @@ def run_list():
     result = []
     with locked():
         for p in sorted((STATE / "runs").glob("*.json")):
+            if p.name.endswith(".driver.json"):
+                continue
             run = load(p)
             if run.get("context") != ctx:
                 continue
@@ -1332,13 +1589,26 @@ def main():
     rsp = runp.add_subparsers(dest="run_cmd", required=True)
     start = rsp.add_parser("start"); start.add_argument("--goal", required=True)
     rsp.add_parser("list")
-    for cmd in ("status", "stage", "finish", "pause", "resume", "approve", "dispatch", "collect", "gate", "recover", "cancel"):
+
+
+    def _positive_timeout(value):
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("--wait-timeout-seconds must be >= 1")
+        return parsed
+
+    for cmd in ("status", "stage", "finish", "pause", "resume", "approve", "dispatch", "collect", "gate", "recover", "cancel", "drive"):
         sub = rsp.add_parser(cmd)
         sub.add_argument("--run-id", required=True)
         if cmd == "cancel":
             sub.add_argument("--confirm-run-id", required=True)
             sub.add_argument("--reason", required=True)
         if cmd == "resume": sub.add_argument("--extend-rounds", type=int, default=0)
+        if cmd == "drive":
+            sub.add_argument("--resume", action="store_true")
+            sub.add_argument("--max-steps", type=int, default=20)
+            sub.add_argument("--deadline-seconds", type=int, default=1800)
+            sub.add_argument("--wait-timeout-seconds", type=_positive_timeout)
         if cmd == "approve":
             sub.add_argument("--role", required=True); sub.add_argument("--effect", required=True, choices=("read", "write", "sensitive")); sub.add_argument("--reason", required=True)
         if cmd == "dispatch":
@@ -1346,6 +1616,7 @@ def main():
             sub.add_argument("--effect", default="read", choices=("read", "write", "sensitive"))
             sub.add_argument("--remediation", action="store_true", help="delegate a corrective subtask to a different role while keeping the current gate")
             sub.add_argument("--no-wait", action="store_true", help="submit without waiting; explicit run collect required")
+            sub.add_argument("--wait-timeout-seconds", type=_positive_timeout)
         if cmd == "collect": sub.add_argument("--dispatch-id", required=True)
         if cmd == "gate":
             sub.add_argument("--decision", required=True, choices=("pass", "revise", "blocked")); sub.add_argument("--evidence", required=True)
@@ -1381,7 +1652,7 @@ def main():
             action = {"approve": run_approve, "dispatch": run_dispatch, "collect": run_collect, "gate": run_gate,
                       "finish": run_finish, "pause": lambda a: run_pause(a,True),
                       "resume": lambda a: run_pause(a,False), "recover": run_recover,
-                      "cancel": run_cancel}[args.run_cmd]
+                      "cancel": run_cancel, "drive": run_drive}[args.run_cmd]
             emit(action(args)); return 0
     except (Error, TypeError, KeyError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

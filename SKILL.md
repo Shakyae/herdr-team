@@ -31,6 +31,7 @@ python3 /path/to/herdr-team/scripts/htm.py status
 python3 /path/to/herdr-team/scripts/htm.py run list
 python3 /path/to/herdr-team/scripts/htm.py run start --goal '具体目标与验收标准'
 python3 /path/to/herdr-team/scripts/htm.py run stage --run-id <RUN_ID>
+python3 /path/to/herdr-team/scripts/htm.py run drive --run-id <RUN_ID> [--resume] [--max-steps 20] [--deadline-seconds 1800]
 python3 /path/to/herdr-team/scripts/htm.py run dispatch --run-id <RUN_ID> --role developer --effect write --message '明确任务、边界及验收方式'
 python3 /path/to/herdr-team/scripts/htm.py run collect --run-id <RUN_ID> --dispatch-id <DISPATCH_ID>
 python3 /path/to/herdr-team/scripts/htm.py run gate --run-id <RUN_ID> --decision pass --evidence '基于可核验资料的具体审核结论'
@@ -39,6 +40,8 @@ python3 /path/to/herdr-team/scripts/htm.py run finish --run-id <RUN_ID>
 
 - 新建 Worker 使用真实 Pane ID 派生名称；`name-lead` 默认预览（无 team 亦可），只有显式 `--apply` 才重命名当前 Lead Agent；用 `--expect-session <预览的 session value>` 核对跨命令身份，不会自动重命名已有 Agent。
 - `name-lead` 要求 Lead 的 Agent 具备可验证的稳定 session 身份（`agent_session.value`），`--apply` 必须传入预览输出的 `--expect-session`。经 Happier 包装启动的 Claude Code 目前不上报 `agent_session`，因此该环境下 `name-lead` 会拒绝执行——这是环境限制，不是功能缺陷；不要用伪造身份或跳过校验的方式绕过。
+- `run drive` 是前台串行协调循环，并非无人值守服务：基于账本回收未结算派单、按报告驱动 Worker gate，在 Lead 阶段停止；不会 finish、审批、提交或清理。`--resume` 用于接管意外中断的 drive；每次行动前以账本为准，绝不因进度提示或文件缺失重发。不支持自动返工的 verdict、审批及异常需人工处理。默认最多 20 步、1800 秒；每次派单前按剩余期限收紧 Herdr 与 subprocess 等待，剩余不超过 5 秒不再派单。超时只回收、不重发，返回 `deadline_exceeded` 标明是否已越过期限。
+- 自动 drive 要求所有 Worker 绑定可验证 `agent_session`；旧 team 未绑定时需重建或 `adopt`，手动命令仍可使用。自动 gate 仅依据 Worker 自报及其工件哈希，不是独立验证；Lead 必须在验收前核对文件、测试和证据。
 - `run gate --decision revise`：Worker 反馈不通过，进入新一轮，必要时先派 Developer `--remediation`，然后重新让 Reviewer/Tester 检查。
 - `run collect`：**只**根据任务专属 JSON + 已知 Agent 状态完成结算，终端快照不算证据。
 - `run pause/resume`：管理已保存的执行状态；不会自动启动或杀死 Worker。
