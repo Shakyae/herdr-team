@@ -21,7 +21,7 @@
 | 2 | 重复派单精确序列：`--no-wait` → 账本断言 `submitted_unsettled` → 第二次派单**断言被拒**（exit=2 + stderr 正则）→ `herdr agent wait` → `collect --dispatch-id <账本里的真实 id>` | §5.3–§5.5 |
 | 3 | 报告归属**绝不**从 dispatch 响应读 `run_id`；run_id 只来自 `htm run list` 与 `$HTM_STATE_DIR/runs/*.json` | §5.7 |
 | 4 | 超时用例用 run 文件集合差集定位新 run，再从 `dispatches[-1].id` 取 dispatch id 并断言唯一 | §5.9 |
-| 5 | 明确「同一 pane 只允许一个 non-terminal run」，给出只读断言 | §3.5、§5.8 |
+| 5 | 明确「同一 pane 只允许一个 non-terminal run」，给出只读断言 | §3.6、§5.8 |
 | 6 | 错误报告注入改为独立 Mock：`cp -R` 一份 state 到 `$MOCK/state`，在副本中伪造账本与工件后直接 `collect` | §5.10 |
 | 7 | 16 条机器断言重写，无 `\|\| true`、无 `2>/dev/null`；每条含编号/对象/命令/通过条件/失败诊断；身份不符按 JSON 判定 | §6 |
 | 8 | Blocked 只做被动观察，不构造危险操作；未发生标「未验证」；禁止 send-keys 代答 | §5.12 |
@@ -33,7 +33,7 @@
 - 全程只注册 **1 个 team**（`dev-lite`）；`init` 创建 `developer` + `reviewer` 两个 worker，**只向 developer 发 prompt**，reviewer 从不被驱动。测试 agent 总数 = 2，被驱动的 = 1。
 - 阶段 A **不额外创建探针**：直接以主 team 的 developer 作为探针（2 次 prompt：正常 + 超时）。阶段 A 与阶段 B 复用同一个 agent。
 - 阶段 B 的 htm prompt 共 3 次：D1（`--no-wait`）、D2、超时派单。
-- 超时用例在同一 team 内完成（默认 `task_timeout_seconds=300`，用 `sleep 420` 触发真实超时），不注册第二个 team、不建第二个 Lead。
+- 超时用例在同一 team 内完成（`init` 时 `--set orchestration.task_timeout_seconds=60`，用 worker 侧 `sleep 180` 触发真实超时），不注册第二个 team、不建第二个 Lead。
 - 全程不构造危险审批、不改任何仓库代码。
 
 ### 1.3 范围
@@ -57,15 +57,16 @@ htm run collect --dispatch-id DID -> herdr agent get <agent> -> agent_status_of(
 
 - [ ] 用户已明确授权：1 个测试 Workspace；2 个 Tab（根 Tab + Worker Tab）；1 个 team、2 个 Worker agent（developer + reviewer，仅 developer 被派单）；共 5 次 prompt（A1、A2、D1、D2、B8）
 - [ ] 执行环境在 Herdr 内，`HERDR_ENV=1` 且 `HERDR_WORKSPACE_ID` / `HERDR_TAB_ID` / `HERDR_PANE_ID` 均非空；缺失则**停止**并修启动器，禁止手工伪造
-- [ ] 已确认 `config/team.yaml` 默认 `max_rounds=5, max_retries=1, max_parallel=3, task_timeout_seconds=300`，governance `autonomy=workspace-write, approval=boundary`
+- [ ] 已确认 `config/team.yaml` 默认 `max_rounds=5, max_retries=1, max_parallel=3, task_timeout_seconds=300`，governance `autonomy=workspace-write, approval=boundary`；本方案在 `init` 时用 `--set orchestration.task_timeout_seconds=60` 覆盖（范围 15..300）
 - [ ] 已确认不改 `scripts/htm.py`、`tests/`、`pyproject.toml`、`uv.lock`、`SKILL.md`、`config/`
 - [ ] 已确认不碰 `~/pagi`、`w1`、`w2`（见 §3.2 受保护清单）
 - [ ] 已阅读 §3.1 的 `abort()` / ID 校验器，并在每个 shell 中定义
+- [ ] **目录信任已由人确认**：目标 cwd 里已人工运行过一次 `claude` 并选 Yes，`/exit` 后根 pane 无残留 agent（见 §3.4）
 
 ### 2.2 阶段 A（单 Worker 通信）
 
 - [ ] 探针就是主 team 的 developer（`ht…`），不额外创建 agent
-- [ ] 正常 prompt（A1）exit=0，返回体结构已记录，`agent_status_of` 落在 `{idle, done}`，且本轮 nonce 在终端输出命中
+- [ ] 正常 prompt（A1）exit=0，返回体结构已记录，`agent_status_of(doc["result"])` 落在 `{idle, done}`（不得喂未解包的 `doc`，见 §3.8），且本轮 nonce 在 **`⏺` 模型回复行**命中（排除 `❯` 输入回显，见 §4.3）
 - [ ] 超时 prompt（A2）记录 timeout 或未触发；不据此断言输入未送达
 - [ ] 证据写入 `$EVIDENCE/phaseA/`
 - [ ] 阶段 A Go/No-Go 已判定为 **Go**
@@ -73,8 +74,8 @@ htm run collect --dispatch-id DID -> herdr agent get <agent> -> agent_status_of(
 ### 2.3 阶段 B（HTM 调度）
 
 - [ ] 仅在 A=Go 后开始
-- [ ] 只有一个 team，`init` 时加 `--set orchestration.max_retries=5`
-- [ ] 主 run 是该 pane 上唯一的 non-terminal run（见 §3.5）
+- [ ] 只有一个 team，`init` 时加 `--set orchestration.max_retries=5 --set orchestration.task_timeout_seconds=60`
+- [ ] 主 run 是该 pane 上唯一的 non-terminal run（见 §3.6）
 - [ ] 已记录 dispatch 响应的 key 集合，确认其中**没有** `run_id`
 - [ ] B1–B12 中每条断言都走了 §6 编号断言，失败即 abort
 - [ ] 证据写入 `$EVIDENCE/phaseB/`
@@ -223,9 +224,42 @@ printf 'export ITEST_WS=%q ITEST_TAB=%q ITEST_ROOT_PANE=%q\n' \
 printf '在新 pane 粘贴执行：source %q\n' "$ITEST_ROOT/env.sh"
 ```
 
-### 3.4 注册唯一的 team（阶段 A 前）
+### 3.4 目录信任预检（必须人工，`htm init` 之前）
 
-阶段 A 的探针就是这里生成的 developer，因此 team 必须在阶段 A 之前注册。**必须在测试 workspace 的根 pane（`$ITEST_ROOT_PANE`）里执行**，先在新 pane 执行上一步打印的 `source` 命令恢复变量与函数，然后断言身份：
+**为什么需要**：Claude Code 对从未信任过的 cwd 会弹出 `Is this a project you created or one you trust?` 对话框。`agent start ... --kind claude` 无法越过该对话框，agent 会停在 `blocked`，`htm init` 因此返回 `partial`（`agent_not_ready ... blocked during startup`）。而且 `init` 对该 partial team **拒绝自动重试**：`scripts/htm.py:497-498` 明确抛出 `Previous init is partial ... no automatic duplicate creation.`，所以一旦踩中就只能人工收拾现场。
+
+先在根 pane 里 source `$ITEST_ROOT/env.sh` 恢复变量与函数：粘贴执行 §3.3 打印的含绝对路径的 `source` 命令（新 pane 尚未设置 `$ITEST_ROOT`），然后断言身份；任一断言失败即 abort：
+
+```bash
+[ "${HERDR_ENV:-}" = "1" ] || abort "HERDR_ENV 缺失；禁止伪造"
+[ "${HERDR_WORKSPACE_ID:-}" = "$ITEST_WS" ] || abort "不在测试 workspace（期望 $ITEST_WS）"
+[ "${HERDR_PANE_ID:-}" = "$ITEST_ROOT_PANE" ] || abort "不在测试根 pane（期望 $ITEST_ROOT_PANE）"
+[ "$(pwd)" = "$ITEST_ROOT" ] || abort "cwd 不是临时目录: $(pwd)"
+```
+
+**做法**（在目标 cwd 的根 pane 里，即 §3.3 创建的 `$ITEST_ROOT_PANE`，cwd 为 `$ITEST_ROOT`）：
+
+1. 直接在该 pane 运行 `claude`。
+2. 若出现 trust 对话框：**停止自动流程，交给人在终端里确认**（选 Yes）。
+3. 确认后输入 `/exit` 退出 claude。
+4. 执行 `herdr agent list`，确认该 pane 没有残留 agent（`pane_id == $ITEST_ROOT_PANE` 的行数为 0）。
+5. 再按 §3.5 执行 `htm init`。
+
+```bash
+# 在第 4 步之后、htm init 之前执行
+herdr agent list > "$EVIDENCE/phaseB/00b-agents-before-init.json" || abort "agent list 失败"
+jq -e --arg p "$ITEST_ROOT_PANE" '[.result.agents[]|select(.pane_id==$p)]|length==0' \
+  "$EVIDENCE/phaseB/00b-agents-before-init.json" >/dev/null \
+  || abort "根 pane 仍有残留 agent，不得 init: $ITEST_ROOT_PANE"
+```
+
+**明确禁止**：不得用 `send-keys`（或其他自动输入手段）代替人应答 trust 对话框，除非用户当轮明确授权。
+
+**partial 发生后的处理**：**不要**删除 team 文件硬闯，也不要手工把 `status` 改回正常。记录现场（team 文件路径、`htm status` 输出、`herdr agent list`），如实向用户报告，由人决定是否新建 workspace、换新 `RUNTOKEN` 重来。
+
+### 3.5 注册唯一的 team（阶段 A 前）
+
+阶段 A 的探针就是这里生成的 developer，因此 team 必须在阶段 A 之前注册。**必须在测试 workspace 的根 pane（`$ITEST_ROOT_PANE`）里执行**，先在新 pane 执行 §3.3 打印的 `source` 命令恢复变量与函数（若前一节已 source 可跳过），然后断言身份：
 
 ```bash
 [ "${HERDR_ENV:-}" = "1" ] || abort "HERDR_ENV 缺失；禁止伪造"
@@ -236,7 +270,8 @@ printf '在新 pane 粘贴执行：source %q\n' "$ITEST_ROOT/env.sh"
 htm validate > "$EVIDENCE/phaseB/00-validate.json" || abort "validate 失败"
 jq -e '.valid == true' "$EVIDENCE/phaseB/00-validate.json" >/dev/null || abort "validate 未返回 valid"
 htm init dev-lite --layout tab --worktree off --cwd "$ITEST_ROOT" \
-  --set orchestration.max_retries=5 > "$EVIDENCE/phaseB/01-init.json" || abort "init 失败"
+  --set orchestration.max_retries=5 \
+  --set orchestration.task_timeout_seconds=60 > "$EVIDENCE/phaseB/01-init.json" || abort "init 失败"
 jq -e '.reused == false' "$EVIDENCE/phaseB/01-init.json" >/dev/null \
   || abort "init 返回 reused=true；先人工核对，不得重跑"
 _tmp=$(jq -er '.team.roles[]|select(.role=="developer")|.agent_name' "$EVIDENCE/phaseB/01-init.json") || abort "取不到 developer"
@@ -262,9 +297,10 @@ jq -e '.agents[] | select(.role=="reviewer") | .live==true' "$EVIDENCE/phaseB/02
 
 - `--layout tab` 让 worker 独占 `init` 自建的 `htm-dev-lite` tab，与 Lead 分屏；`--worktree off` 避免触碰任何 Git 仓库。
 - `--set orchestration.max_retries=5` 是必须的：同一 stage_attempt 内同一 role 的派单上限是 `1+max_retries`，默认 1 只允许 2 次，而本方案在同一次 run 内需要 D1 + D2 + 超时共 3 次。
-- `agent start` 没有 `--cwd`；worker 的 cwd 来自 `init` 的 `--cwd`。`agent_not_ready` 表示启动期被弹窗阻塞，由**人**处理，不自动应答。
+- `--set orchestration.task_timeout_seconds=60` 把 htm 侧单次派单等待固定为 60 秒（合法范围 15..300）；**阶段 B 的 htm 派单**统一使用该值，阶段 A 的 A2 是直接 CLI 调用，使用 `--timeout 15000`（见 §4.4）。该值事后不可改。
+- `agent start` 没有 `--cwd`；worker 的 cwd 来自 `init` 的 `--cwd`。`agent_not_ready` 表示启动期被弹窗阻塞，由**人**处理，不自动应答（见 §3.4）。
 
-### 3.5 单 pane 单 Run 约束（只读断言）
+### 3.6 单 pane 单 Run 约束（只读断言）
 
 `run_start` 会拒绝与其 `(workspace, pane_id)` 重叠的未完成 Run（`scripts/htm.py:591-598`）。本方案额外要求执行者主动断言——使用 §3.1 已定义的 `assert_single_active_run <ws> <pane>`，字段依据 `scripts/htm.py:234-242,599-601`（`workspace` / `lead_pane`）；它只计数 `active`，账本解析失败即 abort，在 `runs/` 目录不存在时按 0 处理，不使用 `2>/dev/null`，逐文件读取以避免 `jq -s` 对空 glob 的行为差异：
 
@@ -273,7 +309,7 @@ jq -e '.agents[] | select(.role=="reviewer") | .live==true' "$EVIDENCE/phaseB/02
 assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 ```
 
-### 3.6 已核实 CLI / 实现事实
+### 3.7 已核实 CLI / 实现事实
 
 **Herdr**
 
@@ -304,10 +340,27 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 | run_id 12 位 hex、dispatch_id 10 位 hex | `:640-644` |
 | worker 名 `ht<digest>-N-<role>`；team 文件 `teams/<sha256(workspace\|lead_pane)[:16]>.json`；run 文件 `runs/<12位>.json` | `:548-549`、`:249-251` |
 | `--config` 是全局参数，必须在子命令前 | `:992-996` |
+| `process()` 已解包 Herdr 响应：`return out.get("result", out)` | `:309` |
+| `agent_status_of()` 读 `agent_status`（回退 `status`）；缺省返回 `unknown`，调用方按 uncertain 处理 | `:339-352` |
 
-`--set orchestration.max_retries=5` 的必要性：同一 stage_attempt 内对同一 role 的派单上限是 `1+max_retries`。默认 1 只允许 2 次；本方案在 `implement` 上需要 D1、D2、超时共 3 次，并预留 collect 未结算后的重派余量，因此固定到上限 5（允许 6 次）。`task_timeout_seconds` 在 `init` 时固化（默认 300），事后不能改，所以超时用例靠 worker 侧 `sleep 420` 触发，而不是改配置或开第二个 team。
+`--set orchestration.max_retries=5` 的必要性：同一 stage_attempt 内对同一 role 的派单上限是 `1+max_retries`。默认 1 只允许 2 次；本方案在 `implement` 上需要 D1、D2、超时共 3 次，并预留 collect 未结算后的重派余量，因此固定到上限 5（允许 6 次）。`task_timeout_seconds` 在 `init` 时固化（本方案取 60），事后不能改，所以超时用例靠 worker 侧 `sleep 180` 触发，而不是改配置或开第二个 team。
 
 命名说明：`htm` 的 worker 由 `init` 生成 `ht…`，`verify_existing()` 按 `team["agent_name"]` 查活体，因此**不能**把派单目标改成探针名。探针只用于阶段 A 的原始返回实测，不进入 htm 账本。
+
+### 3.8 `.result` 状态解析（原始 CLI vs htm 内部）
+
+真实 `herdr agent prompt --wait` 的原始返回是 `{id, result}`，其中 `result = {agent, type}`；Agent 对象在 `result.agent` 里，含 `agent_status` / `agent` / `pane_id` 等字段。
+
+- **htm 内部**：`process()` 已经 `return out.get("result", out)`（`scripts/htm.py:309`），所以 `agent_status_of()` 实际收到的是**已解包的 result 层**对象，能正确解析为 `done`/`idle`。
+- 因此“顶层没有 status”这一说法是针对**原始 CLI 输出**的，不是针对 htm 内部。文档中凡是要在 python 里直接调用 `agent_status_of()` 校验原始输出，必须先解包：
+
+```python
+doc = json.load(open(path))
+h.agent_status_of(doc["result"])   # 正确：htm 内部同样是先解包 result 再解析
+h.agent_status_of(doc)             # 错误：得到 unknown，属于调用方式错误，不是代码缺陷
+```
+
+- 若某处示例直接喂未解包的 `doc` 并观察到 `unknown`，那是**调用方式错误**，不得据此判定 htm 映射缺陷或 No-Go。全文相关示例（§4.3 解析验证、§4.6 A1 状态解析）均已按此修正。
 
 ---
 
@@ -315,11 +368,11 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 
 ### 4.1 目的
 
-在最小成本下确认：真实 Herdr 0.9.5 的 `agent prompt --wait` 返回形状能被 `agent_status_of` 解释为 `idle`/`done`，超时返回 `Error` 时不能让调用方误判为已送达/已成功。阶段 A 直接使用 §3.4 生成的 `$DEV`（同一个 agent 后续也会被 htm 派单），**不额外创建探针**。
+在最小成本下确认：真实 Herdr 0.9.5 的 `agent prompt --wait` 返回形状能被 `agent_status_of` 解释为 `idle`/`done`，超时返回 `Error` 时不能让调用方误判为已送达/已成功。阶段 A 直接使用 §3.5 生成的 `$DEV`（同一个 agent 后续也会被 htm 派单），**不额外创建探针**。
 
 ### 4.2 前置
 
-§3.3、§3.4 完成；`herdr agent get "$DEV"` 的 `.result.agent.agent_status` 为 `idle`/`done`。若为其他值，先 `herdr agent wait "$DEV" --timeout 120000`；仍非 `idle/done` 则 abort，不得发送。
+§3.3、§3.4、§3.5 完成；`herdr agent get "$DEV"` 的 `.result.agent.agent_status` 为 `idle`/`done`。若为其他值，先 `herdr agent wait "$DEV" --timeout 120000`；仍非 `idle/done` 则 abort，不得发送。
 
 ```bash
 herdr agent get "$DEV" \
@@ -345,7 +398,7 @@ jq -r '.result | to_entries[] | "\(.key):\(.value|type)"' "$A1_OUT" \
   > "$EVIDENCE/phaseA/13-result-shape.txt" || abort "A1 结构记录失败"
 ```
 
-解析验证（只记录 key 与短值，不记录长文本）：
+解析验证（只记录 key 与短值，不记录长文本）。注意：原始 CLI 输出是 `{id, result}`，Agent 对象在 `result.agent` 里，**必须**先解包 `.result` 再交给 `agent_status_of`（详见 §3.8）：
 
 ```bash
 python3 - "$A1_OUT" "$REPO/scripts/htm.py" <<'PY' > "$EVIDENCE/phaseA/14-status-parse.txt"
@@ -354,23 +407,25 @@ doc_path, module = sys.argv[1], sys.argv[2]
 spec = importlib.util.spec_from_file_location("htm", module)
 h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 doc = json.load(open(doc_path, encoding="utf-8"))
-res = doc.get("result") if isinstance(doc, dict) else None
-print("doc_status_of =", h.agent_status_of(doc))
+res = doc["result"]                      # 原始 CLI 返回 {id, result}
 print("result_status_of =", h.agent_status_of(res))
-print("doc_kind_of =", h.agent_kind_of(doc))
+print("result_kind_of =", h.agent_kind_of(res))
 PY
 cat "$EVIDENCE/phaseA/14-status-parse.txt"
-grep -Eq 'doc_status_of = (idle|done)$|result_status_of = (idle|done)$' "$EVIDENCE/phaseA/14-status-parse.txt" \
+grep -Eq 'result_status_of = (idle|done)$' "$EVIDENCE/phaseA/14-status-parse.txt" \
   || abort "A1 状态无法解析为 idle/done（记录为需补映射，No-Go）"
 herdr agent read "$DEV" --source recent-unwrapped --lines 40 > "$EVIDENCE/phaseA/15-a1-read.txt" || abort "A1 终端读取失败"
-grep -Fq "ITEST_PONG_${RUNTOKEN}_A1" "$EVIDENCE/phaseA/15-a1-read.txt" || abort "A1 未在终端输出中观察到本次 nonce，通信未被证实"
+grep -E '^⏺ ' "$EVIDENCE/phaseA/15-a1-read.txt" | grep -Fq "ITEST_PONG_${RUNTOKEN}_A1" \
+  || abort "A1 模型回复行未命中本次 nonce，通信未被证实"
 ```
 
-状态 `idle/done` 只证明生命周期，nonce 命中才证明本轮 prompt 被处理。终端输出证据可能含对话内容，留存或分享前须脱敏。
+状态 `idle/done` 只证明生命周期；只匹配以 `⏺` 开头且含本次 nonce 的模型回复行，可排除以 `❯` 开头的输入回显。模型回复命中证明观察到本轮回复，但本身不证明其他动作已执行。终端输出证据可能含对话内容，留存或分享前须脱敏。
 
 ### 4.4 A2 超时 prompt（第 2 次）
 
-用 15 秒调用方超时对 `sleep 45` 的任务发 prompt。模型可能不执行 `sleep 45`，因此 15 秒超时不一定发生；A2 带 nonce，但超时可能尚未完成，不要求命中。
+用调用方 `--timeout 15000`（15 秒）对 `sleep 45` 的任务发 prompt。模型可能不执行 `sleep 45`，因此 15 秒超时不一定发生；A2 带 nonce，但超时可能尚未完成，不要求命中。
+
+CLI timeout 时的**标准形态**：stderr 为 `{"error":{"code":"timeout","message":"timed out waiting for agent status"}}`，exit=1。
 
 ```bash
 A2_OUT="$EVIDENCE/phaseA/20-prompt-timeout.json"
@@ -380,17 +435,27 @@ herdr agent prompt "$DEV" "先执行 sleep 45，再回复 ITEST_PONG_${RUNTOKEN}
   --wait --timeout 15000 >"$A2_OUT" 2>"$A2_ERR" || rc=$?
 if [ "$rc" -eq 0 ]; then
   printf '%s\n' 'NOT-OBSERVED: timeout 未触发（模型未执行 sleep），本次超时不作为验证项' > "$EVIDENCE/phaseA/16-a2-result.txt"
-elif grep -Eqi 'timeout|timed out' "$A2_ERR" "$A2_OUT"; then
-  printf '%s\n' 'VERIFIED: timeout 已观察；失败不代表输入未送达' > "$EVIDENCE/phaseA/16-a2-result.txt"
+elif [ "$rc" -eq 1 ] && grep -Eq '"code"[[:space:]]*:[[:space:]]*"timeout"' "$A2_ERR"; then
+  printf '%s\n' 'VERIFIED: CLI timeout（stderr code=timeout, exit=1）；timeout ≠ 未送达，须用 agent read 查 nonce' \
+    > "$EVIDENCE/phaseA/16-a2-result.txt"
 else
   printf 'NOT-OBSERVED: 非 timeout 错误 rc=%s，超时未验证；失败不代表输入未送达\n' "$rc" > "$EVIDENCE/phaseA/16-a2-result.txt"
 fi
 ```
 
-随后等待 developer 稳定并记录观察值（只读，不发 prompt）：
+随后尝试等待 developer 稳定，成功后再用 `agent read` 查模型回复行（只读，不发 prompt）。**timeout ≠ 未送达**：超时只说明调用方不再等，任务可能仍在执行；若 `agent wait` 失败，后续读取与 nonce 判定均标为未验证，不得宣称已稳定或已处理：
 
 ```bash
-herdr agent wait "$DEV" --timeout 180000 || printf 'NOT-OBSERVED: A2 后 agent wait 失败\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+if herdr agent wait "$DEV" --timeout 180000; then
+  herdr agent read "$DEV" --source recent-unwrapped --lines 60 > "$EVIDENCE/phaseA/21-a2-read.txt" || abort "A2 终端读取失败"
+  if grep -E '^⏺ ' "$EVIDENCE/phaseA/21-a2-read.txt" | grep -Fq "ITEST_PONG_${RUNTOKEN}_A2"; then
+    printf '%s\n' 'NONCE-A2: HIT（模型回复行命中；timeout 不代表未送达）' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+  else
+    printf '%s\n' 'NONCE-A2: MISS（不能据此断言未送达，只记录）' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+  fi
+else
+  printf 'NOT-OBSERVED: A2 后 agent wait 失败；后续读取与 nonce 判定未验证\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+fi
 herdr agent get "$DEV" | jq -r '.result.agent | [.name, .agent_status, .revision, .state_change_seq] | @tsv' \
   > "$EVIDENCE/phaseA/22-after-timeout.tsv" || printf 'NOT-OBSERVED: A2 后状态读取失败\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
 ```
@@ -399,14 +464,14 @@ herdr agent get "$DEV" | jq -r '.result.agent | [.name, .agent_status, .revision
 
 ### 4.5 阶段 A 证据
 
-`$EVIDENCE/phaseA/` 至少包含：`00-probe-agent.json`、`10/11/12/13/14-*`、`15-a1-read.txt`、`16-a2-result.txt`、`20-prompt-timeout.{json,err}`、`22-after-timeout.tsv`。
+`$EVIDENCE/phaseA/` 至少包含：`00-probe-agent.json`、`10/11/12/13/14-*`、`15-a1-read.txt`、`16-a2-result.txt`、`20-prompt-timeout.{json,err}`；wait 成功时还包括 `21-a2-read.txt`，状态读取成功时包括 `22-after-timeout.tsv`。
 
 ### 4.6 阶段 A Go/No-Go
 
 | 项 | Go 条件 |
 |---|---|
-| A1 nonce | 本轮 nonce 在终端输出命中（包括 prompt 成功返回） |
-| A1 状态解析 | `agent_status_of` 对顶层或 `.result` 至少一处返回 `idle` 或 `done` |
+| A1 nonce | prompt 成功返回，且本轮 nonce 在以 `⏺` 开头的模型回复行命中 |
+| A1 状态解析 | `agent_status_of(doc["result"])` 返回 `idle` 或 `done`（不得直接喂未解包的 `doc`，见 §3.8） |
 | A1 返回体结构 | 合法 JSON，key 和类型已记录 |
 
 仅上述三项决定 Go/No-Go；A2 未触发 timeout 不判 No-Go。任一必要断言失败即 `exit 1`，因此 GO 文件不存在即 No-Go；重新执行前必须使用新的 `RUNTOKEN` 和证据目录。若需要将 No-Go 落盘，可在 `abort()` 的 `exit 1` 前加入 `printf 'NO-GO: %s\n' "$*" > "$GO_FILE"`，并在断言前设置对应阶段的 `GO_FILE`；这不是强制要求。
@@ -426,12 +491,21 @@ grep -qx GO "$GO_FILE" || abort "阶段 A 未 GO"
 
 ## 5. 阶段 B：HTM 调度、结果、异常验证
 
-阶段 B 只对 `developer` 派单；`reviewer` 由 `init` 创建但**不发 prompt**。team 已在 §3.4 注册（同一 team，`max_retries=5`，默认 `task_timeout_seconds=300`），超时用 `sleep 420` 在同一 team 内触发真实超时。
+阶段 B 只对 `developer` 派单；`reviewer` 由 `init` 创建但**不发 prompt**。team 已在 §3.5 注册（同一 team，`max_retries=5`，`task_timeout_seconds=60`）。
 
-### 5.1 B0 前置复核（team 已由 §3.4 注册）
+超时参数分工（全文统一）：
+
+| 参数 | 位置 | 取值 | 作用 |
+|---|---|---|---|
+| A2 直接 CLI | `herdr agent prompt ... --timeout 15000`（§4.4） | `15000` ms | 调用方等待 15s |
+| B8 htm | `init --set orchestration.task_timeout_seconds=60`（§3.5），htm 生成 `--timeout 60000` | `60000` ms | Herdr 等待 60s；htm 的 `herdr()` 子进程上限为 `60000/1000+15 = 75` 秒（`scripts/htm.py:781-786`） |
+
+CLI timeout 时 stderr 为 `{"error":{"code":"timeout","message":"timed out waiting for agent status"}}`，exit=1。**timeout ≠ 未送达**：等待成功后可用 `herdr agent read` 检查模型回复行中的本轮 nonce；未命中不能证明未送达。
+
+### 5.1 B0 前置复核（team 已由 §3.5 注册）
 
 ```bash
-[ -n "${DEV:-}" ] && [ -n "${DEV_PANE:-}" ] && [ -n "${REV:-}" ] || abort "§3.4 未完成"
+[ -n "${DEV:-}" ] && [ -n "${DEV_PANE:-}" ] && [ -n "${REV:-}" ] || abort "§3.5 未完成"
 [ -n "${ITEST_WS:-}" ] && [ -n "${ITEST_ROOT_PANE:-}" ] || abort "§3.3 未完成"
 htm status > "$EVIDENCE/phaseB/02b-status.json" || abort "htm status 失败"
 jq -e '.agents[] | select(.role=="developer") | .live==true and (.observed_state=="idle" or .observed_state=="done")' \
@@ -589,9 +663,9 @@ grep -c 'status=active' "$EVIDENCE/phaseB/32-active-runs.txt" \
 
 在同一 team 上对同一 developer 再开 run 会被 `run_start` 拒绝（`Worker(s) reserved by unfinished Run ...`）。该负例可选，不构造成本。
 
-### 5.9 B8 超时用例（同一 team / 默认 300s，第 3 次 htm prompt）
+### 5.9 B8 超时用例（同一 team / `task_timeout_seconds=60`，第 3 次 htm prompt）
 
-`task_timeout_seconds` 在 `init` 时固化（`config/team.yaml` 默认 300），事后不能改；为了不注册第二个 team，本用例让 worker `sleep 420`，从而在默认 300 秒超时下触发真实的 `timeout`。
+`task_timeout_seconds` 在 `init` 时固化为 60（§3.5），事后不能改；为了不注册第二个 team，本用例让 worker `sleep 180`，尝试触发真实的 `timeout`。模型不一定执行 sleep，且其他错误也会走 uncertain 路径，必须核验账本中的 timeout 证据。
 
 **不从失败命令的 stdout 取 dispatch id**（超时失败时 stdout 可能为空）。做法：派单前后快照 `runs/*.json` 集合与目标 run 的派单数，差集必须为空；dispatch id 从目标 run 文件的 `dispatches[-1].id` 读取，并断言唯一。
 
@@ -612,7 +686,7 @@ printf 'run=%s dispatch-count-before=%s\n' "$TRUN" "$BEFORE_COUNT" > "$EVIDENCE/
 
 rc=0
 htm run dispatch --run-id "$TRUN" --role developer --effect read \
-  --message '先执行 sleep 420，再按提示路径写入 JSON 报告；不要提前写。' \
+  --message "先执行 sleep 180，完成后回复 ITEST_PONG_${RUNTOKEN}_B8，再按提示路径写入 JSON 报告；不要提前写。" \
   > "$EVIDENCE/phaseB/42-dispatch-timeout.txt" 2>&1 || rc=$?
 [ "$rc" -eq 2 ] || abort "超时派单应失败 exit=2，实际 $rc"
 grep -Eq 'Dispatch [a-f0-9]{10} uncertain; input might have been sent\. Run collect before retry\.' \
@@ -633,10 +707,23 @@ printf '%s' "$TD1" | grep -Eq '^[a-f0-9]{10}$' || abort "TD1 形状非法"
 jq -e --arg d "$TD1" '([.dispatches[]|select(.id==$d)]|length)==1' "$TRUN_FILE" >/dev/null \
   || abort "TD1 在账本中不唯一"
 jq -e --arg d "$TD1" '.dispatches[]|select(.id==$d)|.status=="submission_uncertain" and (.error|length>0)' \
-  "$TRUN_FILE" >/dev/null || abort "超时后账本不是 submission_uncertain 或 error 为空"
+  "$TRUN_FILE" >/dev/null || abort "派单后账本不是 submission_uncertain 或 error 为空"
+jq -er --arg d "$TD1" '.dispatches[]|select(.id==$d)|.error' "$TRUN_FILE" \
+  > "$EVIDENCE/phaseB/42-ledger-error.txt" || abort "读取账本 error 失败"
+# Command unavailable 是 OSError，可能是可执行文件缺失而非超时
+if ! grep -Fq 'Command unavailable' "$EVIDENCE/phaseB/42-ledger-error.txt" && \
+   { grep -Eq '"code"[[:space:]]*:[[:space:]]*"timeout"' "$EVIDENCE/phaseB/42-ledger-error.txt" || \
+     grep -Fq 'timed out waiting for agent status' "$EVIDENCE/phaseB/42-ledger-error.txt"; }; then
+  printf '%s\n' 'VERIFIED: 账本 error 含 timeout 证据' > "$EVIDENCE/phaseB/42-timeout-verification.txt"
+else
+  printf '%s\n' 'NOT-VERIFIED: timeout 未确认（账本仅有其他错误）' > "$EVIDENCE/phaseB/42-timeout-verification.txt"
+  abort "NOT-VERIFIED: timeout 未确认，不得算 B8 通过"
+fi
 grep -q "$TD1" "$EVIDENCE/phaseB/42-dispatch-timeout.txt" \
   || abort "错误信息里的 dispatch id 与账本不一致"
 ```
+
+账本 error 可能是 Herdr 自身返回的 `{"code":"timeout",...}` 或 `timed out waiting for agent status`；htm 子进程超时会以 `Command unavailable/timed out` 出现，本判据**保守地**归为 NOT-VERIFIED（fail-closed），不作为 timeout 证据。含 `Command unavailable` 的 OSError 可能并非超时，必须排除。`stalled`、命令错误等其他 `Error` 同样会写入 `submission_uncertain`，但不能证明 timeout，须记为 NOT-VERIFIED 并保留现场。这是有意的保守取舍：宁可将可超时但未确证的情形记为 NOT-VERIFIED，也不把非 timeout 错误误判为通过。
 
 不自动重发：
 
@@ -649,16 +736,26 @@ grep -Eq 'Pending/uncertain dispatch [a-f0-9]{10}; use run collect, never blindl
   || abort "超时后重发拒绝原因不符"
 ```
 
-收尾（collect 会把 `submission_uncertain` 改写为 settled/blocked/uncertain，属正常推进）：
+收尾（collect 会把 `submission_uncertain` 改写为 settled/blocked/uncertain，属正常推进）。若 `agent wait` 失败即 abort，后续读取与 nonce 判定均未验证，不得宣称已稳定或已处理；仅匹配以 `⏺` 开头的模型回复行，排除以 `❯` 开头的输入回显：
 
 ```bash
 herdr agent wait "$DEV" --timeout 600000 || abort "developer 等待失败"
+# timeout ≠ 未送达：只记录模型回复行中的 nonce，不凭 MISS 断言未送达
+herdr agent read "$DEV" --source recent-unwrapped --lines 80 > "$EVIDENCE/phaseB/43-b8-read.txt" \
+  || abort "B8 终端读取失败"
+if grep -E '^⏺ ' "$EVIDENCE/phaseB/43-b8-read.txt" | grep -Fq "ITEST_PONG_${RUNTOKEN}_B8"; then
+  printf '%s\n' 'B8-NONCE: HIT（模型回复行命中；timeout 不代表未送达）' > "$EVIDENCE/phaseB/43-b8-nonce.txt"
+else
+  printf '%s\n' 'B8-NONCE: MISS（仅记录，不据此断言未送达）' > "$EVIDENCE/phaseB/43-b8-nonce.txt"
+fi
 htm run collect --run-id "$TRUN" --dispatch-id "$TD1" > "$EVIDENCE/phaseB/47-collect-timeout.json" || abort "timeout collect 失败"
 jq -e --arg d "$TD1" '.dispatch_id==$d and (.status|IN("settled","blocked","uncertain"))' \
   "$EVIDENCE/phaseB/47-collect-timeout.json" >/dev/null || abort "timeout collect 返回异常"
 ```
 
-注意：`sleep 420` 的 worker 在 `--wait` 超时（300s）后仍在工作；`herdr agent wait` 要等它真正结束。若它最终写出合法报告，collect 会得到 `settled`，这**不构成**超时降级用例失败——关键断言是上一步的账本 `submission_uncertain` 与“不自动重发”。
+注意：若 worker 执行了 `sleep 180`，在 `--wait` 超时（`task_timeout_seconds=60`）后可能仍在工作；须等待其结束。若它最终写出合法报告，collect 会得到 `settled`，这**不构成**超时降级用例失败——关键断言是账本中的 timeout 证据、`submission_uncertain` 与“不自动重发”。
+
+**timeout ≠ 未送达**：`htm run dispatch` 的 exit=2 也可能来自其他错误，本身不能证明 timeout 或输入没送进 pane；wait 成功后可用 `herdr agent read` 查该轮模型回复行 nonce，命中也不单独证明 sleep 已执行。同理，`herdr agent prompt --timeout` 返回 `{"error":{"code":"timeout",...}}` 时不据此断言未送达。
 
 ### 5.10 B9 Mock：错误报告注入（独立 state 副本，**Mock**）
 
@@ -857,7 +954,7 @@ fi
 | B5（§5.6） | 新 id ≠ 旧 id，账本两条记录都在 |
 | B6（§5.7） | 工件身份/形状全通过，`artifact_sha256` 非空 |
 | B7（§5.8） | 同一 pane active run 恰好 1 |
-| B8（§5.9） | 超时 exit=2、账本 `submission_uncertain`、error 非空、重发被拒、run 差集为空、账本恰好 +1 |
+| B8（§5.9） | exit=2、账本 `submission_uncertain` 且 error 含 timeout 错误码或 `timed out waiting for agent status` 证据、重发被拒、run 差集为空、账本恰好 +1；其他错误为 `NOT-VERIFIED: timeout 未确认`，不得通过 |
 | B9（§5.10） | Mock 身份不符 → exit=0 且 JSON `uncertain` + `Result identity mismatch: run_id`；真实 state 哈希不变 |
 | B10（§5.11） | 错误 run-id exit=2；Mock role 篡改报 `unexpected pane` |
 | B11（§5.12） | blocked 未主动构造；观察结果如实标记 |
@@ -890,14 +987,14 @@ grep -qx GO "$GO_FILE" || abort "阶段 B 未 GO"
 | A-08 | 报告归属 | 账本 `report.run_id==$RUN` 且 `report.dispatch_id==$D2` | exit=0，且 `status==settled` | 工件错配 |
 | A-09 | 产物契约 | `jq -e` 校验 run_id/dispatch_id/role/stage/attempt/status/verdict/summary/evidence/tests | exit=0 | 工件形状不合规 |
 | A-10 | 错位工件（Mock） | `HTM_STATE_DIR=$MOCK_STATE htm run collect` 后读 stdout JSON | exit=0 **且** `.status=="uncertain"` 且 `.error` 以 `Result identity mismatch: run_id` 开头 | 归属校验失效 |
-| A-11 | 超时账本 | `jq -e --arg d "$TD1" '.dispatches[]\|select(.id==$d)\|.status=="submission_uncertain" and (.error\|length>0)'` | exit=0 | 超时被当成成功/无错误 |
+| A-11 | 超时账本 | 校验 `submission_uncertain` 与非空 error，另按 §5.9 匹配 timeout 证据 | 两项均通过 | 状态错误或 timeout 未确认 |
 | A-12 | 超时不重发 | 超时后立即 dispatch | rc=2 且含 `never blindly resend` | 重复投递风险 |
 | A-13 | 二次派单唯一性 | `test "$D2" != "$D1"` + 账本两条各 1 | exit=0 | 历史被覆盖 |
 | A-14 | 单 pane 单 Run | `assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"` | active run ≤1；B7 另要求 active 恰好 1 | 冲突 Run 并存 |
 | A-15 | Mock 隔离 | `$MOCK_STATE` ≠ `$HTM_STATE_DIR`；Mock 后真实账本 sha 不变；真实 state 无 Mock 工件 | 三项均成立 | Mock 污染真实 state |
 | A-16 | 状态目录隔离 + 受保护 pane | `find` 默认 state 目录新文件为空；受保护 worker 行 diff 为空 | 输出为空 | 越界写或测试泄漏 |
 
-pytest 等价写法（供后续把断言固化为测试时使用）：
+pytest 等价写法（供后续把断言固化为测试时使用；其中 `test_timeout_ledger` 仅验证账本不确定态与 error 中的 timeout 证据，不验证超时成因，不能单独作为 B8 的等价验证）：
 
 ```python
 import json, re, pathlib, subprocess
@@ -928,7 +1025,11 @@ def test_timeout_ledger(env, run_id, dispatch_id):
     out = htm(env, "run", "status", "--run-id", run_id)
     rec = next(d for d in json.loads(out.stdout)["dispatches"] if d["id"] == dispatch_id)
     assert rec["status"] == "submission_uncertain"
-    assert rec["error"]
+    # Command unavailable 是 OSError，可能是可执行文件缺失而非超时
+    error = rec["error"]
+    assert "Command unavailable" not in error, error
+    # 优先确认 Herdr 等待超时；兜底收紧为完整文案，排除 stalled 等其他含 timed out 的错误
+    assert re.search(r'"code"\s*:\s*"timeout"', error) or "timed out waiting for agent status" in error, error
 
 def test_artifact_contract(artifact, run_id, dispatch_id):
     doc = json.loads(pathlib.Path(artifact).read_text(encoding="utf-8"))
@@ -947,13 +1048,15 @@ def test_artifact_contract(artifact, run_id, dispatch_id):
 
 ```text
 $EVIDENCE/phaseA/   00-探针身份、10-14 正常返回、20-22 超时、GO-NOGO.txt
-$EVIDENCE/phaseB/   00-03 初始化、10-13 D1、20 D2、30-32 归属与互斥、
+                    21-a2-read.txt（仅 `agent wait` 成功时产生；缺失不等于失败）、22-after-timeout.tsv（**内容非空**表示 `herdr agent get` 成功；空文件/缺失均不等于失败）
+$EVIDENCE/phaseB/   00-03 初始化（00b 为 init 前残留 agent 检查）、10-13 D1、20 D2、30-32 归属与互斥、
                     40-47 超时、50-51 Mock、60 负例、70 blocked、80 隔离、GO-NOGO.txt
+                    43-b8-read.txt（仅 `agent wait` 成功时产生；缺失不等于失败）
 ```
 
 规则：
 
-- 除 A1 nonce 验证必需的 `15-a1-read.txt` 外，真实响应只保留 **key 名、值的类型、短值**（如 `idle`、`claude`、10 位 id）；不保存终端标题、长文本、对话内容。
+- 除 nonce 验证必需的 `15-a1-read.txt`、`21-a2-read.txt`、`43-b8-read.txt` 外，真实响应只保留 **key 名、值的类型、短值**（如 `idle`、`claude`、10 位 id）；不保存终端标题、长文本、对话内容。三份 read 证据可能含对话内容，留存或分享前须脱敏。
 - 账本快照用 `jq '{id,status,stage_index,stage_attempt,dispatches:[.dispatches[]|{id,role,status,error,artifact_sha256}]}'`，不保留完整 prompt。
 - Mock 证据文件名带 `mock` 前缀，内容首行标注 `MOCK`，与真实测试分开。
 - 证据留在 `$ITEST_ROOT` 内；如需长期保留，清理前复制到用户另行授权的目录。
@@ -1077,7 +1180,7 @@ unset -f htm mock_htm mock2_htm abort need need_ws need_tab need_pane same_ws \
 | HTM_STATE_DIR 隔离 | 与默认 state 完全隔离 | 不得据此宣称真实多团队并存已验证 |
 | 临时工件清理 | 清理后不可审计 | 需保留时先复制到授权目录 |
 | Lead pane 漂移 | 并行任务导致 revision 变化 | 只对 worker 严格断言 |
-| 超时阈值 | `task_timeout_seconds` init 时固化（默认 300s） | 用 `sleep 420` 触发真实超时；不改 team 配置 |
+| 超时阈值 | `task_timeout_seconds` init 时固化（本方案设为 60s） | 用 worker 侧 `sleep 180` 触发真实超时；不改 team 配置；timeout 不等于未送达 |
 | Mock 与真实差异 | 副本中的账本/工件是伪造的 | 结论必须标 Mock |
 | reviewer 未被验证 | 全程 0 次 prompt | 报告中明确“reviewer 仅验证存在性，未验证其工作链路” |
 
