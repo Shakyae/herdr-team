@@ -97,7 +97,20 @@ htm run collect --dispatch-id DID -> herdr agent get <agent> -> agent_status_of(
 
 ```bash
 set -u
-abort() { printf 'ABORT: %s\n' "$*" >&2; exit 1; }
+abort() {
+  printf 'ABORT: %s\n' "$*" >&2
+  if [ -n "${GO_FILE:-}" ]; then
+    if [ -e "$GO_FILE" ] || [ -L "$GO_FILE" ]; then
+      printf '门槛文件已存在，拒绝覆盖: %s\n' "$GO_FILE" >&2
+      exit 1
+    fi
+    (set -C; printf 'NO-GO: %s\n' "$*" > "$GO_FILE") || {
+      printf '无法写入 NO-GO 文件或文件冲突: %s\n' "$GO_FILE" >&2
+      exit 1
+    }
+  fi
+  exit 1
+}
 need() {
   [ -n "${1:-}" ] && [ "${1:-}" != "null" ] || abort "${2:-missing value}"
 }
@@ -162,9 +175,10 @@ printf '引导文件：%s/env.sh\n' "$ITEST_ROOT"
 
 要点：
 
-- `RUNTOKEN` 每次随机生成，禁止写死；进入新 pane 时变量和函数不会继承，复制上一步打印的引导文件路径并执行 `source "<打印的引导文件路径>"`（路径替换为实际值，不硬编码）；若已设置 `ITEST_ROOT`，执行 `source "$ITEST_ROOT/env.sh"`。
+- `RUNTOKEN` 每次随机生成，禁止写死；进入新 pane 时变量和函数不会继承，复制上一步打印的引导文件路径并执行 `set -u; . "<打印的引导文件路径>" || exit 1`（路径替换为实际值，不硬编码）；若已设置 `ITEST_ROOT`，执行 `set -u; . "$ITEST_ROOT/env.sh" || exit 1`。source 失败即停止。
 - `HTM_STATE_DIR` 在模块导入时读取（`scripts/htm.py:34`），必须每条命令都带着它；未设置时默认 `~/.local/state/herdr-team`。
 - 所有 ABORT 必须 `exit 1`；不允许 `echo "ABORT: ..."` 后继续执行。
+- `env.sh` 只恢复变量与函数，**不恢复 shell 选项**：每个新 shell 都要先执行 §3.1 的 `set -u`，再 `source`。本方案不依赖 `pipefail`，因此每条管道都按 §3.1 的约定单独检查上游退出码，而不是指望 shell 选项兜底。
 
 ### 3.2 隔离与受保护资源
 
@@ -188,32 +202,88 @@ w2:p2  developer-w2
 w2:p3  reviewer-w2
 ```
 
-### 3.3 创建测试 workspace（阶段 A 前）
+### 3.3 建立不可变基线，然后创建测试 workspace（阶段 A 前）
 
-先采集基线（任何写操作之前），放入 `$EVIDENCE/phaseB/`，供 §5.13 复核：
+**采集时机（硬性）**：下列基线必须在**任何测试资源（workspace / tab / pane / agent / run / state 文件）创建之前**采集，并且此后不得重写。`00-agents-before.tsv` 是 §5.13 B12 唯一允许使用的比对基准；**不得用阶段 B 中段或末段的快照替代**，否则“全程未变”的结论超出证据。创建 workspace 前采集是流程约束，不是可独立审计的 workspace 创建时序证明；只读权限也不是防篡改证明。采集后立即置为只读，时间锚点单独落盘为 `00-baseline-epoch.txt`（供默认 state 扫描使用，不得用会变的 `env.sh` 充当锚点），采集时间与校验和写入 `00-baseline-meta.txt`。
 
 ```bash
-herdr agent list \
-  | jq -r '.result.agents[] | [.workspace_id, .pane_id, (.name // "-"), (.agent_status // "-"), (.revision|tostring), (.state_change_seq|tostring)] | @tsv' \
-  | sort > "$EVIDENCE/phaseB/00-agents-before.tsv" || abort "基线 agent list 失败"
-herdr workspace list \
-  | jq -r '.result.workspaces[] | [.workspace_id, (.label // "-")] | @tsv' \
-  | sort > "$EVIDENCE/phaseB/00-workspaces-before.tsv" || abort "基线 workspace list 失败"
-git -C "$REPO" rev-parse HEAD > "$EVIDENCE/phaseB/00-head.txt" || abort "记录 HEAD 失败"
-git -C "$REPO" status --porcelain > "$EVIDENCE/phaseB/00-git-status.txt" || abort "记录 git status 失败"
+BASE="$EVIDENCE/phaseB"
+# 1) 采集基线列表与仓库状态（均为写操作之前）
+# 先落盘原始 JSON 再转 TSV：管道会把 herdr 的退出码丢掉，只看最后一段就等于 fail-open
+herdr agent list > "$BASE/00-agents-before.json" || abort "基线 agent list 失败"
+jq -r '.result.agents[] | [.workspace_id, .pane_id, (.name // "-"), (.agent_status // "-"), (.revision|tostring), (.state_change_seq|tostring)] | @tsv' \
+  "$BASE/00-agents-before.json" > "$BASE/00-agents-before.raw" || abort "基线 agent jq 失败"
+[ -s "$BASE/00-agents-before.raw" ] || abort "基线 agent 列表为空"
+sort "$BASE/00-agents-before.raw" > "$BASE/00-agents-before.tsv" || abort "基线 agent sort 失败"
+herdr workspace list > "$BASE/00-workspaces-before.json" || abort "基线 workspace list 失败"
+jq -r '.result.workspaces[] | [.workspace_id, (.label // "-")] | @tsv' \
+  "$BASE/00-workspaces-before.json" > "$BASE/00-workspaces-before.raw" || abort "基线 workspace jq 失败"
+[ -s "$BASE/00-workspaces-before.raw" ] || abort "基线 workspace 列表为空"
+sort "$BASE/00-workspaces-before.raw" > "$BASE/00-workspaces-before.tsv" || abort "基线 workspace sort 失败"
+git -C "$REPO" rev-parse HEAD > "$BASE/00-head.txt" || abort "记录 HEAD 失败"
+git -C "$REPO" status --porcelain > "$BASE/00-git-status.txt" || abort "记录 git status 失败"
 for p in w1:p1 w1:p5 w1:p6 w2:p1 w2:p2 w2:p3; do
-  awk -v p="$p" '$2==p' "$EVIDENCE/phaseB/00-agents-before.tsv" | grep -q . \
-    || abort "基线缺少受保护 pane: $p"
+  count=$(awk -v p="$p" '$2==p {n++} END {print n+0}' "$BASE/00-agents-before.tsv") || abort "基线检查失败"
+  [ "$count" -gt 0 ] || abort "基线缺少受保护 pane: $p"
 done
+# 2) 记录默认 state 目录在基线时刻是否存在（§5.13 fail-closed 判定用）
+DEFAULT_STATE="$HOME/.local/state/herdr-team"
+default_state_presence() {
+  local dir="$HOME" component
+  [ -d "$dir" ] && [ -x "$dir" ] || abort "HOME 不可搜索"
+  for component in .local state herdr-team; do
+    dir="$dir/$component"
+    if [ -L "$dir" ]; then
+      abort "默认 state 路径含符号链接，需人工核查: $dir"
+    elif [ -e "$dir" ]; then
+      [ -d "$dir" ] && [ -x "$dir" ] && [ -r "$dir" ] || abort "默认 state 路径非目录或不可访问: $dir"
+    else
+      printf 'absent\n' || abort "输出存在性失败"
+      return
+    fi
+  done
+  printf 'present\n' || abort "输出存在性失败"
+}
+typeset -f default_state_presence >> "$ITEST_ROOT/env.sh" || abort "保存默认 state 检查函数失败"
+DEFAULT_PRESENCE=$(default_state_presence) || abort "检查默认 state 失败"
+if [ "$DEFAULT_PRESENCE" = "present" ]; then
+  printf 'present\n' > "$BASE/00-default-state-exists.txt" || abort "记录默认 state 存在性失败"
+else
+  printf 'absent\n' > "$BASE/00-default-state-exists.txt" || abort "记录默认 state 存在性失败"
+fi
+
+# 3) 基线全部落盘后再取时间锚点：保证基线 mtime <= epoch，且 epoch 仍早于任何测试资源创建
+BASELINE_EPOCH=$(date +%s) || abort "生成基线时间戳失败"
+printf '%s\n' "$BASELINE_EPOCH" > "$BASE/00-baseline-epoch.txt" || abort "写入基线时间锚点失败"
+chmod 0444 "$BASE/00-baseline-epoch.txt" || abort "基线时间锚点置为只读失败"
+
+# 4) 元信息 + 校验和，然后冻结基线文件
+CAPTURED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ) || abort "读取采集时间失败"
+SHA_OUTPUT=$(shasum -a 256 "$BASE/00-agents-before.tsv") || abort "计算基线校验和失败"
+SHA=${SHA_OUTPUT%% *}
+printf '%s\n' "$SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "基线校验和格式非法"
+AGENTS_MTIME=$(stat -f '%m' "$BASE/00-agents-before.tsv") || abort "读取基线 mtime 失败"
+{
+  printf 'captured_at=%s\n' "$CAPTURED_AT"
+  printf 'epoch=%s\n' "$BASELINE_EPOCH"
+  printf 'agents_sha256=%s\n' "$SHA"
+  printf 'agents_mtime=%s\n' "$AGENTS_MTIME"
+  printf '%s\n' 'rule=阶段 B 的 B12 只能与本文件及 00-agents-before.tsv 比对；不得重写或用末段快照替代'
+} > "$BASE/00-baseline-meta.txt" || abort "写入基线元信息失败"
+META_SHA=$(awk -F= '$1=="agents_sha256"{print $2}' "$BASE/00-baseline-meta.txt") || abort "读取元信息校验和失败"
+printf '%s\n' "$META_SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "元信息校验和格式非法"
+[ "$META_SHA" = "$SHA" ] || abort "元信息校验和与基线不符"
+chmod 0444 "$BASE/00-agents-before.tsv" "$BASE/00-baseline-meta.txt" \
+  || abort "基线文件置为只读失败"
 ```
 
 ```bash
 WS_JSON=$(herdr workspace create --label "htm-itest-$RUNTOKEN" --cwd "$ITEST_ROOT" --focus) || abort "workspace create 失败"
-_tmp=$(printf '%s' "$WS_JSON" | jq -er '.result.workspace.workspace_id') || abort "取不到 workspace id"
+_tmp=$(jq -er '.result.workspace.workspace_id' <<< "$WS_JSON") || abort "取不到 workspace id"
 export ITEST_WS="$_tmp"
-_tmp=$(printf '%s' "$WS_JSON" | jq -er '.result.tab.tab_id') || abort "取不到 tab id"
+_tmp=$(jq -er '.result.tab.tab_id' <<< "$WS_JSON") || abort "取不到 tab id"
 export ITEST_TAB="$_tmp"
-_tmp=$(printf '%s' "$WS_JSON" | jq -er '.result.root_pane.pane_id') || abort "取不到 root pane id"
+_tmp=$(jq -er '.result.root_pane.pane_id' <<< "$WS_JSON") || abort "取不到 root pane id"
 export ITEST_ROOT_PANE="$_tmp"
 need_ws "$ITEST_WS"; need_tab "$ITEST_TAB"; need_pane "$ITEST_ROOT_PANE"
 same_ws "$ITEST_WS" "$ITEST_TAB" "workspace/tab"
@@ -221,20 +291,32 @@ same_ws "$ITEST_WS" "$ITEST_ROOT_PANE" "workspace/pane"
 case "$ITEST_WS" in w1|w2) abort "测试 workspace 不独立: $ITEST_WS";; esac
 printf 'export ITEST_WS=%q ITEST_TAB=%q ITEST_ROOT_PANE=%q\n' \
   "$ITEST_WS" "$ITEST_TAB" "$ITEST_ROOT_PANE" >> "$ITEST_ROOT/env.sh" || abort "保存 workspace 身份失败"
-printf '在新 pane 粘贴执行：source %q\n' "$ITEST_ROOT/env.sh"
+printf '在新 pane 粘贴执行（source 失败即停止）：set -u; . %q || exit 1\n' "$ITEST_ROOT/env.sh" || abort "打印引导命令失败"
+```
+
+创建测试资源之后，立即确认基线仍未被改写（B12 依赖它）：
+
+```bash
+SHA_OUTPUT=$(shasum -a 256 "$BASE/00-agents-before.tsv") || abort "计算基线校验和失败"
+SHA=${SHA_OUTPUT%% *}
+META_SHA=$(awk -F= '$1=="agents_sha256"{print $2}' "$BASE/00-baseline-meta.txt") || abort "读取元信息校验和失败"
+printf '%s\n' "$SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "基线校验和格式非法"
+printf '%s\n' "$META_SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "元信息校验和格式非法"
+[ "$SHA" = "$META_SHA" ] || abort "基线 00-agents-before.tsv 已被改写，B12 失去可比基准"
 ```
 
 ### 3.4 目录信任预检（必须人工，`htm init` 之前）
 
 **为什么需要**：Claude Code 对从未信任过的 cwd 会弹出 `Is this a project you created or one you trust?` 对话框。`agent start ... --kind claude` 无法越过该对话框，agent 会停在 `blocked`，`htm init` 因此返回 `partial`（`agent_not_ready ... blocked during startup`）。而且 `init` 对该 partial team **拒绝自动重试**：`scripts/htm.py:497-498` 明确抛出 `Previous init is partial ... no automatic duplicate creation.`，所以一旦踩中就只能人工收拾现场。
 
-先在根 pane 里 source `$ITEST_ROOT/env.sh` 恢复变量与函数：粘贴执行 §3.3 打印的含绝对路径的 `source` 命令（新 pane 尚未设置 `$ITEST_ROOT`），然后断言身份；任一断言失败即 abort：
+先在根 pane 恢复变量与函数：粘贴执行 §3.3 打印的 `set -u; . <path>/env.sh || exit 1`（新 pane 尚未设置 `$ITEST_ROOT`；source 失败即停止），然后断言身份；任一断言失败即 abort：
 
 ```bash
 [ "${HERDR_ENV:-}" = "1" ] || abort "HERDR_ENV 缺失；禁止伪造"
 [ "${HERDR_WORKSPACE_ID:-}" = "$ITEST_WS" ] || abort "不在测试 workspace（期望 $ITEST_WS）"
 [ "${HERDR_PANE_ID:-}" = "$ITEST_ROOT_PANE" ] || abort "不在测试根 pane（期望 $ITEST_ROOT_PANE）"
-[ "$(pwd)" = "$ITEST_ROOT" ] || abort "cwd 不是临时目录: $(pwd)"
+CURRENT_DIR=$(pwd) || abort "读取 cwd 失败"
+[ "$CURRENT_DIR" = "$ITEST_ROOT" ] || abort "cwd 不是临时目录: $CURRENT_DIR"
 ```
 
 **做法**（在目标 cwd 的根 pane 里，即 §3.3 创建的 `$ITEST_ROOT_PANE`，cwd 为 `$ITEST_ROOT`）：
@@ -259,13 +341,14 @@ jq -e --arg p "$ITEST_ROOT_PANE" '[.result.agents[]|select(.pane_id==$p)]|length
 
 ### 3.5 注册唯一的 team（阶段 A 前）
 
-阶段 A 的探针就是这里生成的 developer，因此 team 必须在阶段 A 之前注册。**必须在测试 workspace 的根 pane（`$ITEST_ROOT_PANE`）里执行**，先在新 pane 执行 §3.3 打印的 `source` 命令恢复变量与函数（若前一节已 source 可跳过），然后断言身份：
+阶段 A 的探针就是这里生成的 developer，因此 team 必须在阶段 A 之前注册。**必须在测试 workspace 的根 pane（`$ITEST_ROOT_PANE`）里执行**，先在新 pane 执行 §3.3 打印的 `set -u; . <path>/env.sh || exit 1` 恢复变量与函数（source 失败即停止；若前一节已成功执行可跳过），然后断言身份：
 
 ```bash
 [ "${HERDR_ENV:-}" = "1" ] || abort "HERDR_ENV 缺失；禁止伪造"
 [ "${HERDR_WORKSPACE_ID:-}" = "$ITEST_WS" ] || abort "不在测试 workspace（期望 $ITEST_WS）"
 [ "${HERDR_PANE_ID:-}" = "$ITEST_ROOT_PANE" ] || abort "不在测试根 pane（期望 $ITEST_ROOT_PANE）"
-[ "$(pwd)" = "$ITEST_ROOT" ] || abort "cwd 不是临时目录: $(pwd)"
+CURRENT_DIR=$(pwd) || abort "读取 cwd 失败"
+[ "$CURRENT_DIR" = "$ITEST_ROOT" ] || abort "cwd 不是临时目录: $CURRENT_DIR"
 
 htm validate > "$EVIDENCE/phaseB/00-validate.json" || abort "validate 失败"
 jq -e '.valid == true' "$EVIDENCE/phaseB/00-validate.json" >/dev/null || abort "validate 未返回 valid"
@@ -345,7 +428,7 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 
 `--set orchestration.max_retries=5` 的必要性：同一 stage_attempt 内对同一 role 的派单上限是 `1+max_retries`。默认 1 只允许 2 次；本方案在 `implement` 上需要 D1、D2、超时共 3 次，并预留 collect 未结算后的重派余量，因此固定到上限 5（允许 6 次）。`task_timeout_seconds` 在 `init` 时固化（本方案取 60），事后不能改，所以超时用例靠 worker 侧 `sleep 180` 触发，而不是改配置或开第二个 team。
 
-命名说明：`htm` 的 worker 由 `init` 生成 `ht…`，`verify_existing()` 按 `team["agent_name"]` 查活体，因此**不能**把派单目标改成探针名。探针只用于阶段 A 的原始返回实测，不进入 htm 账本。
+命名说明：`htm` 的 worker 由 `init` 生成 `ht…`，`verify_existing()` 按 `team["agent_name"]` 查活体，因此**不能**把派单目标改成其他探针名。阶段 A 的原始探针调用不写入 htm 账本；同一 agent 在阶段 B 由 `init` 生成的 `ht…` 名称进入账本。
 
 ### 3.8 `.result` 状态解析（原始 CLI vs htm 内部）
 
@@ -372,12 +455,16 @@ h.agent_status_of(doc)             # 错误：得到 unknown，属于调用方�
 
 ### 4.2 前置
 
-§3.3、§3.4、§3.5 完成；`herdr agent get "$DEV"` 的 `.result.agent.agent_status` 为 `idle`/`done`。若为其他值，先 `herdr agent wait "$DEV" --timeout 120000`；仍非 `idle/done` 则 abort，不得发送。
+进入阶段 A 前设置 `GO_FILE="$EVIDENCE/phaseA/GO-NOGO.txt"`；每个执行阶段断言的 shell 都须设置。断言失败由 `abort` 写入 NO-GO 并退出；写入失败也须报告 No-Go、保留现场，等待负责人判定。
+
+§3.3、§3.4、§3.5 完成；`herdr agent get "$DEV"` 的 `.result.agent.agent_status` 为 `idle`/`done`。若为其他值则 abort，不得发送。
 
 ```bash
-herdr agent get "$DEV" \
-  | jq -r '.result.agent | {name, pane_id, agent, agent_status, cwd}' \
-  > "$EVIDENCE/phaseA/00-probe-agent.json" || abort "读取 developer 失败"
+GO_FILE="$EVIDENCE/phaseA/GO-NOGO.txt"
+[ ! -e "$GO_FILE" ] && [ ! -L "$GO_FILE" ] || abort "阶段 A 门槛文件已存在，必须使用新证据目录"
+herdr agent get "$DEV" > "$EVIDENCE/phaseA/00-probe-raw.json" || abort "读取 developer 失败"
+jq -r '.result.agent | {name, pane_id, agent, agent_status, cwd}' \
+  "$EVIDENCE/phaseA/00-probe-raw.json" > "$EVIDENCE/phaseA/00-probe-agent.json" || abort "解析 developer 失败"
 jq -e --arg p "$DEV_PANE" '.pane_id==$p and (.agent_status|IN("idle","done"))' \
   "$EVIDENCE/phaseA/00-probe-agent.json" >/dev/null || abort "developer 不在预期 pane 或未 idle/done"
 ```
@@ -401,7 +488,7 @@ jq -r '.result | to_entries[] | "\(.key):\(.value|type)"' "$A1_OUT" \
 解析验证（只记录 key 与短值，不记录长文本）。注意：原始 CLI 输出是 `{id, result}`，Agent 对象在 `result.agent` 里，**必须**先解包 `.result` 再交给 `agent_status_of`（详见 §3.8）：
 
 ```bash
-python3 - "$A1_OUT" "$REPO/scripts/htm.py" <<'PY' > "$EVIDENCE/phaseA/14-status-parse.txt"
+python3 - "$A1_OUT" "$REPO/scripts/htm.py" <<'PY' > "$EVIDENCE/phaseA/14-status-parse.txt" || abort "A1 状态解析失败"
 import importlib.util, json, sys
 doc_path, module = sys.argv[1], sys.argv[2]
 spec = importlib.util.spec_from_file_location("htm", module)
@@ -415,7 +502,7 @@ cat "$EVIDENCE/phaseA/14-status-parse.txt"
 grep -Eq 'result_status_of = (idle|done)$' "$EVIDENCE/phaseA/14-status-parse.txt" \
   || abort "A1 状态无法解析为 idle/done（记录为需补映射，No-Go）"
 herdr agent read "$DEV" --source recent-unwrapped --lines 40 > "$EVIDENCE/phaseA/15-a1-read.txt" || abort "A1 终端读取失败"
-grep -E '^⏺ ' "$EVIDENCE/phaseA/15-a1-read.txt" | grep -Fq "ITEST_PONG_${RUNTOKEN}_A1" \
+grep -Eq "^⏺ .*ITEST_PONG_${RUNTOKEN}_A1" "$EVIDENCE/phaseA/15-a1-read.txt" \
   || abort "A1 模型回复行未命中本次 nonce，通信未被证实"
 ```
 
@@ -434,12 +521,12 @@ rc=0
 herdr agent prompt "$DEV" "先执行 sleep 45，再回复 ITEST_PONG_${RUNTOKEN}_A2。不要读写文件。" \
   --wait --timeout 15000 >"$A2_OUT" 2>"$A2_ERR" || rc=$?
 if [ "$rc" -eq 0 ]; then
-  printf '%s\n' 'NOT-OBSERVED: timeout 未触发（模型未执行 sleep），本次超时不作为验证项' > "$EVIDENCE/phaseA/16-a2-result.txt"
+  printf '%s\n' 'NOT-OBSERVED: timeout 未触发（模型未执行 sleep），本次超时不作为验证项' > "$EVIDENCE/phaseA/16-a2-result.txt" || abort "写入证据失败"
 elif [ "$rc" -eq 1 ] && grep -Eq '"code"[[:space:]]*:[[:space:]]*"timeout"' "$A2_ERR"; then
   printf '%s\n' 'VERIFIED: CLI timeout（stderr code=timeout, exit=1）；timeout ≠ 未送达，须用 agent read 查 nonce' \
-    > "$EVIDENCE/phaseA/16-a2-result.txt"
+    > "$EVIDENCE/phaseA/16-a2-result.txt" || abort "写入证据失败"
 else
-  printf 'NOT-OBSERVED: 非 timeout 错误 rc=%s，超时未验证；失败不代表输入未送达\n' "$rc" > "$EVIDENCE/phaseA/16-a2-result.txt"
+  printf 'NOT-OBSERVED: 非 timeout 错误 rc=%s，超时未验证；失败不代表输入未送达\n' "$rc" > "$EVIDENCE/phaseA/16-a2-result.txt" || abort "写入证据失败"
 fi
 ```
 
@@ -448,16 +535,18 @@ fi
 ```bash
 if herdr agent wait "$DEV" --timeout 180000; then
   herdr agent read "$DEV" --source recent-unwrapped --lines 60 > "$EVIDENCE/phaseA/21-a2-read.txt" || abort "A2 终端读取失败"
-  if grep -E '^⏺ ' "$EVIDENCE/phaseA/21-a2-read.txt" | grep -Fq "ITEST_PONG_${RUNTOKEN}_A2"; then
-    printf '%s\n' 'NONCE-A2: HIT（模型回复行命中；timeout 不代表未送达）' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+  NONCE_COUNT=$(awk -v nonce="ITEST_PONG_${RUNTOKEN}_A2" '/^⏺ / && index($0, nonce) {n++} END {print n+0}' "$EVIDENCE/phaseA/21-a2-read.txt") || abort "读取 nonce 证据失败"
+  if [ "$NONCE_COUNT" -gt 0 ]; then
+    printf '%s\n' 'NONCE-A2: HIT（模型回复行命中；timeout 不代表未送达）' >> "$EVIDENCE/phaseA/16-a2-result.txt" || abort "写入证据失败"
   else
-    printf '%s\n' 'NONCE-A2: MISS（不能据此断言未送达，只记录）' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+    printf '%s\n' 'NONCE-A2: MISS（不能据此断言未送达，只记录）' >> "$EVIDENCE/phaseA/16-a2-result.txt" || abort "写入证据失败"
   fi
 else
-  printf 'NOT-OBSERVED: A2 后 agent wait 失败；后续读取与 nonce 判定未验证\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+  printf 'NOT-OBSERVED: A2 后 agent wait 失败；后续读取与 nonce 判定未验证\n' >> "$EVIDENCE/phaseA/16-a2-result.txt" || abort "写入证据失败"
 fi
-herdr agent get "$DEV" | jq -r '.result.agent | [.name, .agent_status, .revision, .state_change_seq] | @tsv' \
-  > "$EVIDENCE/phaseA/22-after-timeout.tsv" || printf 'NOT-OBSERVED: A2 后状态读取失败\n' >> "$EVIDENCE/phaseA/16-a2-result.txt"
+herdr agent get "$DEV" > "$EVIDENCE/phaseA/22-after-timeout.json" || abort "A2 后状态读取失败"
+jq -r '.result.agent | [.name, .agent_status, .revision, .state_change_seq] | @tsv' "$EVIDENCE/phaseA/22-after-timeout.json" \
+  > "$EVIDENCE/phaseA/22-after-timeout.tsv" || abort "A2 后状态解析失败"
 ```
 
 观察值为 `blocked` 时只做记录（见 §5.12 的被动观察规则），不判失败，也不代答。
@@ -474,18 +563,19 @@ herdr agent get "$DEV" | jq -r '.result.agent | [.name, .agent_status, .revision
 | A1 状态解析 | `agent_status_of(doc["result"])` 返回 `idle` 或 `done`（不得直接喂未解包的 `doc`，见 §3.8） |
 | A1 返回体结构 | 合法 JSON，key 和类型已记录 |
 
-仅上述三项决定 Go/No-Go；A2 未触发 timeout 不判 No-Go。任一必要断言失败即 `exit 1`，因此 GO 文件不存在即 No-Go；重新执行前必须使用新的 `RUNTOKEN` 和证据目录。若需要将 No-Go 落盘，可在 `abort()` 的 `exit 1` 前加入 `printf 'NO-GO: %s\n' "$*" > "$GO_FILE"`，并在断言前设置对应阶段的 `GO_FILE`；这不是强制要求。
+仅上述三项决定 Go/No-Go；A2 未触发 timeout 不判 No-Go。阶段 A 所有必要断言通过后才写 GO；失败写 `NO-GO: <原因>` 并保留现场、不清理，等待负责人判定。文件缺失或写入失败也按 No-Go 处理；重新执行前必须使用新的 `RUNTOKEN` 和证据目录。
 
 ```bash
 GO_FILE="$EVIDENCE/phaseA/GO-NOGO.txt"
 # 只有在前面所有必要 abort 断言都通过后才会执行到这里
-printf 'GO\n' > "$GO_FILE"
+[ ! -e "$GO_FILE" ] && [ ! -L "$GO_FILE" ] || abort "门槛文件已存在，拒绝覆盖"
+(set -C; printf 'GO\n' > "$GO_FILE") || abort "写入 GO 文件失败或文件冲突"
 grep -qx GO "$GO_FILE" || abort "阶段 A 未 GO"
 ```
 
 ### 4.7 进入阶段 B 的唯一条件
 
-`grep -qx 'GO' "$EVIDENCE/phaseA/GO-NOGO.txt" || abort "阶段 A 未 GO，禁止进入阶段 B"`。
+`grep -qx 'GO' "$EVIDENCE/phaseA/GO-NOGO.txt" || abort "阶段 A 未 GO，禁止进入阶段 B"`。这是硬性前置：A 的 `GO-NOGO.txt` 必须已在进入 B 之前生成；缺失即禁止进入 B，且不得在 B 中补写 A 的门槛文件。
 
 ---
 
@@ -504,7 +594,12 @@ CLI timeout 时 stderr 为 `{"error":{"code":"timeout","message":"timed out wait
 
 ### 5.1 B0 前置复核（team 已由 §3.5 注册）
 
+进入阶段 B 前确认 A 的 GO；每个执行 B 断言的 shell 均须设置 B 的 `GO_FILE`，失败时 `abort` 写入 NO-GO、保留现场并等待负责人判定。
+
 ```bash
+GO_FILE="$EVIDENCE/phaseB/GO-NOGO.txt"
+[ ! -e "$GO_FILE" ] && [ ! -L "$GO_FILE" ] || abort "阶段 B 门槛文件已存在，必须使用新证据目录"
+grep -qx GO "$EVIDENCE/phaseA/GO-NOGO.txt" || abort "阶段 A 未 GO，禁止进入阶段 B"
 [ -n "${DEV:-}" ] && [ -n "${DEV_PANE:-}" ] && [ -n "${REV:-}" ] || abort "§3.5 未完成"
 [ -n "${ITEST_WS:-}" ] && [ -n "${ITEST_ROOT_PANE:-}" ] || abort "§3.3 未完成"
 htm status > "$EVIDENCE/phaseB/02b-status.json" || abort "htm status 失败"
@@ -518,21 +613,35 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 ### 5.2 B1 建 run 并推进到 implement
 
 ```bash
+# run start 返回后立即固化 run 文件 birth time；后续不得重新采集或覆盖
 RUN_JSON=$(htm run start --goal '阶段 B：验证 dispatch/collect、账本状态机与异常降级，不改任何仓库') || abort "run start 失败"
-_tmp=$(printf '%s' "$RUN_JSON" | jq -er '.run_id') || abort "取不到 run_id"
+_tmp=$(jq -er '.run_id' <<< "$RUN_JSON") || abort "取不到 run_id"
 export RUN="$_tmp"
 printf '%s' "$RUN" | grep -Eq '^[a-f0-9]{12}$' || abort "run_id 形状非法"
 export RUN_FILE="$HTM_STATE_DIR/runs/$RUN.json"
 [ -f "$RUN_FILE" ] || abort "run 文件不存在: $RUN_FILE"
+STAT_ERR="$EVIDENCE/phaseB/00-run-birth.err"
+: > "$STAT_ERR" || abort "无法创建 stat 诊断文件"
+RUN_CREATED_BIRTH=$(stat -f '%B' "$RUN_FILE" 2>> "$STAT_ERR") || abort "读取 run birth time 失败（见 $STAT_ERR）"
+[ -f "$STAT_ERR" ] && [ -r "$STAT_ERR" ] || abort "stat 诊断证据不可读: $STAT_ERR"
+printf '%s' "$RUN_CREATED_BIRTH" | grep -Eq '^[0-9]+$' || abort "run birth time 非法"
+[ "$RUN_CREATED_BIRTH" -gt 0 ] || abort "文件系统不支持 birth time（返回 0），不得用 mtime 冒充"
+[ ! -e "$EVIDENCE/phaseB/00-run-created-birth.txt" ] || abort "run birth time 已存在，不得覆盖"
+printf '%s\n' "$RUN_CREATED_BIRTH" > "$EVIDENCE/phaseB/00-run-created-birth.txt" || abort "记录 run birth time 失败"
+chmod 0444 "$EVIDENCE/phaseB/00-run-created-birth.txt" || abort "run 时间证据置为只读失败"
 assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 
-htm run stage --run-id "$RUN" | jq -e '.stage=="plan_brief"' >/dev/null || abort "首阶段不是 plan_brief"
+htm run stage --run-id "$RUN" > "$EVIDENCE/phaseB/03-stage-before.json" || abort "读取首阶段失败"
+jq -e '.stage=="plan_brief"' "$EVIDENCE/phaseB/03-stage-before.json" >/dev/null || abort "首阶段不是 plan_brief"
 htm run gate --run-id "$RUN" --decision pass \
   --evidence 'plan_brief：本轮仅验证派单与回收链路，验收标准见 docs/integration-test-plan.md' \
   > "$EVIDENCE/phaseB/03-gate-plan.json" || abort "plan_brief gate 失败"
-htm run stage --run-id "$RUN" | jq -e '.stage=="implement" and .actor=="developer"' >/dev/null \
+htm run stage --run-id "$RUN" > "$EVIDENCE/phaseB/03-stage-after.json" || abort "读取推进后阶段失败"
+jq -e '.stage=="implement" and .actor=="developer"' "$EVIDENCE/phaseB/03-stage-after.json" >/dev/null \
   || abort "未推进到 implement/developer"
 ```
+
+`stat` 成功时 stderr 允许为空；非零退出即 abort 并保留诊断文件，成功后仍须核验诊断证据可读。
 
 ### 5.3 B2 首次派单（`--no-wait`，第 1 次 htm prompt）
 
@@ -557,8 +666,10 @@ jq -e '(.dispatch_id | type=="string" and test("^[a-f0-9]{10}$")) and .status=="
 _tmp=$(jq -er '.dispatches[-1].id' "$RUN_FILE") || abort "账本无 dispatch"
 export D1="$_tmp"
 printf '%s' "$D1" | grep -Eq '^[a-f0-9]{10}$' || abort "D1 形状非法: $D1"
-[ "$(jq -r '.dispatch_id' "$D1_OUT")" = "$D1" ] || abort "响应 dispatch_id 与账本不一致"
-[ "$(jq -r '.status' "$D1_OUT")" = "submitted_unsettled" ] || abort "no-wait 响应状态不是 submitted_unsettled"
+D1_RESPONSE=$(jq -er '.dispatch_id' "$D1_OUT") || abort "读取响应 dispatch_id 失败"
+[ "$D1_RESPONSE" = "$D1" ] || abort "响应 dispatch_id 与账本不一致"
+D1_STATUS=$(jq -er '.status' "$D1_OUT") || abort "读取响应状态失败"
+[ "$D1_STATUS" = "submitted_unsettled" ] || abort "no-wait 响应状态不是 submitted_unsettled"
 jq -e --arg d "$D1" '.dispatches[] | select(.id==$d) | .status=="submitted_unsettled"' "$RUN_FILE" >/dev/null \
   || abort "账本未记录 submitted_unsettled"
 ```
@@ -587,14 +698,15 @@ jq -e --arg d "$D1" '.dispatch_id==$d and .status=="settled"' "$EVIDENCE/phaseB/
   || abort "D1 未 settled: $(cat "$EVIDENCE/phaseB/13-collect-d1.json")"
 ```
 
-说明：`collect` 不等待；若 worker 仍 `working`，会得到 `uncertain` + `Unexpected agent status: working`。这属于设计的 fail-closed；遇到时记录后 `agent wait` 再 collect 一次，但仍须最终 `settled` 才继续。
+说明：`collect` 不等待；若 worker 仍 `working`，会得到 `uncertain` + `Unexpected agent status: working`。这属于设计的 fail-closed；遇到时立即 abort 并保留现场，不得继续。
 
 ### 5.6 B5 结算后再派单必须产生新 id（第 2 次 htm prompt）
 
 ```bash
 # dispatch 要求 worker 处于 idle/done；上一轮刚结束先等稳定
 herdr agent wait "$DEV" --timeout 120000 || abort "D2 前等待 developer 失败"
-herdr agent get "$DEV" | jq -e '.result.agent.agent_status|IN("idle","done")' >/dev/null \
+herdr agent get "$DEV" > "$EVIDENCE/phaseB/19-agent.json" || abort "D2 前读取 developer 失败"
+jq -e '.result.agent.agent_status|IN("idle","done")' "$EVIDENCE/phaseB/19-agent.json" >/dev/null \
   || abort "D2 前 developer 不是 idle/done"
 
 D2_OUT="$EVIDENCE/phaseB/20-dispatch2.json"
@@ -623,7 +735,7 @@ export RUN_FROM_LIST="$_tmp"
 jq -r --arg d "$D2" '.dispatches[]|select(.id==$d)
   | {id, role, stage_index, stage_attempt, status, artifact_sha256, result_file,
      trace_run: .report.run_id, trace_dispatch: .report.dispatch_id}' \
-  "$RUN_FILE" > "$EVIDENCE/phaseB/31-report-ownership.json"
+  "$RUN_FILE" > "$EVIDENCE/phaseB/31-report-ownership.json" || abort "读取报告归属失败"
 jq -e --arg r "$RUN" --arg d "$D2" '
   .trace_run==$r and .trace_dispatch==$d and .status=="settled"
   and (.artifact_sha256|type=="string") and (.artifact_sha256|length>0)
@@ -649,16 +761,16 @@ jq -e --arg r "$RUN" --arg d "$D2" '
 ```bash
 assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 {
-  printf 'workspace=%s lead_pane=%s\n' "$ITEST_WS" "$ITEST_ROOT_PANE"
+  printf 'workspace=%s lead_pane=%s\n' "$ITEST_WS" "$ITEST_ROOT_PANE" || abort "写入 run 身份失败"
   for f in "$HTM_STATE_DIR"/runs/*.json; do
     [ -e "$f" ] || continue
     jq -r --arg ws "$ITEST_WS" --arg pane "$ITEST_ROOT_PANE" '
       select(.context.workspace==$ws and .context.lead_pane==$pane)
-      | "RUN=\(.id) status=\(.status)"' "$f"
+      | "RUN=\(.id) status=\(.status)"' "$f" || abort "读取账本失败: $f"
   done
-} > "$EVIDENCE/phaseB/32-active-runs.txt"
-grep -c 'status=active' "$EVIDENCE/phaseB/32-active-runs.txt" \
-  | grep -qx '1' || abort "该 pane 的 active run 数不等于 1"
+} > "$EVIDENCE/phaseB/32-active-runs.txt" || abort "写入 run 证据失败"
+count=$(awk '/status=active/ {n++} END {print n+0}' "$EVIDENCE/phaseB/32-active-runs.txt") || abort "统计 active run 失败"
+[ "$count" -eq 1 ] || abort "该 pane 的 active run 数不等于 1"
 ```
 
 在同一 team 上对同一 developer 再开 run 会被 `run_start` 拒绝（`Worker(s) reserved by unfinished Run ...`）。该负例可选，不构造成本。
@@ -676,13 +788,16 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 
 # dispatch 要求 worker idle/done；先等 D2 稳定
 herdr agent wait "$DEV" --timeout 180000 || abort "B8 前等待 developer 失败"
-herdr agent get "$DEV" | jq -e '.result.agent.agent_status|IN("idle","done")' >/dev/null \
+herdr agent get "$DEV" > "$EVIDENCE/phaseB/40-agent.json" || abort "B8 前读取 developer 失败"
+jq -e '.result.agent.agent_status|IN("idle","done")' "$EVIDENCE/phaseB/40-agent.json" >/dev/null \
   || abort "B8 前 developer 不是 idle/done"
 
 # 派单前快照
-ls "$HTM_STATE_DIR"/runs/*.json | sort > "$EVIDENCE/phaseB/41-runs-before.txt" || abort "快照 run 集合失败"
+ls "$HTM_STATE_DIR"/runs/*.json > "$EVIDENCE/phaseB/41-runs-before.raw" || abort "读取 run 集合失败"
+[ -s "$EVIDENCE/phaseB/41-runs-before.raw" ] || abort "run 集合为空"
+sort "$EVIDENCE/phaseB/41-runs-before.raw" > "$EVIDENCE/phaseB/41-runs-before.txt" || abort "排序 run 集合失败"
 BEFORE_COUNT=$(jq -er '.dispatches|length' "$TRUN_FILE") || abort "读派单数失败"
-printf 'run=%s dispatch-count-before=%s\n' "$TRUN" "$BEFORE_COUNT" > "$EVIDENCE/phaseB/41-dispatch-count.txt"
+printf 'run=%s dispatch-count-before=%s\n' "$TRUN" "$BEFORE_COUNT" > "$EVIDENCE/phaseB/41-dispatch-count.txt" || abort "记录派单数失败"
 
 rc=0
 htm run dispatch --run-id "$TRUN" --role developer --effect read \
@@ -693,10 +808,14 @@ grep -Eq 'Dispatch [a-f0-9]{10} uncertain; input might have been sent\. Run coll
   "$EVIDENCE/phaseB/42-dispatch-timeout.txt" || abort "超时错误文案不符"
 
 # 集合差集：必须为空（失败路径不得创建新 run）
-ls "$HTM_STATE_DIR"/runs/*.json | sort > "$EVIDENCE/phaseB/44-runs-after.txt" || abort "快照 run 集合失败"
+ls "$HTM_STATE_DIR"/runs/*.json > "$EVIDENCE/phaseB/44-runs-after.raw" || abort "读取 run 集合失败"
+[ -s "$EVIDENCE/phaseB/44-runs-after.raw" ] || abort "run 集合为空"
+sort "$EVIDENCE/phaseB/44-runs-after.raw" > "$EVIDENCE/phaseB/44-runs-after.txt" || abort "排序 run 集合失败"
 comm -13 "$EVIDENCE/phaseB/41-runs-before.txt" "$EVIDENCE/phaseB/44-runs-after.txt" \
   > "$EVIDENCE/phaseB/45-runs-new.txt" || abort "计算 run 差集失败"
 [ ! -s "$EVIDENCE/phaseB/45-runs-new.txt" ] || abort "派单失败路径意外创建了新 run"
+comm -23 "$EVIDENCE/phaseB/41-runs-before.txt" "$EVIDENCE/phaseB/44-runs-after.txt" > "$EVIDENCE/phaseB/45-runs-removed.txt" || abort "计算消失 run 差集失败"
+[ ! -s "$EVIDENCE/phaseB/45-runs-removed.txt" ] || abort "派单期间 run 文件消失"
 
 # 从目标 run 文件读取新派单 id，并断言唯一、账本恰好 +1
 AFTER_COUNT=$(jq -er '.dispatches|length' "$TRUN_FILE") || abort "读派单数失败"
@@ -714,14 +833,19 @@ jq -er --arg d "$TD1" '.dispatches[]|select(.id==$d)|.error' "$TRUN_FILE" \
 if ! grep -Fq 'Command unavailable' "$EVIDENCE/phaseB/42-ledger-error.txt" && \
    { grep -Eq '"code"[[:space:]]*:[[:space:]]*"timeout"' "$EVIDENCE/phaseB/42-ledger-error.txt" || \
      grep -Fq 'timed out waiting for agent status' "$EVIDENCE/phaseB/42-ledger-error.txt"; }; then
-  printf '%s\n' 'VERIFIED: 账本 error 含 timeout 证据' > "$EVIDENCE/phaseB/42-timeout-verification.txt"
+  printf '%s\n' 'VERIFIED: 账本 error 含 timeout 证据' > "$EVIDENCE/phaseB/42-timeout-verification.txt" || abort "写入证据失败"
 else
-  printf '%s\n' 'NOT-VERIFIED: timeout 未确认（账本仅有其他错误）' > "$EVIDENCE/phaseB/42-timeout-verification.txt"
+  printf '%s\n' 'NOT-VERIFIED: timeout 未确认（账本仅有其他错误）' > "$EVIDENCE/phaseB/42-timeout-verification.txt" || abort "写入证据失败"
   abort "NOT-VERIFIED: timeout 未确认，不得算 B8 通过"
 fi
+# fail-closed：确认落盘内容为 VERIFIED，否则后续步骤一律不得执行
+grep -qx 'VERIFIED: 账本 error 含 timeout 证据' "$EVIDENCE/phaseB/42-timeout-verification.txt" \
+  || abort "timeout 证据未确认为 VERIFIED，禁止继续 B8"
 grep -q "$TD1" "$EVIDENCE/phaseB/42-dispatch-timeout.txt" \
   || abort "错误信息里的 dispatch id 与账本不一致"
 ```
+
+NOT-VERIFIED 分支**必须 `abort`**：不得只 printf 后继续执行重发、收尾或 collect，否则会把未确证的超时当成通过，或在后续写入中覆盖已有证据。
 
 账本 error 可能是 Herdr 自身返回的 `{"code":"timeout",...}` 或 `timed out waiting for agent status`；htm 子进程超时会以 `Command unavailable/timed out` 出现，本判据**保守地**归为 NOT-VERIFIED（fail-closed），不作为 timeout 证据。含 `Command unavailable` 的 OSError 可能并非超时，必须排除。`stalled`、命令错误等其他 `Error` 同样会写入 `submission_uncertain`，但不能证明 timeout，须记为 NOT-VERIFIED 并保留现场。这是有意的保守取舍：宁可将可超时但未确证的情形记为 NOT-VERIFIED，也不把非 timeout 错误误判为通过。
 
@@ -736,22 +860,34 @@ grep -Eq 'Pending/uncertain dispatch [a-f0-9]{10}; use run collect, never blindl
   || abort "超时后重发拒绝原因不符"
 ```
 
-收尾（collect 会把 `submission_uncertain` 改写为 settled/blocked/uncertain，属正常推进）。若 `agent wait` 失败即 abort，后续读取与 nonce 判定均未验证，不得宣称已稳定或已处理；仅匹配以 `⏺` 开头的模型回复行，排除以 `❯` 开头的输入回显：
+收尾（collect 会把 `submission_uncertain` 改写为 settled/blocked/uncertain，属正常推进）。**`agent wait` 失败时必须 fail-closed**：不得继续读取、不得判定 nonce、不得用新的 collect 结果覆盖已有证据；一律记为未验证并 abort。仅匹配以 `⏺` 开头的模型回复行，排除以 `❯` 开头的输入回显：
 
 ```bash
-herdr agent wait "$DEV" --timeout 600000 || abort "developer 等待失败"
+if ! herdr agent wait "$DEV" --timeout 600000; then
+  if [ ! -e "$EVIDENCE/phaseB/43-b8-nonce.txt" ]; then
+    printf '%s\n' 'B8-NONCE: NOT-VERIFIED（agent wait 失败，未读取终端，未做 nonce 判定）' \
+      > "$EVIDENCE/phaseB/43-b8-nonce.txt" || exit 1
+  fi
+  abort "developer 等待失败：后续读取、nonce 判定与 collect 一律未验证，不得继续"
+fi
 # timeout ≠ 未送达：只记录模型回复行中的 nonce，不凭 MISS 断言未送达
 herdr agent read "$DEV" --source recent-unwrapped --lines 80 > "$EVIDENCE/phaseB/43-b8-read.txt" \
   || abort "B8 终端读取失败"
-if grep -E '^⏺ ' "$EVIDENCE/phaseB/43-b8-read.txt" | grep -Fq "ITEST_PONG_${RUNTOKEN}_B8"; then
-  printf '%s\n' 'B8-NONCE: HIT（模型回复行命中；timeout 不代表未送达）' > "$EVIDENCE/phaseB/43-b8-nonce.txt"
+NONCE_COUNT=$(awk -v nonce="ITEST_PONG_${RUNTOKEN}_B8" '/^⏺ / && index($0, nonce) {n++} END {print n+0}' "$EVIDENCE/phaseB/43-b8-read.txt") || abort "读取 nonce 证据失败"
+if [ "$NONCE_COUNT" -gt 0 ]; then
+  printf '%s\n' 'B8-NONCE: HIT（模型回复行命中；timeout 不代表未送达）' > "$EVIDENCE/phaseB/43-b8-nonce.txt" || abort "写入证据失败"
 else
-  printf '%s\n' 'B8-NONCE: MISS（仅记录，不据此断言未送达）' > "$EVIDENCE/phaseB/43-b8-nonce.txt"
+  printf '%s\n' 'B8-NONCE: MISS（仅记录，不据此断言未送达）' > "$EVIDENCE/phaseB/43-b8-nonce.txt" || abort "写入证据失败"
 fi
+# 已存在的 collect 结果不得被后续写入覆盖；存在即视为现场异常
+[ ! -e "$EVIDENCE/phaseB/47-collect-timeout.json" ] \
+  || abort "47-collect-timeout.json 已存在，拒绝覆盖既有证据"
 htm run collect --run-id "$TRUN" --dispatch-id "$TD1" > "$EVIDENCE/phaseB/47-collect-timeout.json" || abort "timeout collect 失败"
 jq -e --arg d "$TD1" '.dispatch_id==$d and (.status|IN("settled","blocked","uncertain"))' \
   "$EVIDENCE/phaseB/47-collect-timeout.json" >/dev/null || abort "timeout collect 返回异常"
 ```
+
+若 `agent wait` 失败，`43-b8-read.txt` 不生成、`47-collect-timeout.json` 不生成，B8 只能记未验证/NO-GO，不得补写或改用旧证据宣称通过。
 
 注意：若 worker 执行了 `sleep 180`，在 `--wait` 超时（`task_timeout_seconds=60`）后可能仍在工作；须等待其结束。若它最终写出合法报告，collect 会得到 `settled`，这**不构成**超时降级用例失败——关键断言是账本中的 timeout 证据、`submission_uncertain` 与“不自动重发”。
 
@@ -759,7 +895,7 @@ jq -e --arg d "$TD1" '.dispatch_id==$d and (.status|IN("settled","blocked","unce
 
 ### 5.10 B9 Mock：错误报告注入（独立 state 副本，**Mock**）
 
-不碰真实 worker 正在使用的文件。复制一份 state，在副本里伪造账本 + 伪造工件，`HTM_STATE_DIR` 指向副本：
+不碰真实 worker 正在使用的文件。复制一份 state，在副本里伪造账本 + 伪造工件，`HTM_STATE_DIR` 指向副本。本地 Mock 原始证据保留文件名与原始内容，统一由同目录 `50-mock-collect.meta.txt` 首行 `MOCK` 标记（见 §7）；清单列出原始名，交付副本时各文件名加 `mock-` 前缀；JSON 不插入标记行。
 
 ```bash
 export MOCK="$ITEST_ROOT/mock"
@@ -767,7 +903,8 @@ rm -rf "$MOCK" || abort "无法清理旧 mock 目录"
 mkdir -p "$MOCK" || abort "无法创建 mock 目录"
 cp -R "$HTM_STATE_DIR" "$MOCK/state" || abort "复制 state 失败"
 export MOCK_STATE="$MOCK/state"
-[ "$(cd "$MOCK_STATE" && pwd)" != "$HTM_STATE_DIR" ] || abort "Mock state 与真实 state 相同"
+MOCK_DIR=$(cd "$MOCK_STATE" && pwd) || abort "读取 Mock 路径失败"
+[ "$MOCK_DIR" != "$HTM_STATE_DIR" ] || abort "Mock state 与真实 state 相同"
 mock_htm() { HTM_STATE_DIR="$MOCK_STATE" python3 "$REPO/scripts/htm.py" "$@"; }
 ```
 
@@ -805,7 +942,8 @@ doc = {"run_id": "000000000000", "dispatch_id": did, "role": rec["role"],
        "evidence": ["injected-by-mock-test"]}
 open(out, "w", encoding="utf-8").write(json.dumps(doc, ensure_ascii=False))
 PY
-[ "$(jq -r '.run_id' "$MOCK_STATE/artifacts/$MOCK_RUN/$MOCK_DID.json")" = "000000000000" ] \
+MOCK_ID=$(jq -er '.run_id' "$MOCK_STATE/artifacts/$MOCK_RUN/$MOCK_DID.json") || abort "读取 mock run_id 失败"
+[ "$MOCK_ID" = "000000000000" ] \
   || abort "mock 工件 run_id 未写错"
 ```
 
@@ -813,10 +951,15 @@ PY
 
 ```bash
 herdr agent wait "$DEV" --timeout 240000 || abort "Mock 前等待 developer 失败"
-herdr agent get "$DEV" | jq -e '.result.agent.agent_status|IN("idle","done")' >/dev/null \
+herdr agent get "$DEV" > "$EVIDENCE/phaseB/49-agent.json" || abort "Mock 前读取 developer 失败"
+jq -e '.result.agent.agent_status|IN("idle","done")' "$EVIDENCE/phaseB/49-agent.json" >/dev/null \
   || abort "Mock 前 developer 不是 idle/done"
 
-REAL_RUN_SHA_BEFORE=$(shasum -a 256 "$RUN_FILE" | awk '{print $1}') || abort "真实账本哈希失败"
+SHA_OUTPUT=$(shasum -a 256 "$RUN_FILE") || abort "真实账本哈希失败"
+REAL_RUN_SHA_BEFORE=${SHA_OUTPUT%% *}
+printf '%s\n' "$REAL_RUN_SHA_BEFORE" | grep -Eq '^[a-f0-9]{64}$' || abort "真实账本哈希格式非法"
+printf 'MOCK\n50-mock-collect.json\n50-mock-collect.err\n51-mock-verdict.txt\n61-mock-role.txt\n' \
+  > "$EVIDENCE/phaseB/50-mock-collect.meta.txt" || abort "写入 Mock 标记失败"
 rc=0
 mock_htm run collect --run-id "$MOCK_RUN" --dispatch-id "$MOCK_DID" \
   > "$EVIDENCE/phaseB/50-mock-collect.json" 2>"$EVIDENCE/phaseB/50-mock-collect.err" || rc=$?
@@ -828,13 +971,15 @@ jq -e --arg d "$MOCK_DID" '.dispatches[]|select(.id==$d)|.status!="settled"' "$M
   || abort "Mock 账本被错误写成 settled"
 
 # 隔离断言：真实账本与真实工件目录都未被改动
-REAL_RUN_SHA_AFTER=$(shasum -a 256 "$RUN_FILE" | awk '{print $1}') || abort "真实账本哈希失败"
+SHA_OUTPUT=$(shasum -a 256 "$RUN_FILE") || abort "真实账本哈希失败"
+REAL_RUN_SHA_AFTER=${SHA_OUTPUT%% *}
+printf '%s\n' "$REAL_RUN_SHA_AFTER" | grep -Eq '^[a-f0-9]{64}$' || abort "真实账本哈希格式非法"
 [ "$REAL_RUN_SHA_BEFORE" = "$REAL_RUN_SHA_AFTER" ] || abort "真实账本被 Mock 测试改动"
 [ ! -e "$HTM_STATE_DIR/artifacts/$MOCK_RUN/$MOCK_DID.json" ] \
   || abort "Mock 工件泄漏到真实 state"
 echo "MOCK PASS: 身份不符 -> status=uncertain, error=Result identity mismatch: run_id" \
-  > "$EVIDENCE/phaseB/51-mock-verdict.txt"
-echo "REAL UNTOUCHED: ledger sha $REAL_RUN_SHA_BEFORE" >> "$EVIDENCE/phaseB/51-mock-verdict.txt"
+  > "$EVIDENCE/phaseB/51-mock-verdict.txt" || abort "写入 Mock 结论失败"
+echo "REAL UNTOUCHED: ledger sha $REAL_RUN_SHA_BEFORE" >> "$EVIDENCE/phaseB/51-mock-verdict.txt" || abort "写入 Mock 隔离证据失败"
 export REAL_RUN_SHA_AFTER="$REAL_RUN_SHA_AFTER"
 ```
 
@@ -855,7 +1000,7 @@ grep -Eq 'Invalid Run ID|Cannot read state|Unknown dispatch ID' "$EVIDENCE/phase
   || abort "错误 run-id 报错文案不符"
 ```
 
-role→pane 篡改**只在 Mock 副本**里做（复制 `$HTM_STATE_DIR` 后修改 `.roles[].pane_id` 为 `w1:p5`），报错中的 pane 是 agent **实际观察到的 pane**，不是篡改后的期望值 `w1:p5`；断言前缀 `is live in unexpected pane` 与非空 pane id，不断言具体 id。`w1:p5` 仅读取元数据，不发送任何输入。
+role→pane 篡改**只在 Mock 副本**里做（复制 `$HTM_STATE_DIR` 后修改 `.roles[].pane_id` 为 `w1:p5`），报错中的 pane 是 agent **实际观察到的 pane**，不是篡改后的期望值 `w1:p5`；断言前缀 `is live in unexpected pane` 与非空 pane id，不断言具体 id。`w1:p5` 仅读取元数据，不发送任何输入。本地 `61-mock-role.txt` 的 Mock 标记由 §5.10 的同目录元信息提供。
 
 ```bash
 export MOCK2="$ITEST_ROOT/mock-role"
@@ -880,8 +1025,11 @@ mock2_htm run collect --run-id "$RUN" --dispatch-id "$D1" \
 [ "$rc" -eq 2 ] || abort "错误 pane 映射未拒绝 exit=$rc"
 grep -Eq 'is live in unexpected pane [^[:space:];]+; refusing reuse' "$EVIDENCE/phaseB/61-mock-role.txt" \
   || abort "错误 pane 映射报错文案不符"
-[ "$(shasum -a 256 "$RUN_FILE" | awk '{print $1}')" = "$REAL_RUN_SHA_AFTER" ] \
-  || abort "真实账本被 role 篡改测试改动"
+SHA_OUTPUT=$(shasum -a 256 "$RUN_FILE") || abort "真实账本哈希失败"
+SHA=${SHA_OUTPUT%% *}
+printf '%s\n' "$SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "真实账本哈希格式非法"
+printf '%s\n' "$REAL_RUN_SHA_AFTER" | grep -Eq '^[a-f0-9]{64}$' || abort "原真实账本哈希格式非法"
+[ "$SHA" = "$REAL_RUN_SHA_AFTER" ] || abort "真实账本被 role 篡改测试改动"
 ```
 
 ### 5.12 B11 Blocked：只做被动观察
@@ -890,16 +1038,19 @@ grep -Eq 'is live in unexpected pane [^[:space:];]+; refusing reuse' "$EVIDENCE/
 
 ```bash
 BLOCK_OBS="$EVIDENCE/phaseB/70-blocked-observation.txt"
+herdr agent get "$DEV" > "$EVIDENCE/phaseB/70-developer.json" || abort "读取 developer 失败"
+herdr agent get "$REV" > "$EVIDENCE/phaseB/70-reviewer.json" || abort "读取 reviewer 失败"
+DEV_STATUS=$(jq -er '.result.agent.agent_status | select(type=="string" and IN("idle","done","working","blocked"))' "$EVIDENCE/phaseB/70-developer.json") || abort "developer 状态非法"
+REV_STATUS=$(jq -er '.result.agent.agent_status | select(type=="string" and IN("idle","done","working","blocked"))' "$EVIDENCE/phaseB/70-reviewer.json") || abort "reviewer 状态非法"
 {
-  printf 'developer %s %s\n' "$DEV" \
-    "$(herdr agent get "$DEV" | jq -r '.result.agent.agent_status')"
-  printf 'reviewer %s %s\n' "$REV" \
-    "$(herdr agent get "$REV" | jq -r '.result.agent.agent_status')"
+  printf 'developer %s %s\n' "$DEV" "$DEV_STATUS" || abort "写入状态失败"
+  printf 'reviewer %s %s\n' "$REV" "$REV_STATUS" || abort "写入状态失败"
 } > "$BLOCK_OBS" || abort "读取 agent 状态失败"
-if grep -q ' blocked$' "$BLOCK_OBS"; then
-  echo "OBSERVED: blocked（不代答；由人在 Herdr 中处理）" >> "$BLOCK_OBS"
+BLOCK_COUNT=$(awk '$3=="blocked" {n++} END {print n+0}' "$BLOCK_OBS") || abort "读取 blocked 观察失败"
+if [ "$BLOCK_COUNT" -gt 0 ]; then
+  echo "OBSERVED: blocked（不代答；由人在 Herdr 中处理）" >> "$BLOCK_OBS" || abort "写入 blocked 观察失败"
 else
-  echo "NOT-OBSERVED: 未验证" >> "$BLOCK_OBS"
+  echo "NOT-OBSERVED: 未验证" >> "$BLOCK_OBS" || abort "写入 blocked 观察失败"
 fi
 ```
 
@@ -912,37 +1063,146 @@ fi
 
 ### 5.13 B12 隔离复核
 
+B12 的比对基准**只有一个**：§3.3 在任何测试资源创建之前采集的 `00-agents-before.tsv`。先校验基线只读、校验和未变、mtime ≤ 采集时刻，且采集时刻 ≤ run 文件的 birth time，再比对末态；不得改用末段快照，也不得重采“before”。`stat -f %B` 返回 0 必须 abort；秒级时间只是时序旁证，同秒无法证明先后，也不能独立证明基线早于 workspace 创建。
+
 ```bash
-herdr agent list \
-  | jq -r '.result.agents[] | [.workspace_id, .pane_id, (.name // "-"), (.agent_status // "-"), (.revision|tostring), (.state_change_seq|tostring)] | @tsv' \
-  | sort > "$EVIDENCE/phaseB/80-agents-after.tsv" || abort "agent list 失败"
+BASE="$EVIDENCE/phaseB"
+# 1) 基线文件本身必须存在、只读、未被改写
+[ -f "$BASE/00-agents-before.tsv" ] || abort "缺少 §3.3 早期基线 00-agents-before.tsv"
+[ ! -w "$BASE/00-agents-before.tsv" ] || abort "基线 00-agents-before.tsv 不是只读，可能被改写"
+[ -f "$BASE/00-baseline-meta.txt" ] && [ ! -w "$BASE/00-baseline-meta.txt" ] || abort "基线元信息缺失或非只读"
+SHA_OUTPUT=$(shasum -a 256 "$BASE/00-agents-before.tsv") || abort "计算基线校验和失败"
+SHA=${SHA_OUTPUT%% *}
+META_SHA=$(awk -F= '$1=="agents_sha256"{print $2}' "$BASE/00-baseline-meta.txt") || abort "读取元信息校验和失败"
+printf '%s\n' "$SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "基线校验和格式非法"
+printf '%s\n' "$META_SHA" | grep -Eq '^[a-f0-9]{64}$' || abort "元信息校验和格式非法"
+[ "$SHA" = "$META_SHA" ] || abort "基线校验和与元信息不符"
+BASE_EPOCH=$(awk -F= '$1=="epoch"{print $2}' "$BASE/00-baseline-meta.txt") || abort "读取基线时间戳失败"
+printf '%s' "$BASE_EPOCH" | grep -Eq '^[0-9]+$' || abort "基线时间戳非法: ${BASE_EPOCH:-<empty>}"
+
+# 2) 校验固定时间锚点、基线 mtime 和 run birth time
+[ -f "$BASE/00-baseline-epoch.txt" ] && [ ! -w "$BASE/00-baseline-epoch.txt" ] || abort "时间锚点缺失或非只读"
+EPOCH_FILE=$(cat "$BASE/00-baseline-epoch.txt") || abort "读取时间锚点失败"
+[ "$EPOCH_FILE" = "$BASE_EPOCH" ] || abort "时间锚点($EPOCH_FILE) 与元信息($BASE_EPOCH) 不一致"
+BASE_MTIME_REC=$(awk -F= '$1=="agents_mtime"{print $2}' "$BASE/00-baseline-meta.txt") \
+  || abort "读取基线记录的 mtime 失败"
+printf '%s' "$BASE_MTIME_REC" | grep -Eq '^[0-9]+$' || abort "基线记录的 mtime 非法"
+BASE_MTIME=$(stat -f '%m' "$BASE/00-agents-before.tsv") || abort "读取基线 mtime 失败"
+[ "$BASE_MTIME" -eq "$BASE_MTIME_REC" ] \
+  || abort "基线 mtime($BASE_MTIME) 与采集时记录($BASE_MTIME_REC) 不符，基线被改写"
+[ "$BASE_MTIME" -le "$BASE_EPOCH" ] \
+  || abort "基线 mtime($BASE_MTIME) 晚于采集时刻($BASE_EPOCH)，不是不可变早期基线"
+[ -f "$BASE/00-run-created-birth.txt" ] && [ ! -w "$BASE/00-run-created-birth.txt" ] || abort "run 创建后时间证据缺失或非只读"
+RUN_CREATED_BIRTH=$(cat "$BASE/00-run-created-birth.txt") || abort "读取 run birth time 失败"
+printf '%s\n' "$RUN_CREATED_BIRTH" | grep -Eq '^[0-9]+$' || abort "run birth time 非法"
+[ "$RUN_CREATED_BIRTH" -gt 0 ] || abort "文件系统不支持 birth time（返回 0）"
+[ "$BASE_EPOCH" -le "$RUN_CREATED_BIRTH" ] \
+  || abort "基线 epoch($BASE_EPOCH) 晚于 run birth time($RUN_CREATED_BIRTH)"
+printf 'baseline_mtime=%s baseline_epoch=%s run_created_birth=%s\n' \
+  "$BASE_MTIME" "$BASE_EPOCH" "$RUN_CREATED_BIRTH" > "$BASE/00-baseline-timing.txt" \
+  || abort "记录基线时序失败"
+
+# 3) 采集末态并与早期基线比对
+herdr agent list > "$EVIDENCE/phaseB/80-agents-after.json" || abort "agent list 失败"
+jq -r '.result.agents[] | [.workspace_id, .pane_id, (.name // "-"), (.agent_status // "-"), (.revision|tostring), (.state_change_seq|tostring)] | @tsv' \
+  "$EVIDENCE/phaseB/80-agents-after.json" > "$BASE/80-agents-after.raw" || abort "末态 agent jq 失败"
+[ -s "$BASE/80-agents-after.raw" ] || abort "末态 agent 列表为空"
+sort "$BASE/80-agents-after.raw" > "$BASE/80-agents-after.tsv" || abort "末态 agent sort 失败"
 
 PROTECTED='w1:p5 w1:p6 w2:p2 w2:p3'
 pick() { awk -v list="$PROTECTED" '
   BEGIN { n=split(list,a," "); for(i=1;i<=n;i++) keep[a[i]]=1 }
-  keep[$2] { print $2 "\t" $5 "\t" $6 }' "$1" | sort; }
-
-pick "$EVIDENCE/phaseB/00-agents-before.tsv" > "$EVIDENCE/phaseB/81-protected-before.tsv" || abort "基线提取失败"
-pick "$EVIDENCE/phaseB/80-agents-after.tsv"  > "$EVIDENCE/phaseB/82-protected-after.tsv"  || abort "复核提取失败"
+  keep[$2] { print $2 "\t" $5 "\t" $6 }' "$1"; }
+check_pick() {
+  count=$(wc -l < "$1") || abort "统计受保护 pane 失败"
+  [ "$count" -eq 4 ] || abort "受保护 pane 行数不是 4: $1 ($count)"
+  for p in $PROTECTED; do
+    count=$(awk -v p="$p" '$1==p {n++} END {print n+0}' "$1") || abort "统计 $p 失败"
+    [ "$count" -eq 1 ] || abort "受保护 pane $p 出现 $count 次: $1"
+  done
+}
+pick "$BASE/00-agents-before.tsv" > "$BASE/81-protected-before.raw" || abort "基线提取失败"
+pick "$BASE/80-agents-after.tsv" > "$BASE/82-protected-after.raw" || abort "复核提取失败"
+check_pick "$BASE/81-protected-before.raw"
+check_pick "$BASE/82-protected-after.raw"
+sort "$BASE/81-protected-before.raw" > "$BASE/81-protected-before.tsv" || abort "基线排序失败"
+sort "$BASE/82-protected-after.raw" > "$BASE/82-protected-after.tsv" || abort "复核排序失败"
 diff -u "$EVIDENCE/phaseB/81-protected-before.tsv" "$EVIDENCE/phaseB/82-protected-after.tsv" \
   > "$EVIDENCE/phaseB/83-protected-diff.txt" || abort "受保护 worker 的 revision/seq 发生变化（见 83-protected-diff.txt）"
+awk '
+  $2=="w1:p1" || $2=="w2:p1" {
+    key=$2; if (FNR==NR) { before[key]=$0; nb[key]++ } else { after[key]=$0; na[key]++ }
+  }
+  END {
+    split("w1:p1 w2:p1", leads, " ")
+    for (i=1; i<=2; i++) {
+      p=leads[i]; if (nb[p]!=1 || na[p]!=1) { print "Lead 行缺失或重复: " p > "/dev/stderr"; exit 1 }
+      print "before: " before[p]; print "after:  " after[p]
+      print (before[p]==after[p] ? "unchanged" : "drift")
+    }
+  }' "$BASE/00-agents-before.tsv" "$BASE/80-agents-after.tsv" \
+  > "$BASE/85-lead-drift.txt" || abort "提取 Lead 基线与末态失败"
 ```
 
-受保护 worker（`w1:p5`、`w1:p6`、`w2:p2`、`w2:p3`）的 `revision` 与 `state_change_seq` 必须逐字不变；`w1:p1`、`w2:p1` 为 Lead，允许自身工作造成漂移，把它们的差异写进 `85-lead-drift.txt` 并说明原因，不得出现本测试输入的痕迹。
+受保护 worker（`w1:p5`、`w1:p6`、`w2:p2`、`w2:p3`）的 `revision` 与 `state_change_seq` 必须与 §3.3 的早期基线逐字相同；`w1:p1`、`w2:p1` 为 Lead，允许自身工作造成漂移。执行者须人工核查 `85-lead-drift.txt` 和相关只读证据，记录各 Lead 的漂移原因（无漂移也须说明），核查是否有本测试输入痕迹。发现痕迹或无法确认时必须 abort；不得凭元数据差异自行推断无痕迹。**基线有效性断言未通过时，B12 只能记未验证/NO-GO，不得用末段快照补位后宣称“全程不变”。**
 
-默认状态目录隔离（A-16）：`HTM_STATE_DIR` 全程指向临时目录，默认目录不应出现新文件。
+先生成核查模板，由执行者人工填写三个必填字段：`drift_cause`、`test-input-trace`（只能填 `yes` 或 `no`）、`reviewer`。填写并保存后执行下方断言；未填写、含糊或无法确认均不得继续。
+
+```bash
+LEAD_REVIEW="$BASE/85-lead-drift-review.txt"
+[ ! -e "$LEAD_REVIEW" ] && [ ! -L "$LEAD_REVIEW" ] || abort "Lead 核查文件已存在，拒绝覆盖"
+printf 'drift_cause=\ntest-input-trace=yes|no\nreviewer=\n' > "$LEAD_REVIEW" || abort "创建 Lead 核查模板失败"
+```
+
+人工完成核查并填写保存后，执行：
+
+```bash
+LEAD_REVIEW="$EVIDENCE/phaseB/85-lead-drift-review.txt"
+[ -f "$LEAD_REVIEW" ] && [ -r "$LEAD_REVIEW" ] || abort "Lead 核查证据缺失或不可读"
+awk -F= '
+  $1=="drift_cause" { cause++; if ($0 !~ /^drift_cause=[[:space:]]*$/) cause_ok=1 }
+  $1=="test-input-trace" { trace++; if ($0=="test-input-trace=no") trace_ok=1 }
+  $1=="reviewer" { reviewer++; if ($0 !~ /^reviewer=[[:space:]]*$/) reviewer_ok=1 }
+  END { exit !(cause==1 && cause_ok && trace==1 && trace_ok && reviewer==1 && reviewer_ok) }
+' "$LEAD_REVIEW" || abort "Lead 核查未完成或发现测试输入痕迹（见 $LEAD_REVIEW）"
+```
+
+默认状态目录隔离（A-16）：`HTM_STATE_DIR` 全程指向临时目录，默认目录不应出现新文件。本检查必须 fail-closed：`find` 前逐级确认目录存在性与访问权限，锚点用 §3.3 固定的 `00-baseline-epoch.txt`（不用会变化的 `env.sh`），`find` 退出码必须检查。
 
 ```bash
 DEFAULT_STATE="$HOME/.local/state/herdr-team"
-if [ -d "$DEFAULT_STATE" ]; then
-  find "$DEFAULT_STATE" -newer "$EVIDENCE/phaseB/00-head.txt" -type f \
-    > "$EVIDENCE/phaseB/86-default-state-new.txt" || abort "默认 state 目录扫描失败"
+BASE_EXPECT=$(cat "$EVIDENCE/phaseB/00-default-state-exists.txt") || abort "读取默认 state 基线失败"
+if [ "$BASE_EXPECT" = "present" ]; then
+  DEFAULT_PRESENCE=$(default_state_presence) || abort "检查默认 state 失败"
+  [ "$DEFAULT_PRESENCE" = present ] || abort "基线记录默认 state 存在，但现在不存在，需人工核查"
+  BASE_EPOCH=$(awk -F= '$1=="epoch"{print $2}' "$EVIDENCE/phaseB/00-baseline-meta.txt") \
+    || abort "读取基线时间戳失败"
+  NEWER_REF="$EVIDENCE/phaseB/00-baseline-epoch.txt"
+  test -f "$NEWER_REF" || abort "缺少固定时间锚点: $NEWER_REF"
+  # 探测性调用，有意丢弃诊断，不用于断言；实际扫描另行检查退出码
+  if find "$DEFAULT_STATE" -maxdepth 0 -newermt '@1700000000' >/dev/null 2>&1; then
+    find "$DEFAULT_STATE" -type f -newermt "@$BASE_EPOCH" \
+      > "$EVIDENCE/phaseB/86-default-state-new.txt" || abort "默认 state 目录扫描失败"
+  else
+    find "$DEFAULT_STATE" -type f -exec sh -c 'for f do stat -f "%m %N" "$f" || exit 1; done' sh {} + \
+      > "$EVIDENCE/phaseB/86-default-state-stat.txt" || abort "默认 state 扫描或 stat 失败"
+    awk -v e="$BASE_EPOCH" '$1 > e' "$EVIDENCE/phaseB/86-default-state-stat.txt" \
+      > "$EVIDENCE/phaseB/86-default-state-new.txt" || abort "解析默认 state mtime 失败"
+  fi
   [ ! -s "$EVIDENCE/phaseB/86-default-state-new.txt" ] \
     || abort "默认状态目录出现新文件（见 86-default-state-new.txt），需人工核查"
+elif [ "$BASE_EXPECT" = "absent" ]; then
+  DEFAULT_PRESENCE=$(default_state_presence) || abort "检查默认 state 失败"
+  [ "$DEFAULT_PRESENCE" = absent ] || abort "基线记录默认 state 不存在，但现在出现了路径：$DEFAULT_STATE"
+  : > "$EVIDENCE/phaseB/86-default-state-new.txt" || abort "写入默认 state 扫描结果失败"
 else
-  echo "默认 state 目录不存在，视为未写入" > "$EVIDENCE/phaseB/86-default-state-new.txt"
+  abort "默认 state 基线存在性非法: $BASE_EXPECT"
 fi
 ```
+
+说明：先探测 `find -newermt` 能力，再执行互斥的主路径或逐文件 `stat` fallback；两者均检查退出码，失败即 abort。锚点固定为 §3.3 的整数时间戳。
+
+扫描仅检查结束时仍存在的常规文件，无法发现中途创建后删除、回填旧 mtime 或其他类型的写入；fallback 的整数秒 `>` 也会漏掉同秒文件。因此它只是隔离的必要条件，不是充分证明；不得据此宣称从未发生写入。上述检查不依赖 `set -e` / `pipefail`，基线与校验和的各步均单独检查退出码。
 
 ### 5.14 阶段 B Go/No-Go
 
@@ -958,14 +1218,26 @@ fi
 | B9（§5.10） | Mock 身份不符 → exit=0 且 JSON `uncertain` + `Result identity mismatch: run_id`；真实 state 哈希不变 |
 | B10（§5.11） | 错误 run-id exit=2；Mock role 篡改报 `unexpected pane` |
 | B11（§5.12） | blocked 未主动构造；观察结果如实标记 |
-| B12（§5.13） | 受保护 worker 的 revision/seq 不变；默认 state 无新文件 |
+| B12（§5.13） | 受保护 worker 的 revision/seq 与 §3.3 早期基线 `00-agents-before.tsv` 逐字相同；基线只读且校验和未变、基线 epoch ≤ 固定的 run birth time；`85-lead-drift-review.txt` 存在、原因及核查人已填写且 `test-input-trace=no`；默认 state 扫描以固定时间戳锚点 fail-closed，未发现较新文件（仅必要条件） |
 
-全通过 → `GO`；任一失败 → `NO-GO`，保留现场。断言失败会 `exit 1`，文件不存在即 No-Go；可按 §4.6 的可选方法在 `abort()` 中落盘原因。
+本阶段所有断言全通过后才写 `GO`；任一失败由 `abort` 写 `NO-GO: <原因>` 并退出，保留现场、不清理，等待负责人判定。文件缺失或写入失败也按 No-Go 处理。
+
+**阶段门槛（硬性）**：阶段 A 与阶段 B **各自必须产出** `GO-NOGO.txt`。A 的 `$EVIDENCE/phaseA/GO-NOGO.txt` 必须在进入阶段 B 之前生成并通过 §4.7 的 `grep -qx GO` 检查；B 的 `$EVIDENCE/phaseB/GO-NOGO.txt` 必须在 B12 全部断言之后生成。任一文件缺失即该阶段 No-Go，不得以“测试大体通过”代替门槛文件。
 
 ```bash
 GO_FILE="$EVIDENCE/phaseB/GO-NOGO.txt"
+[ -s "$EVIDENCE/phaseB/42-timeout-verification.txt" ] && [ -s "$EVIDENCE/phaseB/43-b8-nonce.txt" ] || abort "B8 必需证据缺失"
+LEAD_REVIEW="$EVIDENCE/phaseB/85-lead-drift-review.txt"
+[ -f "$LEAD_REVIEW" ] && [ -r "$LEAD_REVIEW" ] || abort "Lead 核查证据缺失或不可读"
+awk -F= '
+  $1=="drift_cause" { cause++; if ($0 !~ /^drift_cause=[[:space:]]*$/) cause_ok=1 }
+  $1=="test-input-trace" { trace++; if ($0=="test-input-trace=no") trace_ok=1 }
+  $1=="reviewer" { reviewer++; if ($0 !~ /^reviewer=[[:space:]]*$/) reviewer_ok=1 }
+  END { exit !(cause==1 && cause_ok && trace==1 && trace_ok && reviewer==1 && reviewer_ok) }
+' "$LEAD_REVIEW" || abort "Lead 核查未完成或发现测试输入痕迹（见 $LEAD_REVIEW）"
 # 只有在前面所有必要 abort 断言都通过后才会执行到这里
-printf 'GO\n' > "$GO_FILE"
+[ ! -e "$GO_FILE" ] && [ ! -L "$GO_FILE" ] || abort "门槛文件已存在，拒绝覆盖"
+(set -C; printf 'GO\n' > "$GO_FILE") || abort "写入 GO 文件失败或文件冲突"
 grep -qx GO "$GO_FILE" || abort "阶段 B 未 GO"
 ```
 
@@ -973,7 +1245,7 @@ grep -qx GO "$GO_FILE" || abort "阶段 B 未 GO"
 
 ## 6. 断言规范（16 条）
 
-写法约束：禁止“忽略退出码”的兜底写法（强制成功、丢弃 stderr、diff 判失败仍继续）；每条失败必须 abort。身份不符类断言以 **JSON** 判定，退出码可能为 0。
+写法约束：禁止“忽略退出码”的兜底写法（强制成功、丢弃断言命令的 stderr、diff 判失败仍继续）；每条失败必须 abort。§5.13 的能力探测是有意丢弃诊断的例外，不用于断言。身份不符类断言以 **JSON** 判定，退出码可能为 0。
 
 | 编号 | 对象 | 命令（要点） | 通过条件 | 失败诊断 |
 |---|---|---|---|---|
@@ -992,7 +1264,7 @@ grep -qx GO "$GO_FILE" || abort "阶段 B 未 GO"
 | A-13 | 二次派单唯一性 | `test "$D2" != "$D1"` + 账本两条各 1 | exit=0 | 历史被覆盖 |
 | A-14 | 单 pane 单 Run | `assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"` | active run ≤1；B7 另要求 active 恰好 1 | 冲突 Run 并存 |
 | A-15 | Mock 隔离 | `$MOCK_STATE` ≠ `$HTM_STATE_DIR`；Mock 后真实账本 sha 不变；真实 state 无 Mock 工件 | 三项均成立 | Mock 污染真实 state |
-| A-16 | 状态目录隔离 + 受保护 pane | `find` 默认 state 目录新文件为空；受保护 worker 行 diff 为空 | 输出为空 | 越界写或测试泄漏 |
+| A-16 | 状态目录隔离 + 受保护 pane | 默认 state 的 `find`/`stat` 扫描（能力探测分支）退出码为 0 且无较新文件；受保护 worker 行 diff 为空 | 扫描成功且输出为空、四行 protected 各恰好一行 | 越界写或测试泄漏。注意：扫描为空只是**必要条件**，不能证明中途创建后删除或回填 mtime 从未发生（见 §5.13） |
 
 pytest 等价写法（供后续把断言固化为测试时使用；其中 `test_timeout_ledger` 仅验证账本不确定态与 error 中的 timeout 证据，不验证超时成因，不能单独作为 B8 的等价验证）：
 
@@ -1049,23 +1321,24 @@ def test_artifact_contract(artifact, run_id, dispatch_id):
 ```text
 $EVIDENCE/phaseA/   00-探针身份、10-14 正常返回、20-22 超时、GO-NOGO.txt
                     21-a2-read.txt（仅 `agent wait` 成功时产生；缺失不等于失败）、22-after-timeout.tsv（**内容非空**表示 `herdr agent get` 成功；空文件/缺失均不等于失败）
-$EVIDENCE/phaseB/   00-03 初始化（00b 为 init 前残留 agent 检查）、10-13 D1、20 D2、30-32 归属与互斥、
-                    40-47 超时、50-51 Mock、60 负例、70 blocked、80 隔离、GO-NOGO.txt
+$EVIDENCE/phaseB/   00-03 初始化（00-agents-before.tsv 为资源创建前只读基线，00-baseline-*.txt 为其元信息/时间锚，00-run-created-birth.txt 为 run birth time，00-run-birth.err 为 stat 诊断；00b 为 init 前残留 agent 检查）、10-13 D1、20 D2、30-32 归属与互斥、
+                    40-47 超时、50-51 Mock（含 50-mock-collect.meta.txt 标记）、60 负例（61-mock-role.txt 为 Mock）、70 blocked、80-86 隔离（含 85-lead-drift.txt 和 85-lead-drift-review.txt）、GO-NOGO.txt
                     43-b8-read.txt（仅 `agent wait` 成功时产生；缺失不等于失败）
 ```
 
 规则：
 
-- 除 nonce 验证必需的 `15-a1-read.txt`、`21-a2-read.txt`、`43-b8-read.txt` 外，真实响应只保留 **key 名、值的类型、短值**（如 `idle`、`claude`、10 位 id）；不保存终端标题、长文本、对话内容。三份 read 证据可能含对话内容，留存或分享前须脱敏。
-- 账本快照用 `jq '{id,status,stage_index,stage_attempt,dispatches:[.dispatches[]|{id,role,status,error,artifact_sha256}]}'`，不保留完整 prompt。
-- Mock 证据文件名带 `mock` 前缀，内容首行标注 `MOCK`，与真实测试分开。
-- 证据留在 `$ITEST_ROOT` 内；如需长期保留，清理前复制到用户另行授权的目录。
+- **本地原始证据**保留流程实际落盘的原文件名和内容，可能含终端标题、长文本、对话内容或完整响应；须限制访问，不得直接对外分享。Mock 文件名内含 `mock`（如 `50-mock-collect.json`、`61-mock-role.txt`），同目录 `50-mock-collect.meta.txt` 首行为 `MOCK` 并列出对应文件；不在原始 JSON 等内容前插入标记。
+- **对外交付或长期留存的脱敏副本**须先复制到用户另行授权的交付目录：真实响应只保留 **key 名、值的类型、短值**（如 `idle`、`claude`、10 位 id），去掉终端标题、长文本和对话内容；`15-a1-read.txt`、`21-a2-read.txt`、`43-b8-read.txt` 也须脱敏，仅保留验证必需的短值。
+- 对外脱敏的账本快照用 `jq '{id,status,stage_index,stage_attempt,dispatches:[.dispatches[]|{id,role,status,error,artifact_sha256}]}'`，不保留完整 prompt；其中 `error` 也须去掉长文本和敏感内容。
+- 复制到交付目录时，Mock 证据副本改名加 `mock-` 前缀，与真实测试区分；保留独立元信息的 `MOCK` 首行，不给 JSON 插入非 JSON 首行，并同样去掉长文本和敏感内容。
+- 原始证据留在 `$ITEST_ROOT` 内；需长期保留时，在清理前按上述规则复制并脱敏。
 
 ---
 
 ## 8. 清理与回滚
 
-清理与验收命令必须在一个不属于待关闭测试 workspace 的 pane / 终端里执行（例如原来的 w2:p1 或另一个已存在的 shell）。在控制终端通过打印或粘贴的路径 source §3.1 的引导文件以恢复变量与函数，然后确认身份：
+清理与验收命令必须在一个不属于待关闭测试 workspace 的 pane / 终端里执行（例如原来的 w2:p1 或另一个已存在的 shell）。在控制终端用打印或粘贴的实际路径执行 `set -u; . <path>/env.sh || exit 1` 恢复变量与函数；source 失败即停止，然后确认身份：
 
 ```bash
 printf '%s\n' "${HERDR_WORKSPACE_ID:-<unset>}"
@@ -1099,22 +1372,51 @@ for a in "$DEV" "$REV"; do
   esac
 done
 
-# 2) 关闭前：测试 workspace 内确有 agent，且都属于本测试
+# 2) 关闭前：受保护 worker 仍与 §3.3 早期基线一致（清理不得在隔离已破坏时继续）
+PROTECTED='w1:p5 w1:p6 w2:p2 w2:p3'
+pick() { awk -v list="$PROTECTED" '
+  BEGIN { n=split(list,a," "); for(i=1;i<=n;i++) keep[a[i]]=1 }
+  keep[$2] { print $2 "\t" $5 "\t" $6 }' "$1"; }
+check_pick() {
+  count=$(wc -l < "$1") || abort "统计受保护 pane 失败"
+  [ "$count" -eq 4 ] || abort "受保护 pane 行数不是 4: $1 ($count)"
+  for p in $PROTECTED; do
+    count=$(awk -v p="$p" '$1==p {n++} END {print n+0}' "$1") || abort "统计 $p 失败"
+    [ "$count" -eq 1 ] || abort "受保护 pane $p 出现 $count 次: $1"
+  done
+}
+herdr agent list > "$EVIDENCE/cleanup-agents-current.json" || abort "agent list 失败"
+# pick 只接受 TSV（与 00-agents-before.tsv 同形）
+jq -r '.result.agents[] | [.workspace_id, .pane_id, (.name // "-"), (.agent_status // "-"), (.revision|tostring), (.state_change_seq|tostring)] | @tsv' \
+  "$EVIDENCE/cleanup-agents-current.json" > "$EVIDENCE/cleanup-agents-current.raw" || abort "当前 agent jq 失败"
+[ -s "$EVIDENCE/cleanup-agents-current.raw" ] || abort "当前 agent 列表为空"
+sort "$EVIDENCE/cleanup-agents-current.raw" > "$EVIDENCE/cleanup-agents-current.tsv" || abort "当前 agent sort 失败"
+pick "$EVIDENCE/phaseB/00-agents-before.tsv" > "$EVIDENCE/cleanup-protected-before.raw" || abort "基线提取失败"
+pick "$EVIDENCE/cleanup-agents-current.tsv" > "$EVIDENCE/cleanup-protected-current.raw" || abort "当前状态提取失败"
+check_pick "$EVIDENCE/cleanup-protected-before.raw"
+check_pick "$EVIDENCE/cleanup-protected-current.raw"
+sort "$EVIDENCE/cleanup-protected-before.raw" > "$EVIDENCE/cleanup-protected-before.tsv" || abort "基线排序失败"
+sort "$EVIDENCE/cleanup-protected-current.raw" > "$EVIDENCE/cleanup-protected-current.tsv" || abort "当前状态排序失败"
+diff -u "$EVIDENCE/cleanup-protected-before.tsv" "$EVIDENCE/cleanup-protected-current.tsv" \
+  > "$EVIDENCE/cleanup-protected-diff.txt" \
+  || abort "受保护 worker 已偏离早期基线，保留现场并人工核查（见 cleanup-protected-diff.txt）"
+
+# 3) 关闭前：测试 workspace 内确有 agent，且都属于本测试
 herdr agent list > "$EVIDENCE/cleanup-agents-before.json" || abort "agent list 失败"
 jq -e --arg ws "$ITEST_WS" '
   [.result.agents[] | select(.workspace_id==$ws)] as $mine
   | ($mine|length) > 0 and all($mine[]; ((.name // "") | startswith("ht")))
 ' "$EVIDENCE/cleanup-agents-before.json" >/dev/null || abort "测试 workspace 内存在非本测试 agent"
 
-# 3) 关闭 workspace（其内 pane/agent 一并回收）
+# 4) 关闭 workspace（其内 pane/agent 一并回收）
 herdr workspace close "$ITEST_WS" || abort "workspace close 失败，保留现场"
 
-# 4) workspace 已从列表消失
+# 5) workspace 已从列表消失
 herdr workspace list > "$EVIDENCE/cleanup-workspaces.json" || abort "workspace list 失败"
 jq -e --arg w "$ITEST_WS" '[.result.workspaces[]|select(.workspace_id==$w)]|length==0' \
   "$EVIDENCE/cleanup-workspaces.json" >/dev/null || abort "workspace 关闭后仍出现在列表: $ITEST_WS"
 
-# 5) 测试 worker 已从 agent list 消失
+# 6) 测试 worker 已从 agent list 消失
 herdr agent list > "$EVIDENCE/cleanup-agents-after.json" || abort "agent list 失败"
 jq -e --arg ws "$ITEST_WS" '[.result.agents[]|select(.workspace_id==$ws)]|length==0' \
   "$EVIDENCE/cleanup-agents-after.json" >/dev/null || abort "workspace 关闭后仍有 agent 残留: $ITEST_WS"
@@ -1160,10 +1462,12 @@ unset -f htm mock_htm mock2_htm abort need need_ws need_tab need_pane same_ws \
 | 类别 | 内容 | 判定依据 |
 |---|---|---|
 | 真实测试 | 阶段 A 的正常返回及超时（若观察到）；阶段 B 的 dispatch、账本状态、collect、报告归属、真实超时降级 | 真实 Herdr + 真实 agent + 真实 htm 调用 |
-| Mock 测试 | 身份不符工件注入、错误 pane 映射（在 `$MOCK/state` 副本中） | 隔离 state，不发送 prompt，不写真实工件 |
+| Mock 测试 | 身份不符工件注入（`$MOCK/state`）、错误 pane 映射（`$MOCK2/state`） | 隔离 state，不发送 prompt，不写真实工件 |
 | 未验证项 | blocked 未自然发生时的行为、`agent_prompt_stalled`、长任务/审批/多文件行为、默认 state 目录下的并发 | 只在出现时记录，否则标「未验证」 |
 
 **口径红线**：本方案只验证「调度通信链路」（dispatch → prompt → collect → 账本与工件校验）。它**不等于「自主监督闭环」验证通过**——不证明 Lead 能自主判断交付质量、不证明审批边界、不证明多团队并发与长期运行稳定性。任何“闭环已验证”的表述都超出证据范围。
+
+**摘要写法**：摘要只能陈述本次实际验证到的内容，不得使用超出证据的绝对表述。禁止写“未发现任何 htm.py 缺陷”“所有断言均已严格实现”“一次重试是常态”这类结论；应写成“本方案未验证 `xxx`”“本次单样本观察到一次重试，不足以推广”“本次未覆盖 `xxx` 路径”。已知缺陷必须如实列入 §10。
 
 ---
 
@@ -1178,11 +1482,13 @@ unset -f htm mock_htm mock2_htm abort need need_ws need_tab need_pane same_ws \
 | `run approve` 恒拒绝 | v4.2 有意禁用（`:634-637`） | 仅用 `--effect read` 与默认 autonomy |
 | Herdr 字段漂移 | 0.9.5 使用 `agent`/`agent_status` | 升级后必须重跑阶段 A |
 | HTM_STATE_DIR 隔离 | 与默认 state 完全隔离 | 不得据此宣称真实多团队并存已验证 |
+| run birth time | `stat -f %B` 返回 0 表示不支持 | 必须 abort，不得以 mtime 冒充 |
 | 临时工件清理 | 清理后不可审计 | 需保留时先复制到授权目录 |
 | Lead pane 漂移 | 并行任务导致 revision 变化 | 只对 worker 严格断言 |
 | 超时阈值 | `task_timeout_seconds` init 时固化（本方案设为 60s） | 用 worker 侧 `sleep 180` 触发真实超时；不改 team 配置；timeout 不等于未送达 |
 | Mock 与真实差异 | 副本中的账本/工件是伪造的 | 结论必须标 Mock |
 | reviewer 未被验证 | 全程 0 次 prompt | 报告中明确“reviewer 仅验证存在性，未验证其工作链路” |
+| `reconcile_result()` 残留旧 error | 已定位但**本轮未修复**：`scripts/htm.py:684-700` 的 `reconcile_result()` 成功时只对新建的 `data` 执行 `data.pop("error", None)`，旧 `rec["error"]` 仍被 `rec.update(...)` 保留，导致已 settled 的 collect 仍返回过期 error（如首次 missing artifact / timeout 后重新 collect 成功仍带原 error） | 仅记录，不改源码；待用户授权后另行修复，并补“先 missing/timeout、后 settled”回归测试。报告中不得据此宣称“未发现任何 htm.py 缺陷” |
 
 ---
 
