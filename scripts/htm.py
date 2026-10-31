@@ -33,6 +33,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "team.yaml"
 CONFIG = Path(os.environ.get("HTM_CONFIG", str(Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "herdr-team" / "team.yaml"))).expanduser()
 STATE = Path(os.environ.get("HTM_STATE_DIR", "~/.local/state/herdr-team")).expanduser()
+# Herdr public ids use a 32-char Crockford-style alphabet (src/workspace.rs PUBLIC_ID_ALPHABET):
+# 123456789ABCDEFGHJKMNPQRSTVWXYZ0 — no I/L/O/U, uppercase only.
+ID_ALPHABET = "123456789ABCDEFGHJKMNPQRSTVWXYZ0"
+WORKSPACE_ID_RE = re.compile(rf"w[{re.escape(ID_ALPHABET)}]+\Z")
+TAB_ID_RE = re.compile(rf"w[{re.escape(ID_ALPHABET)}]+:t[{re.escape(ID_ALPHABET)}]+\Z")
+PANE_ID_RE = re.compile(rf"w[{re.escape(ID_ALPHABET)}]+:p[{re.escape(ID_ALPHABET)}]+\Z")
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 SLUG_RE = re.compile(r"[a-z][a-z0-9-]{0,39}\Z")
 ENUM = {
@@ -240,6 +246,13 @@ def context(require=True):
     tab = os.environ.get("HERDR_TAB_ID", "")
     if require and not (ws and pane and tab):
         raise Error("Missing Herdr pane/workspace/tab environment")
+    if require:
+        for label, value, pattern in (("workspace", ws, WORKSPACE_ID_RE),
+                                      ("tab", tab, TAB_ID_RE), ("pane", pane, PANE_ID_RE)):
+            if not pattern.fullmatch(value):
+                raise Error(f"Invalid Herdr {label} id: {value!r}")
+        if tab.split(":")[0] != ws or pane.split(":")[0] != ws:
+            raise Error(f"Tab/Pane does not belong to workspace {ws}: tab={tab!r} pane={pane!r}")
     return {"workspace": ws, "lead_pane": pane, "lead_tab": tab}
 
 

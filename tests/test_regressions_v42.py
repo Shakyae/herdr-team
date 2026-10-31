@@ -30,6 +30,69 @@ def start_in_child(q, barrier):
         q.put(('blocked', str(e)))
 
 
+class PublicIdContextTests(unittest.TestCase):
+    def test_valid_workspace_ids(self):
+        for ws in ('w1', 'w2', 'wA', 'wB', 'wZ', 'w12', 'wABC'):
+            with self.subTest(ws=ws):
+                env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': ws,
+                       'HERDR_TAB_ID': f'{ws}:t1', 'HERDR_PANE_ID': f'{ws}:p1'}
+                with patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(h.context(), {'workspace': ws, 'lead_tab': f'{ws}:t1',
+                                                   'lead_pane': f'{ws}:p1'})
+
+    def test_valid_tab_and_pane_ids(self):
+        for ws, tab, pane in (('w1', 'w1:t1', 'w1:p1'), ('wA', 'wA:t1', 'wA:p1'),
+                              ('wABC', 'wABC:t2', 'wABC:p1'), ('wA', 'wA:t1', 'wA:p1B'),
+                              ('wB', 'wB:t1', 'wB:pZZ')):
+            with self.subTest(tab=tab, pane=pane), patch.dict(os.environ, {
+                'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': ws,
+                'HERDR_TAB_ID': tab, 'HERDR_PANE_ID': pane}, clear=True):
+                self.assertEqual(h.context(), {'workspace': ws, 'lead_tab': tab, 'lead_pane': pane})
+
+    def test_invalid_ids(self):
+        cases = {
+            'HERDR_WORKSPACE_ID': ('null', 'w', '1', 'a1', 'wa1', 'wI', 'wL', 'wO', 'wU',
+                                   'w1_', 'w1-2', 'w1 2'),
+            'HERDR_TAB_ID': ('w1:', 'w1:t', 'w1:t1:p1', 'w1:t1x'),
+            'HERDR_PANE_ID': ('w1:', 'w1:p', 'w1:t1:p1', 'w1:p@'),
+        }
+        for key, values in cases.items():
+            for value in values:
+                env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1',
+                       'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1', key: value}
+                with self.subTest(key=key, value=value), patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(h.Error) as caught:
+                        h.context()
+                    self.assertIn(repr(value), str(caught.exception))
+
+    def test_missing_values_preserve_errors(self):
+        env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1',
+               'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1'}
+        for key in ('HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID'):
+            with self.subTest(key=key), patch.dict(os.environ, {**env, key: ''}, clear=True):
+                with self.assertRaisesRegex(h.Error, '^Missing Herdr pane/workspace/tab environment$'):
+                    h.context()
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(h.Error, '^Must run inside Herdr: HERDR_ENV=1$'):
+                h.context()
+
+    def test_cross_workspace_ids_rejected(self):
+        for ws, tab, pane in (('w1', 'wA:t1', 'w1:p1'), ('wA', 'wA:t1', 'w1:p1')):
+            with self.subTest(ws=ws, tab=tab, pane=pane), patch.dict(os.environ, {
+                'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': ws,
+                'HERDR_TAB_ID': tab, 'HERDR_PANE_ID': pane}, clear=True):
+                with self.assertRaises(h.Error) as caught:
+                    h.context()
+                self.assertEqual(str(caught.exception),
+                                 f'Tab/Pane does not belong to workspace {ws}: tab={tab!r} pane={pane!r}')
+
+    def test_optional_context_does_not_validate(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(h.context(require=False), {'workspace': '', 'lead_tab': '', 'lead_pane': ''})
+        with patch.dict(os.environ, {'HERDR_WORKSPACE_ID': 'invalid'}, clear=True):
+            self.assertEqual(h.context(require=False), {'workspace': 'invalid', 'lead_tab': '', 'lead_pane': ''})
+
+
 class AdversarialTests(unittest.TestCase):
     def setUp(self):
         test_htm.RuntimeTests.setUp(self)
@@ -312,7 +375,7 @@ class AdversarialTests(unittest.TestCase):
 
     def test_hermes_same_profile_managed_team_conflicts(self):
         self.start('hermes-guide')
-        with patch.dict(os.environ, {'HERDR_PANE_ID':'w1:other-lead'}):
+        with patch.dict(os.environ, {'HERDR_PANE_ID':'w1:p99'}):
             with self.assertRaisesRegex(h.Error,'profile already reserved'):
                 h.init(self.cfg,opts('hermes-guide',dry_run=False,cwd=self.tmp.name))
 

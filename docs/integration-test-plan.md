@@ -1,6 +1,6 @@
 # herdr-team 阶段化联调方案（Herdr 0.9.5 · 派单通信链路）
 
-- 适用版本：herdr-team v4.2.0-beta.1（`scripts/htm.py`，HEAD `3090164`）、Herdr 0.9.5
+- 适用版本：herdr-team v4.2.0-beta.1（`scripts/htm.py`）、Herdr 0.9.5。本次执行对应的提交由证据目录 `00-head.txt` 现场记录（不在此硬编码，避免失真）。
 - 文档状态：**方案，未执行**。本文档不被文档修订轮执行；创建 workspace / tab / pane、启动 agent、`htm init`、`run start/dispatch/collect/gate/cancel`、关闭资源等操作，均需用户单独、明确授权。
 - 读者：能在 Herdr 内操作 CLI 的工程师或 Agent。命令可复制，但必须先完成 §3 的初始化与 `abort()` 定义。
 - 阶段：A（单 Worker 通信验证）→ B（HTM 调度/结果/异常验证）。**A 不 Go，不得进入 B**。
@@ -114,14 +114,18 @@ abort() {
 need() {
   [ -n "${1:-}" ] && [ "${1:-}" != "null" ] || abort "${2:-missing value}"
 }
+ID_ALPHA='123456789ABCDEFGHJKMNPQRSTVWXYZ0'
 need_ws() {
-  printf '%s' "${1:-}" | grep -Eq '^w[0-9]+$' || abort "非法 workspace id: ${1:-<empty>}"
+  case "${1:-}" in *$'\n'*) abort "非法 workspace id: ${1:-<empty>}";; esac
+  printf '%s' "${1:-}" | grep -Eq '^w['"$ID_ALPHA"']+$' || abort "非法 workspace id: ${1:-<empty>}"
 }
 need_tab() {
-  printf '%s' "${1:-}" | grep -Eq '^w[0-9]+:t[0-9]+$' || abort "非法 tab id: ${1:-<empty>}"
+  case "${1:-}" in *$'\n'*) abort "非法 tab id: ${1:-<empty>}";; esac
+  printf '%s' "${1:-}" | grep -Eq '^w['"$ID_ALPHA"']+:t['"$ID_ALPHA"']+$' || abort "非法 tab id: ${1:-<empty>}"
 }
 need_pane() {
-  printf '%s' "${1:-}" | grep -Eq '^w[0-9]+:p[0-9]+$' || abort "非法 pane id: ${1:-<empty>}"
+  case "${1:-}" in *$'\n'*) abort "非法 pane id: ${1:-<empty>}";; esac
+  printf '%s' "${1:-}" | grep -Eq '^w['"$ID_ALPHA"']+:p['"$ID_ALPHA"']+$' || abort "非法 pane id: ${1:-<empty>}"
 }
 same_ws() {
   [ "${2%%:*}" = "$1" ] || abort "$3: 前缀不一致 ($1 vs $2)"
@@ -166,8 +170,8 @@ mkdir -p "$EVIDENCE/phaseA" "$EVIDENCE/phaseB" || abort "无法创建证据目�
 htm() { python3 "$REPO/scripts/htm.py" "$@"; }
 # 引导文件供新 pane 和外部控制终端恢复；使用 shell 引号转义真实路径
 {
-  printf 'export RUNTOKEN=%q ITEST_ROOT=%q HTM_STATE_DIR=%q EVIDENCE=%q REPO=%q\n' \
-    "$RUNTOKEN" "$ITEST_ROOT" "$HTM_STATE_DIR" "$EVIDENCE" "$REPO"
+  printf 'export RUNTOKEN=%q ITEST_ROOT=%q HTM_STATE_DIR=%q EVIDENCE=%q REPO=%q ID_ALPHA=%q\n' \
+    "$RUNTOKEN" "$ITEST_ROOT" "$HTM_STATE_DIR" "$EVIDENCE" "$REPO" "$ID_ALPHA"
   typeset -f abort need need_ws need_tab need_pane same_ws assert_no_protected assert_single_active_run htm
 } > "$ITEST_ROOT/env.sh" || abort "写入引导文件失败"
 printf '引导文件：%s/env.sh\n' "$ITEST_ROOT"
@@ -407,6 +411,8 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 
 | 事实 | 位置 |
 |---|---|
+| Herdr public ID 使用 32 字符 Crockford 风格字母表 `123456789ABCDEFGHJKMNPQRSTVWXYZ0`，排除 I/L/O/U；例如 `wA`、`wA:t1`、`wA:p1`，不得假设只含十进制数字 | Herdr `src/workspace.rs` 的 `PUBLIC_ID_ALPHABET` |
+| 最低支持 Herdr 0.9.5（protocol 22） | Herdr 0.9.5 |
 | 默认 `max_rounds=5, max_retries=1, max_parallel=3, task_timeout_seconds=300` | `config/team.yaml` |
 | 校验范围：max_rounds 1..30、max_retries 0..5、max_parallel 1..8、task_timeout 15..300 | `scripts/htm.py:46-47` |
 | 派单顺序：active → actor 匹配（否则需 `--remediation`）→ 在途检查 → retries 上限 `1+max_retries` → max_parallel → approval → `verify_existing` → 状态必须 `idle\|done` | `:700-810` |
@@ -1481,6 +1487,8 @@ unset -f htm mock_htm mock2_htm abort need need_ws need_tab need_pane same_ws \
 | blocked 自然发生 | 不可控 | 只观察，未发生标未验证；禁止构造危险审批 |
 | `run approve` 恒拒绝 | v4.2 有意禁用（`:634-637`） | 仅用 `--effect read` 与默认 autonomy |
 | Herdr 字段漂移 | 0.9.5 使用 `agent`/`agent_status` | 升级后必须重跑阶段 A |
+| `pane_shell_ready` 的 argv0 白名单 | nu/xonsh/elvish/pwsh 不在白名单，可能 fail-closed 并报 `stayed busy after N readiness checks` | 使用支持的 shell，或另行评估白名单 |
+| ID 字母表漂移 | 校验依赖 Herdr 的 `PUBLIC_ID_ALPHABET` | Herdr 升级改变字母表时同步更新校验 |
 | HTM_STATE_DIR 隔离 | 与默认 state 完全隔离 | 不得据此宣称真实多团队并存已验证 |
 | run birth time | `stat -f %B` 返回 0 表示不支持 | 必须 abort，不得以 mtime 冒充 |
 | 临时工件清理 | 清理后不可审计 | 需保留时先复制到授权目录 |
