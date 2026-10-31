@@ -127,7 +127,7 @@ class RuntimeTests(unittest.TestCase):
             if argv[:2] == ('pane','get'):
                 return {'pane': {'workspace_id': 'w1'}}
             if argv[:2] == ('pane','process-info'):
-                return {'process_info': {'shell_pid': 123, 'foreground_processes': [
+                return {'process_info': {'shell_pid': 123, 'foreground_process_group_id': 123, 'foreground_processes': [
                     {'pid': 123, 'argv0': 'zsh'}]}}
             if argv[:2] == ('pane','split'):
                 self.panes += 1

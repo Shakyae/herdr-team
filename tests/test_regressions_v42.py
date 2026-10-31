@@ -57,6 +57,8 @@ class AdversarialTests(unittest.TestCase):
         starts = [r for r in team['resources'] if r['operation'] == 'agent_start']
         self.assertTrue(starts)
         self.assertTrue(all(r['detail']['readiness_attempts'] == 1 for r in starts))
+        self.assertTrue(all(r['detail']['readiness_shell_polls'] == 0 for r in starts))
+        self.assertTrue(all(r['detail']['readiness_busy_retries'] == 0 for r in starts))
         self.assertIsNone(team['pending_operation'])
 
     def test_init_records_busy_retry_attempts(self):
@@ -66,7 +68,7 @@ class AdversarialTests(unittest.TestCase):
             if args[:2] == ('pane', 'get'):
                 return {'pane': {'workspace_id': h.context()['workspace']}}
             if args[:2] == ('pane', 'process-info'):
-                return {'process_info': {'shell_pid': 123, 'foreground_processes': [
+                return {'process_info': {'shell_pid': 123, 'foreground_process_group_id': 123, 'foreground_processes': [
                     {'pid': 123, 'argv0': 'zsh'}]}}
             if args[:2] == ('agent', 'start'):
                 start_calls.append(args)
@@ -82,6 +84,8 @@ class AdversarialTests(unittest.TestCase):
         self.assertNotEqual(start_calls[3][2], start_calls[0][2])
         self.assertEqual(starts[0]['detail']['readiness_attempts'], 3)
         self.assertEqual(starts[1]['detail']['readiness_attempts'], 1)
+        self.assertEqual([r['detail']['readiness_shell_polls'] for r in starts], [0, 0])
+        self.assertEqual([r['detail']['readiness_busy_retries'] for r in starts], [2, 0])
 
     def test_init_start_failure_preserves_pending_operation(self):
         original = h.herdr
@@ -442,7 +446,7 @@ class PaneShellReadinessTests(unittest.TestCase):
             if args[:2] == ('pane', 'get'):
                 return {'pane': {'workspace_id': 'w6'}}
             if args[:2] == ('pane', 'process-info'):
-                return {'process_info': {'shell_pid': 47185, 'foreground_processes': [
+                return {'process_info': {'shell_pid': 47185, 'foreground_process_group_id': 47185, 'foreground_processes': [
                     {'pid': 47185, 'argv0': '/bin/zsh'}]}}
             if args[:2] == ('agent', 'start'):
                 if start_effect:
@@ -456,7 +460,8 @@ class PaneShellReadinessTests(unittest.TestCase):
         with patch.object(h, 'herdr', side_effect=fake), patch.object(h.time, 'sleep') as sleep:
             result, attempts = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6',
                                                          {'w6:p2'}, ['--', '--flag'], interval=0)
-        self.assertEqual((result, attempts), ({'agent': {'name': 'worker'}}, 1))
+        self.assertEqual((result, attempts), ({'agent': {'name': 'worker'}},
+                                               {'shell_polls': 0, 'busy_retries': 0, 'attempts': 1}))
         self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 1)
         self.assertEqual(calls[-1][-2:], ('--', '--flag'))
         sleep.assert_not_called()
@@ -471,9 +476,52 @@ class PaneShellReadinessTests(unittest.TestCase):
         calls, fake = self.fake(start)
         with patch.object(h, 'herdr', side_effect=fake):
             result, attempts = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'}, interval=0)
-        self.assertEqual((result, attempts), ({'ok': True}, 3))
+        self.assertEqual((result, attempts), ({'ok': True},
+                                               {'shell_polls': 0, 'busy_retries': 2, 'attempts': 3}))
         self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 3)
         self.assertEqual(sum(c[:2] == ('pane', 'process-info') for c in calls), 3)
+
+    def test_stats_shell_polls_only(self):
+        calls, fake = self.fake()
+        ready = iter([False, False, True])
+        def poll(pane_id):
+            value = next(ready)
+            if not value:
+                self.assertFalse(any(c[:2] == ('agent', 'start') for c in calls))
+            return value
+        with patch.object(h, 'herdr', side_effect=fake), patch.object(h, 'pane_shell_ready', side_effect=poll), patch.object(h.time, 'sleep'):
+            result, stats = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'})
+        self.assertEqual(result, {'agent': {'name': 'worker'}})
+        self.assertEqual(stats, {'shell_polls': 2, 'busy_retries': 0, 'attempts': 3})
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 1)
+
+    def test_stats_busy_retries_only(self):
+        outcomes = iter([h.Error('agent_pane_busy'), h.Error('agent_pane_busy'), {'ok': True}])
+        def start():
+            value = next(outcomes)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        calls, fake = self.fake(start)
+        with patch.object(h, 'herdr', side_effect=fake), patch.object(h.time, 'sleep'):
+            result, stats = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'})
+        self.assertEqual(result, {'ok': True})
+        self.assertEqual(stats, {'shell_polls': 0, 'busy_retries': 2, 'attempts': 3})
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 3)
+
+    def test_stats_mixed_shell_and_busy(self):
+        outcomes = iter([h.Error('agent_pane_busy'), {'ok': True}])
+        def start():
+            value = next(outcomes)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        calls, fake = self.fake(start)
+        with patch.object(h, 'herdr', side_effect=fake), patch.object(h, 'pane_shell_ready', side_effect=[False, True, True]), patch.object(h.time, 'sleep'):
+            result, stats = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'})
+        self.assertEqual(result, {'ok': True})
+        self.assertEqual(stats, {'shell_polls': 1, 'busy_retries': 1, 'attempts': 3})
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 2)
 
     def test_pane_busy_exhaustion_fails_closed(self):
         def start():
@@ -500,17 +548,36 @@ class PaneShellReadinessTests(unittest.TestCase):
 
     def test_pane_readiness_shell_argv0_prefix(self):
         for argv0, expected in [('-zsh', True), ('zsh', True), ('-python', False)]:
-            result = {'process_info': {'shell_pid': 1, 'foreground_processes': [
-                {'pid': 1, 'argv0': argv0}]}}
+            result = {'process_info': {'shell_pid': 1, 'foreground_process_group_id': 1,
+                                       'foreground_processes': [{'pid': 1, 'argv0': argv0}]}}
             with self.subTest(argv0=argv0), patch.object(h, 'herdr', return_value=result):
                 self.assertEqual(h.pane_shell_ready('w6:p2'), expected)
+
+    def test_pane_readiness_foreground_group(self):
+        shell = {'pid': 70608, 'argv0': 'zsh'}
+        cases = [
+            (70608, [shell], True),
+            (70608, [shell, {'pid': 70609, 'argv0': 'id'}], True),
+            (70932, [{'pid': 70932, 'argv0': 'sleep'}], False),
+            (70608, [{'pid': 70609, 'argv0': 'zsh'}], False),
+            (True, [shell], False),
+            ('70608', [shell], False),
+        ]
+        for pgid, processes, expected in cases:
+            result = {'process_info': {'shell_pid': 70608, 'foreground_process_group_id': pgid,
+                                       'foreground_processes': processes}}
+            with self.subTest(pgid=pgid, processes=processes), patch.object(h, 'herdr', return_value=result):
+                self.assertEqual(h.pane_shell_ready('w6:p2'), expected)
+        result = {'process_info': {'shell_pid': 70608, 'foreground_processes': [shell]}}
+        with patch.object(h, 'herdr', return_value=result):
+            self.assertFalse(h.pane_shell_ready('w6:p2'))
 
     def test_pane_readiness_invalid_and_non_shell_fail_closed(self):
         cases = [None, {}, {'process_info': {}},
                  {'process_info': {'shell_pid': 1, 'foreground_processes': []}},
-                 {'process_info': {'shell_pid': 1, 'foreground_processes': [{'pid': 1, 'argv0': 'python'}]}},
-                 {'process_info': {'shell_pid': 1, 'foreground_processes': [{'pid': 2, 'argv0': 'zsh'}]}},
-                 {'process_info': {'shell_pid': True, 'foreground_processes': [{'pid': 1, 'argv0': 'zsh'}]}}]
+                 {'process_info': {'shell_pid': 1, 'foreground_process_group_id': 1, 'foreground_processes': [{'pid': 1, 'argv0': 'python'}]}},
+                 {'process_info': {'shell_pid': 1, 'foreground_process_group_id': 1, 'foreground_processes': [{'pid': 2, 'argv0': 'zsh'}]}},
+                 {'process_info': {'shell_pid': True, 'foreground_process_group_id': 1, 'foreground_processes': [{'pid': 1, 'argv0': 'zsh'}]}}]
         for result in cases:
             with self.subTest(result=result), patch.object(h, 'herdr', return_value=result):
                 self.assertFalse(h.pane_shell_ready('w6:p2'))
