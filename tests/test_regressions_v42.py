@@ -152,6 +152,56 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(result['status'],'uncertain')
         self.assertIn('not found',result['error'])
 
+    def test_reconcile_uncertain_then_settled_clears_error(self):
+        rid=self.start()
+        d=self.dispatch(rid,no_wait=True)
+        run=h.require_run(rid)
+        rec=run['dispatches'][-1]
+        h.result_path(rid,d['dispatch_id']).unlink()
+        rec.update(h.reconcile_result(run,rec,'done'))
+        self.assertEqual(rec['status'],'uncertain')
+        self.assertIn('not found',rec['error'])
+        report={'run_id':rid,'dispatch_id':d['dispatch_id'],'role':rec['role'],
+                'stage':run['stages'][rec['stage_index']],'stage_attempt':rec['stage_attempt'],
+                'status':'complete','verdict':'pass',
+                'summary':'A valid report restored after the missing artifact failure.',
+                'evidence':['Verified restored artifact in regression test']}
+        h.result_path(rid,d['dispatch_id']).write_text(json.dumps(report))
+        rec.update(h.reconcile_result(run,rec,'done'))
+        self.assertEqual(rec['status'],'settled')
+        self.assertIsNone(rec['error'])
+
+    def test_reconcile_timeout_error_then_settled_clears_error(self):
+        rid=self.start()
+        d=self.dispatch(rid,no_wait=True)
+        run=h.require_run(rid)
+        rec=run['dispatches'][-1]
+        rec['status']='submission_uncertain'
+        rec['error']='Agent prompt timed out'
+        rec.update(h.reconcile_result(run,rec,'done'))
+        self.assertEqual(rec['status'],'settled')
+        self.assertIsNone(rec['error'])
+
+    def test_reconcile_missing_artifact_preserves_error(self):
+        rid=self.start()
+        d=self.dispatch(rid,no_wait=True)
+        run=h.require_run(rid)
+        rec=run['dispatches'][-1]
+        h.result_path(rid,d['dispatch_id']).unlink()
+        rec.update(h.reconcile_result(run,rec,'done'))
+        self.assertEqual(rec['status'],'uncertain')
+        self.assertTrue(rec['error'])
+        self.assertIn('not found',rec['error'])
+
+    def test_reconcile_unexpected_status_preserves_error(self):
+        rid=self.start()
+        d=self.dispatch(rid,no_wait=True)
+        run=h.require_run(rid)
+        rec=run['dispatches'][-1]
+        rec.update(h.reconcile_result(run,rec,'working'))
+        self.assertEqual(rec['status'],'uncertain')
+        self.assertEqual(rec['error'],'Unexpected agent status: working')
+
     def test_artifact_changed_after_collection_rejected(self):
         rid=self.start()
         d=self.dispatch(rid)

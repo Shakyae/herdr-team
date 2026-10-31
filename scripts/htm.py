@@ -696,7 +696,7 @@ def reconcile_result(run, rec, observed_status):
         return data
     data.update({"status": "blocked" if observed_status == "blocked" or report["status"] == "blocked" else "settled",
                  "report": report, "artifact_sha256": digest, "result_file": str(result_path(run["id"], rec["id"]))})
-    data.pop("error", None)
+    data["error"] = None
     return data
 
 
