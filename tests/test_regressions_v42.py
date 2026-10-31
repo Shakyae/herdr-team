@@ -52,6 +52,51 @@ class AdversarialTests(unittest.TestCase):
         path.write_text(json.dumps(content))
         return path
 
+    def test_init_records_readiness_attempts(self):
+        team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
+        starts = [r for r in team['resources'] if r['operation'] == 'agent_start']
+        self.assertTrue(starts)
+        self.assertTrue(all(r['detail']['readiness_attempts'] == 1 for r in starts))
+        self.assertIsNone(team['pending_operation'])
+
+    def test_init_records_busy_retry_attempts(self):
+        original = h.herdr
+        start_calls = []
+        def busy_twice(*args, **kwargs):
+            if args[:2] == ('pane', 'get'):
+                return {'pane': {'workspace_id': h.context()['workspace']}}
+            if args[:2] == ('pane', 'process-info'):
+                return {'process_info': {'shell_pid': 123, 'foreground_processes': [
+                    {'pid': 123, 'argv0': 'zsh'}]}}
+            if args[:2] == ('agent', 'start'):
+                start_calls.append(args)
+                if len(start_calls) <= 2:
+                    raise h.Error('agent_pane_busy')
+            return original(*args, **kwargs)
+        with patch.object(h, 'herdr', side_effect=busy_twice), patch.object(h.time, 'sleep'):
+            team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
+        starts = [r for r in team['resources'] if r['operation'] == 'agent_start']
+        self.assertEqual(team['status'], 'ready')
+        self.assertEqual(len(start_calls), 4)
+        self.assertEqual([c[2] for c in start_calls[:3]], [start_calls[0][2]] * 3)
+        self.assertNotEqual(start_calls[3][2], start_calls[0][2])
+        self.assertEqual(starts[0]['detail']['readiness_attempts'], 3)
+        self.assertEqual(starts[1]['detail']['readiness_attempts'], 1)
+
+    def test_init_start_failure_preserves_pending_operation(self):
+        original = h.herdr
+        def blocked(*args, **kwargs):
+            if args[:2] == ('agent', 'start'):
+                raise h.Error('agent_not_ready blocked during startup')
+            return original(*args, **kwargs)
+        with patch.object(h, 'herdr', side_effect=blocked):
+            with self.assertRaisesRegex(h.Error, 'Initialization partially applied'):
+                h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))
+        team = h.load(h.state_file(h.context()))
+        self.assertEqual(team['status'], 'partial')
+        self.assertEqual(team['pending_operation']['operation'], 'agent_start')
+        self.assertIn('agent_not_ready', team['error'])
+
     def test_permissions_change_fails_closed_on_reuse(self):
         self.start('dev-lite')
         with self.assertRaisesRegex(h.Error, 'different resolved config'):
@@ -387,6 +432,109 @@ class AgentFieldMappingTests(unittest.TestCase):
         with patch.object(h, 'lookup_agent', return_value=REAL_HERDR_095_AGENT):
             with self.assertRaisesRegex(h.Error, 'CWD mismatch'):
                 h.verify_existing(role)
+
+
+class PaneShellReadinessTests(unittest.TestCase):
+    def fake(self, start_effect=None):
+        calls = []
+        def herdr(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('pane', 'get'):
+                return {'pane': {'workspace_id': 'w6'}}
+            if args[:2] == ('pane', 'process-info'):
+                return {'process_info': {'shell_pid': 47185, 'foreground_processes': [
+                    {'pid': 47185, 'argv0': '/bin/zsh'}]}}
+            if args[:2] == ('agent', 'start'):
+                if start_effect:
+                    return start_effect()
+                return {'agent': {'name': 'worker'}}
+            raise AssertionError(args)
+        return calls, herdr
+
+    def test_pane_ready_starts_once_without_waiting(self):
+        calls, fake = self.fake()
+        with patch.object(h, 'herdr', side_effect=fake), patch.object(h.time, 'sleep') as sleep:
+            result, attempts = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6',
+                                                         {'w6:p2'}, ['--', '--flag'], interval=0)
+        self.assertEqual((result, attempts), ({'agent': {'name': 'worker'}}, 1))
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 1)
+        self.assertEqual(calls[-1][-2:], ('--', '--flag'))
+        sleep.assert_not_called()
+
+    def test_pane_busy_twice_then_starts(self):
+        outcomes = iter([h.Error('agent_pane_busy'), h.Error('agent_pane_busy'), {'ok': True}])
+        def start():
+            value = next(outcomes)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        calls, fake = self.fake(start)
+        with patch.object(h, 'herdr', side_effect=fake):
+            result, attempts = h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'}, interval=0)
+        self.assertEqual((result, attempts), ({'ok': True}, 3))
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 3)
+        self.assertEqual(sum(c[:2] == ('pane', 'process-info') for c in calls), 3)
+
+    def test_pane_busy_exhaustion_fails_closed(self):
+        def start():
+            raise h.Error('agent_pane_busy')
+        calls, fake = self.fake(start)
+        with patch.object(h, 'herdr', side_effect=fake), self.assertRaisesRegex(h.Error, 'stayed busy after 3 readiness checks'):
+            h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'}, attempts=3, interval=0)
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 3)
+
+    def test_pane_blocked_does_not_retry_or_send_input(self):
+        def start():
+            raise h.Error('agent_not_ready blocked during startup')
+        calls, fake = self.fake(start)
+        with patch.object(h, 'herdr', side_effect=fake), self.assertRaisesRegex(h.Error, 'agent_not_ready'):
+            h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'}, interval=0)
+        self.assertEqual(sum(c[:2] == ('agent', 'start') for c in calls), 1)
+        self.assertFalse(any('send-keys' in c or 'prompt' in c for c in calls))
+
+    def test_pane_not_created_by_init_rejected_immediately(self):
+        calls, fake = self.fake()
+        with patch.object(h, 'herdr', side_effect=fake), self.assertRaisesRegex(h.Error, 'not created'):
+            h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', set(), interval=0)
+        self.assertEqual(calls, [])
+
+    def test_pane_readiness_shell_argv0_prefix(self):
+        for argv0, expected in [('-zsh', True), ('zsh', True), ('-python', False)]:
+            result = {'process_info': {'shell_pid': 1, 'foreground_processes': [
+                {'pid': 1, 'argv0': argv0}]}}
+            with self.subTest(argv0=argv0), patch.object(h, 'herdr', return_value=result):
+                self.assertEqual(h.pane_shell_ready('w6:p2'), expected)
+
+    def test_pane_readiness_invalid_and_non_shell_fail_closed(self):
+        cases = [None, {}, {'process_info': {}},
+                 {'process_info': {'shell_pid': 1, 'foreground_processes': []}},
+                 {'process_info': {'shell_pid': 1, 'foreground_processes': [{'pid': 1, 'argv0': 'python'}]}},
+                 {'process_info': {'shell_pid': 1, 'foreground_processes': [{'pid': 2, 'argv0': 'zsh'}]}},
+                 {'process_info': {'shell_pid': True, 'foreground_processes': [{'pid': 1, 'argv0': 'zsh'}]}}]
+        for result in cases:
+            with self.subTest(result=result), patch.object(h, 'herdr', return_value=result):
+                self.assertFalse(h.pane_shell_ready('w6:p2'))
+        with patch.object(h, 'herdr', side_effect=h.Error('unavailable')):
+            self.assertFalse(h.pane_shell_ready('w6:p2'))
+
+    def test_pane_not_ready_is_rechecked_without_start(self):
+        calls, fake = self.fake()
+        def pending(*args, **kwargs):
+            if args[:2] == ('pane', 'process-info'):
+                calls.append(args)
+                return {'process_info': {'shell_pid': 1, 'foreground_processes': []}}
+            return fake(*args, **kwargs)
+        with patch.object(h, 'herdr', side_effect=pending), patch.object(h.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(h.Error, 'stayed busy after 3 readiness checks'):
+                h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'}, attempts=3, interval=0)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertFalse(any(c[:2] == ('agent', 'start') for c in calls))
+
+    def test_pane_workspace_mismatch_rejected(self):
+        with patch.object(h, 'herdr', return_value={'pane': {'workspace_id': 'other'}}) as mock:
+            with self.assertRaisesRegex(h.Error, 'different workspace'):
+                h.start_agent_when_ready('worker', 'claude', 'w6:p2', 'w6', {'w6:p2'}, interval=0)
+            self.assertEqual(mock.call_count, 1)
 
 
 class WorktreeSafetyTests(unittest.TestCase):

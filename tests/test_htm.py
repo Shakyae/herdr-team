@@ -124,6 +124,11 @@ class RuntimeTests(unittest.TestCase):
 
         def fake_herdr(*argv, **kwargs):
             self.actions.append(argv)
+            if argv[:2] == ('pane','get'):
+                return {'pane': {'workspace_id': 'w1'}}
+            if argv[:2] == ('pane','process-info'):
+                return {'process_info': {'shell_pid': 123, 'foreground_processes': [
+                    {'pid': 123, 'argv0': 'zsh'}]}}
             if argv[:2] == ('pane','split'):
                 self.panes += 1
                 return {'pane': {'pane_id': f'w1:p{self.panes}'}}

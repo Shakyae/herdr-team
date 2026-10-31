@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 try:
@@ -313,6 +314,51 @@ def herdr(*args, timeout=40):
     return process(["herdr", *args], timeout=timeout)
 
 
+def pane_shell_ready(pane_id):
+    try:
+        result = herdr("pane", "process-info", "--pane", pane_id)
+    except Error:
+        return False
+    info = result.get("process_info") if isinstance(result, dict) else None
+    if not isinstance(info, dict):
+        return False
+    processes = info.get("foreground_processes")
+    shell_pid = info.get("shell_pid")
+    if (not isinstance(processes, list) or len(processes) != 1 or
+            not isinstance(processes[0], dict) or type(shell_pid) is not int):
+        return False
+    process_info = processes[0]
+    argv0 = process_info.get("argv0")
+    if not isinstance(argv0, str):
+        return False
+    # 实测 Herdr 的 argv0 为 zsh；-zsh 出现在 argv/cmdline，这里 lstrip 只是容错，避免依赖字段差异。
+    token = os.path.basename(argv0).lstrip("-")
+    return (type(process_info.get("pid")) is int and process_info["pid"] == shell_pid and
+            token in {"zsh", "bash", "sh", "dash", "fish", "ksh", "tcsh"})
+
+
+def start_agent_when_ready(name, kind, pane_id, workspace, created_panes,
+                           launch_args=(), attempts=8, interval=0.5):
+    for attempt in range(1, attempts + 1):
+        if pane_id not in created_panes:
+            raise Error(f"Pane {pane_id} was not created by this init; refusing agent start")
+        result = herdr("pane", "get", pane_id)
+        pane = result.get("pane") if isinstance(result, dict) else None
+        if not isinstance(pane, dict) or pane.get("workspace_id") != workspace:
+            raise Error(f"Pane {pane_id} is missing or belongs to a different workspace")
+        if pane_shell_ready(pane_id):
+            try:
+                result = herdr("agent", "start", name, "--kind", kind, "--pane", pane_id,
+                               *launch_args, timeout=60)
+                return result, attempt
+            except Error as e:
+                if "agent_pane_busy" not in str(e):
+                    raise
+        if attempt < attempts:
+            time.sleep(interval)
+    raise Error(f"Agent pane {pane_id} stayed busy after {attempts} readiness checks; refusing to retry blindly")
+
+
 def agent_data(obj):
     # Herdr wraps the Agent object as {"agent": {...}} for `agent get`.
     # An Agent object itself also carries the string field "agent" (the kind),
@@ -550,11 +596,14 @@ def init(cfg, args):
                 info = {**role, "pane_id": pane_ids[idx], "agent_name": name, "cwd": work_cwd}
                 roles.append(info)
                 save(path, team)
-                cmd = ["agent", "start", name, "--kind", role["kind"], "--pane", pane_ids[idx]]
-                if role["launch_args"]:
-                    cmd.extend(["--", *role["launch_args"]])
-                operate("agent_start", {"name": name, "pane": pane_ids[idx], "kind": role["kind"]},
-                        lambda: herdr(*cmd, timeout=60))
+                detail = {"name": name, "pane": pane_ids[idx], "kind": role["kind"]}
+                def start():
+                    launch_args = ["--", *role["launch_args"]] if role["launch_args"] else []
+                    result, attempts_used = start_agent_when_ready(
+                        name, role["kind"], pane_ids[idx], ctx["workspace"], pane_ids, launch_args)
+                    detail["readiness_attempts"] = attempts_used
+                    return result
+                operate("agent_start", detail, start)
             team["status"] = "ready"
             save(path, team)
         except (Error, KeyError, TypeError) as e:
