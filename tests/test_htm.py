@@ -135,6 +135,10 @@ class RuntimeTests(unittest.TestCase):
             if argv[:2] == ('tab','create'):
                 self.panes += 1
                 return {'tab': {'tab_id': 'w1:t2'}, 'root_pane': {'pane_id': f'w1:p{self.panes}'}}
+            if argv[:2] == ('agent','get'):
+                if argv[2] not in self.started:
+                    raise h.HerdrError('not found', code='agent_not_found')
+                return {'agent': self.started[argv[2]]}
             if argv[:2] == ('agent','start'):
                 self.started[argv[2]] = {'pane_id': argv[argv.index('--pane')+1],
                                           'kind': argv[argv.index('--kind')+1], 'status':'idle'}

@@ -65,7 +65,7 @@ htm run collect --dispatch-id DID -> herdr agent get <agent> -> agent_status_of(
 
 ### 2.2 阶段 A（单 Worker 通信）
 
-- [ ] 探针就是主 team 的 developer（`ht…`），不额外创建 agent
+- [ ] 探针就是主 team 的 developer（`<role>-wXpY` 派生名），不额外创建 agent
 - [ ] 正常 prompt（A1）exit=0，返回体结构已记录，`agent_status_of(doc["result"])` 落在 `{idle, done}`（不得喂未解包的 `doc`，见 §3.8），且本轮 nonce 在 **`⏺` 模型回复行**命中（排除 `❯` 输入回显，见 §4.3）
 - [ ] 超时 prompt（A2）记录 timeout 或未触发；不据此断言输入未送达
 - [ ] 证据写入 `$EVIDENCE/phaseA/`
@@ -190,7 +190,7 @@ printf '引导文件：%s/env.sh\n' "$ITEST_ROOT"
 |---|---|
 | workspace label | `htm-itest-$RUNTOKEN`（不得复用 `w1` pagi、`w2` herdr-team） |
 | tab | `init --layout tab` 自建 `htm-dev-lite`；本方案不另建 tab |
-| 探针 / 派单 agent | 同一个 `ht<digest>-1-developer`（`init` 生成），阶段 A 与阶段 B 复用 |
+| 探针 / 派单 agent | 同一个 `developer-wXpY`（`init` 按真实 Pane ID 派生，如 `developer-w5p2`），阶段 A 与阶段 B 复用 |
 | reviewer | `init` 生成但全程 0 次 prompt；失败时如实记录，不得为了“跑通”而驱动它 |
 | cwd | `$ITEST_ROOT`，禁止 `~/pagi`、`~/dev/herdr-team` |
 | state | `$HTM_STATE_DIR=$ITEST_ROOT/state` |
@@ -370,8 +370,9 @@ export REV="$_tmp"
 need_pane "$DEV_PANE"
 same_ws "$ITEST_WS" "$DEV_PANE" "workspace/developer"
 assert_no_protected "$DEV_PANE" "developer"
-case "$DEV" in ht*) ;; *) abort "worker 名不符合 ht<digest>-N-<role>: $DEV";; esac
-case "$REV" in ht*) ;; *) abort "worker 名不符合 ht<digest>-N-<role>: $REV";; esac
+# 命名规则（P1B 起）：<role>-<真实 pane id 去冒号并小写>，如 developer-w5p2
+case "$DEV" in developer-w*) ;; *) abort "worker 名不符合 <role>-wXpY: $DEV";; esac
+case "$REV" in reviewer-w*) ;; *) abort "worker 名不符合 <role>-wXpY: $REV";; esac
 printf 'export DEV=%q DEV_PANE=%q REV=%q\n' "$DEV" "$DEV_PANE" "$REV" >> "$ITEST_ROOT/env.sh" || abort "保存 worker 身份失败"
 htm status > "$EVIDENCE/phaseB/02-status.json" || abort "htm status 失败"
 jq -e '.agents[] | select(.role=="developer") | .live==true and (.observed_state=="idle" or .observed_state=="done")' \
@@ -427,14 +428,14 @@ assert_single_active_run "$ITEST_WS" "$ITEST_ROOT_PANE"
 | `run_gate`：pass/revise 前要求无未 settled；非 lead 要求最新报告 verdict=pass 且字节未变；测试阶段要求 tests 全 0；evidence ≥12；超轮 → `blocked_round_limit` | `:838-903` |
 | `run_approve` 恒抛错 | `:634-637` |
 | run_id 12 位 hex、dispatch_id 10 位 hex | `:640-644` |
-| worker 名 `ht<digest>-N-<role>`；team 文件 `teams/<sha256(workspace\|lead_pane)[:16]>.json`；run 文件 `runs/<12位>.json` | `:548-549`、`:249-251` |
+| worker 名 `<role>-<pane id 去冒号小写>`（如 `developer-w5p2`）；team 文件 `teams/<sha256(workspace\|lead_pane)[:16]>.json`；run 文件 `runs/<12位>.json` | `agent_name_for()`、`:249-251` |
 | `--config` 是全局参数，必须在子命令前 | `:992-996` |
 | `process()` 已解包 Herdr 响应：`return out.get("result", out)` | `:309` |
 | `agent_status_of()` 读 `agent_status`（回退 `status`）；缺省返回 `unknown`，调用方按 uncertain 处理 | `:339-352` |
 
 `--set orchestration.max_retries=5` 的必要性：同一 stage_attempt 内对同一 role 的派单上限是 `1+max_retries`。默认 1 只允许 2 次；本方案在 `implement` 上需要 D1、D2、超时共 3 次，并预留 collect 未结算后的重派余量，因此固定到上限 5（允许 6 次）。`task_timeout_seconds` 在 `init` 时固化（本方案取 60），事后不能改，所以超时用例靠 worker 侧 `sleep 180` 触发，而不是改配置或开第二个 team。
 
-命名说明：`htm` 的 worker 由 `init` 生成 `ht…`，`verify_existing()` 按 `team["agent_name"]` 查活体，因此**不能**把派单目标改成其他探针名。阶段 A 的原始探针调用不写入 htm 账本；同一 agent 在阶段 B 由 `init` 生成的 `ht…` 名称进入账本。
+命名说明：`htm` 的 worker 由 `init` 按真实 Pane ID 派生为 `<role>-wXpY`（如 `developer-w5p2`），`verify_existing()` 按 `team["agent_name"]` 查活体，因此**不能**把派单目标改成其他探针名。阶段 A 的原始探针调用不写入 htm 账本；同一 agent 在阶段 B 由 `init` 生成的派生名进入账本。
 
 ### 3.8 `.result` 状态解析（原始 CLI vs htm 内部）
 
@@ -1370,10 +1371,10 @@ esac
 ### 8.2 关闭前归属断言（全部通过才继续）
 
 ```bash
-# 1) 资源名前缀：htm worker 必须 ht 开头
+# 1) P1B 起 worker 名按 <role>-wXpY 派生，只接受测试角色前缀
 for a in "$DEV" "$REV"; do
   case "$a" in
-    "ht"*) ;;
+    developer-w*|reviewer-w*) ;;
     *) abort "agent 名不属于本测试: $a" ;;
   esac
 done
@@ -1411,7 +1412,7 @@ diff -u "$EVIDENCE/cleanup-protected-before.tsv" "$EVIDENCE/cleanup-protected-cu
 herdr agent list > "$EVIDENCE/cleanup-agents-before.json" || abort "agent list 失败"
 jq -e --arg ws "$ITEST_WS" '
   [.result.agents[] | select(.workspace_id==$ws)] as $mine
-  | ($mine|length) > 0 and all($mine[]; ((.name // "") | startswith("ht")))
+  | ($mine|length) > 0 and all($mine[]; ((.name // "") | test("^(developer|reviewer)-w[0-9a-z]+p[0-9a-z]+$")))
 ' "$EVIDENCE/cleanup-agents-before.json" >/dev/null || abort "测试 workspace 内存在非本测试 agent"
 
 # 4) 关闭 workspace（其内 pane/agent 一并回收）

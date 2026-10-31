@@ -2,6 +2,7 @@
 
 All Herdr interactions are mocked. No real agents or user repositories touched.
 """
+import contextlib
 import copy
 import json
 import multiprocessing
@@ -836,6 +837,337 @@ class WorktreeSafetyTests(unittest.TestCase):
                 h.worktree_details(h.initial_plan(cfg,'dev-review',opts('dev-review',worktree='on')),
                                    opts('dev-review',worktree='on',repo=str(repo),task='dirty-check'),False)
             self.assertFalse((Path(tmp)/'managed').exists())
+
+
+class PaneNamingTests(unittest.TestCase):
+    def setUp(self):
+        test_htm.RuntimeTests.setUp(self)
+
+    def lead_fake(self, pane_session='original-session', agent_session='original-session', pane_kind='claude', agent_kind='claude'):
+        session = lambda value: {'kind': 'claude', 'source': 'test', 'value': value}
+        pane = {'pane_id': 'w1:p1', 'workspace_id': 'w1', 'agent': pane_kind, 'agent_session': session(pane_session)}
+        agent = {'pane_id': 'w1:p1', 'name': 'old-lead', 'agent': agent_kind, 'agent_session': session(agent_session)}
+        calls = []
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args == ('pane', 'get', 'w1:p1'): return {'pane': pane}
+            if args == ('agent', 'get', 'w1:p1'): return {'agent': copy.deepcopy(agent)}
+            if args == ('agent', 'get', 'lead-w1p1'): raise h.HerdrError('not found', code='agent_not_found')
+            if args[:2] == ('agent', 'rename'): return {}
+            raise AssertionError(args)
+        return pane, agent, calls, fake
+
+    def test_name_lead_apply_requires_expect_session(self):
+        _, _, calls, fake = self.lead_fake('replacement-session', 'replacement-session')
+        with patch.object(h, 'herdr', side_effect=fake):
+            for expected in (None, '', '   '):
+                with self.subTest(expected=expected), self.assertRaisesRegex(h.Error, '预览.*agent_session.value.*--expect-session'):
+                    h.name_lead(ns(apply=True, current=None, expect_session=expected))
+            with self.assertRaisesRegex(h.Error, '预览.*--expect-session'):
+                h.name_lead(ns(apply=True, current=None))
+        self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+
+    def test_name_lead_apply_rejects_wrong_expect_session(self):
+        _, _, calls, fake = self.lead_fake('replacement-session', 'replacement-session')
+        with patch.object(h, 'herdr', side_effect=fake), self.assertRaisesRegex(h.Error, 'Expected session'):
+            h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+        self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+
+    def test_name_lead_preview_creates_no_state(self):
+        _, _, calls, fake = self.lead_fake()
+        self.assertFalse(h.STATE.exists())
+        with patch.object(h, 'herdr', side_effect=fake):
+            result = h.name_lead(ns(apply=False, current=None))
+        self.assertEqual(result['agent_session']['value'], 'original-session')
+        self.assertFalse(h.STATE.exists())
+        self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+
+    def test_name_lead_apply_lock_scope_and_team_recheck(self):
+        path = h.state_file(h.context())
+        h.save(path, {'context': h.context(), 'status': 'ready', 'roles': []})
+        _, _, calls, fake = self.lead_fake()
+        inside = False
+        original_locked = h.locked
+        @contextlib.contextmanager
+        def tracked_lock():
+            nonlocal inside
+            with original_locked():
+                inside = True
+                try: yield
+                finally: inside = False
+        def tracked_herdr(*args, **kwargs):
+            if args == ('pane', 'get', 'w1:p1') or args == ('agent', 'get', 'lead-w1p1'):
+                self.assertFalse(inside)
+            elif args[:2] == ('agent', 'rename'):
+                self.assertTrue(inside)
+            return fake(*args, **kwargs)
+        with patch.object(h, 'locked', tracked_lock), patch.object(h, 'herdr', side_effect=tracked_herdr):
+            h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+        self.assertEqual(sum(c[:2] == ('agent', 'rename') for c in calls), 1)
+        calls.clear()
+        @contextlib.contextmanager
+        def changed_team_lock():
+            with original_locked():
+                h.save(path, {'context': h.context(), 'status': 'partial', 'roles': []})
+                yield
+        with patch.object(h, 'locked', changed_team_lock), patch.object(h, 'herdr', side_effect=fake):
+            with self.assertRaisesRegex(h.Error, 'not ready'):
+                h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+        self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+
+    def test_name_lead_rejects_identity_mismatch(self):
+        for pane_kind, agent_kind, pane_session, agent_session in (
+                ('claude', 'codex', 'original-session', 'original-session'),
+                ('claude', 'claude', 'original-session', 'replacement-session')):
+            with self.subTest(agent_kind=agent_kind, agent_session=agent_session):
+                _, _, calls, fake = self.lead_fake(pane_session, agent_session, pane_kind, agent_kind)
+                with patch.object(h, 'herdr', side_effect=fake), self.assertRaisesRegex(h.Error, 'identity'):
+                    h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+                self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+
+    def test_name_lead_rejects_unverifiable_session(self):
+        for value in (None, '', 'short', '        '):
+            with self.subTest(value=value):
+                _, _, calls, fake = self.lead_fake(value, value)
+                with patch.object(h, 'herdr', side_effect=fake), self.assertRaisesRegex(h.Error, 'identity'):
+                    h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+                self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+
+    def test_name_lead_rechecks_session_around_rename(self):
+        for change_at in (2, 3):
+            with self.subTest(change_at=change_at):
+                _, agent, calls, fake = self.lead_fake()
+                count = 0
+                def changing(*args, **kwargs):
+                    nonlocal count
+                    if args == ('agent', 'get', 'w1:p1'):
+                        count += 1
+                        if count == change_at: agent['agent_session']['value'] = 'replacement-session'
+                    return fake(*args, **kwargs)
+                message = 'before rename' if change_at == 2 else 'rename 后身份已变化，需人工核对'
+                with patch.object(h, 'herdr', side_effect=changing), self.assertRaisesRegex(h.Error, message):
+                    h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+                renames = [c for c in calls if c[:2] == ('agent', 'rename')]
+                self.assertEqual(len(renames), 0 if change_at == 2 else 1)
+
+    def test_require_name_available_structured_code(self):
+        path = h.state_file(h.context())
+        with patch.object(h, 'herdr', side_effect=h.HerdrError('agent_not_found', code='permission_denied')):
+            with self.assertRaisesRegex(h.Error, 'Cannot verify'): h.require_name_available('lead-w1p1', path)
+        with patch.object(h, 'herdr', side_effect=h.HerdrError('not found', code='agent_not_found')):
+            h.require_name_available('lead-w1p1', path)
+        for rc, stdout, stderr, code in ((1, '{"error":{"code":"agent_not_found"}}', '', 'agent_not_found'),
+                                         (1, '', '{"error":{"code":"agent_not_found"}}', 'agent_not_found'),
+                                         (1, '', '{"error":{"code":"permission_denied","message":"agent_not_found"}}', 'permission_denied'),
+                                         (1, '{"error":{"code":"agent_not_found"}}', '{"error":{"code":"permission_denied"}}', 'permission_denied'),
+                                         (0, '{"error":{"code":"agent_not_found"}}', '', 'agent_not_found')):
+            with self.subTest(rc=rc, stdout=stdout, stderr=stderr), patch.object(h.subprocess, 'run', return_value=ns(returncode=rc, stdout=stdout, stderr=stderr)):
+                with self.assertRaises(h.HerdrError) as caught: h.process(['herdr', 'agent', 'get'])
+                self.assertEqual(caught.exception.code, code)
+
+    def test_init_rejects_overlong_role_before_resources(self):
+        cfg = copy.deepcopy(self.cfg)
+        roles = cfg['templates']['dev-lite']['roles']
+        roles['a' * 27] = roles.pop('developer')
+        args = opts('dev-lite', dry_run=False, cwd=self.tmp.name)
+        with patch.object(h, 'save', wraps=h.save) as save:
+            with self.assertRaisesRegex(h.Error, 'role 名过长'): h.init(cfg, args)
+        save.assert_not_called()
+        self.assertFalse(self.actions)
+        self.assertFalse(list((h.STATE / 'teams').glob('*.json')))
+        roles['a' * 26] = roles.pop('a' * 27)
+        team = h.init(cfg, args)['team']
+        self.assertIn('a' * 26, [role['role'] for role in team['roles']])
+
+    def test_name_lead_without_team(self):
+        _, _, calls, fake = self.lead_fake()
+        with patch.object(h, 'herdr', side_effect=fake):
+            preview = h.name_lead(ns(apply=False, current=None))
+            self.assertIsNone(preview['team'])
+            self.assertTrue(preview['verified'])
+            self.assertEqual(preview['agent_session'], {'kind': 'claude', 'source': 'test', 'value': 'original-session'})
+            self.assertFalse(any(c[:2] == ('agent', 'rename') for c in calls))
+            with self.assertRaisesRegex(h.Error, 'Expected session'):
+                h.name_lead(ns(apply=True, current=None, expect_session='different-session'))
+            result = h.name_lead(ns(apply=True, current=None, expect_session=preview['agent_session']['value']))
+            self.assertIsNone(result['team'])
+            self.assertEqual(sum(c[:2] == ('agent', 'rename') for c in calls), 1)
+            h.save(h.state_file(h.context()), {'context': {'workspace': 'w2'}, 'status': 'ready'})
+            with self.assertRaisesRegex(h.Error, 'context mismatch'):
+                h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+            self.assertEqual(sum(c[:2] == ('agent', 'rename') for c in calls), 1)
+
+    def test_multiple_workspaces_and_same_role(self):
+        self.assertEqual(h.agent_name_for('developer', 'w1:p2'), 'developer-w1p2')
+        self.assertEqual(h.agent_name_for('developer', 'w2:p2'), 'developer-w2p2')
+        self.assertEqual(h.agent_name_for('developer', 'w2:p3'), 'developer-w2p3')
+        self.assertNotEqual(h.state_file({'workspace': 'w1', 'lead_pane': 'w1:p1'}),
+                            h.state_file({'workspace': 'w2', 'lead_pane': 'w2:p1'}))
+
+    def test_uppercase_public_id_preserves_pane(self):
+        self.assertEqual(h.agent_name_for('developer', 'wA:pB'), 'developer-wapb')
+        original = h.herdr
+        with patch.object(h, 'herdr') as fake:
+            def upper(*args, **kwargs):
+                if args[:2] == ('pane', 'split'):
+                    self.panes += 1
+                    return {'pane': {'pane_id': f'wA:p{self.panes}'}}
+                if args[:2] == ('pane', 'get'):
+                    return {'pane': {'workspace_id': 'wA'}}
+                return original(*args, **kwargs)
+            fake.side_effect = upper
+            with patch.dict(os.environ, {'HERDR_WORKSPACE_ID':'wA', 'HERDR_PANE_ID':'wA:p1', 'HERDR_TAB_ID':'wA:t1'}):
+                team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
+        self.assertEqual(team['roles'][0]['pane_id'], 'wA:p2')
+        self.assertEqual(team['roles'][0]['agent_name'], 'developer-wap2')
+
+    def test_name_length_and_invalid_fail_closed(self):
+        self.assertEqual(len(h.agent_name_for('a'*27, 'w1:p1')), 32)
+        with self.assertRaisesRegex(h.Error, 'Invalid derived'): h.agent_name_for('a'*28, 'w1:p1')
+        with self.assertRaisesRegex(h.Error, 'Invalid pane'): h.agent_name_for('developer', 'wa:p1')
+        with self.assertRaisesRegex(h.Error, 'Invalid derived'): h.agent_name_for('bad.role', 'w1:p1')
+
+    def test_name_conflicts_preserve_partial_and_block_retry(self):
+        self.started['developer-w1p2'] = {'pane_id': 'w1:p99'}
+        args = opts('dev-lite', dry_run=False, cwd=self.tmp.name)
+        with self.assertRaisesRegex(h.Error, 'already created; agent not named or started'):
+            h.init(self.cfg, args)
+        team = h.load(h.state_file(h.context()))
+        self.assertEqual(team['status'], 'partial')
+        self.assertEqual(team['roles'], [])
+        self.assertTrue(any(x['operation'] == 'pane_split' for x in team['resources']))
+        self.assertFalse(any(x[:2] == ('agent','start') for x in self.actions))
+        with self.assertRaisesRegex(h.Error, 'partial'): h.init(self.cfg, args)
+
+    def test_registered_conflicts_and_duplicate_roles(self):
+        path = h.state_file(h.context())
+        with self.assertRaisesRegex(h.Error, 'this team'):
+            h.require_name_available('developer-w1p2', path, [{'agent_name':'developer-w1p2'}])
+        h.save(h.STATE/'teams'/'other.json', {'roles':[{'agent_name':'developer-w1p2'}]})
+        with self.assertRaisesRegex(h.Error, 'registered by team'):
+            h.require_name_available('developer-w1p2', path)
+
+    def test_name_availability_unknown_fails_closed(self):
+        with patch.object(h, 'herdr', side_effect=h.Error('server unavailable')):
+            with self.assertRaisesRegex(h.Error, 'Cannot verify'):
+                h.require_name_available('developer-w1p2', h.state_file(h.context()))
+
+    def test_plan_is_pending_without_changing_persisted_plan(self):
+        args = opts('dev-lite', dry_run=True, cwd=self.tmp.name)
+        result = h.init(self.cfg, args)
+        self.assertTrue(all(r['agent_name'] is None and r['pending'] for r in result['plan']['roles']))
+        self.assertNotIn('agent_name', h.initial_plan(self.cfg, 'dev-lite', args)['roles'][0])
+        self.assertFalse(self.actions)
+
+    def test_history_hash_team_reuse_no_rename(self):
+        args = opts('dev-lite', dry_run=False, cwd=self.tmp.name)
+        team = h.init(self.cfg, args)['team']
+        for role in team['roles']:
+            old = role['agent_name']; name = 'htabcdef-' + role['role']
+            self.started[name] = self.started.pop(old); role['agent_name'] = name
+        h.save(h.state_file(h.context()), team)
+        before = len(self.actions)
+        result = h.init(self.cfg, args)
+        self.assertTrue(result['reused'])
+        self.assertEqual(len(self.actions), before)
+        self.assertTrue(all(r['agent_name'].startswith('htabcdef-') for r in result['team']['roles']))
+
+    def test_agent_move_and_identity_drift_rejected(self):
+        team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
+        role = team['roles'][0]
+        self.started[role['agent_name']]['pane_id'] = 'w2:p2'
+        with self.assertRaisesRegex(h.Error, 'unexpected pane'): h.verify_existing(role)
+        self.started[role['agent_name']]['pane_id'] = role['pane_id']
+        role['agent_session'] = {'value':'original-session'}
+        self.started[role['agent_name']]['agent_session'] = {'value':'changed-session'}
+        with self.assertRaisesRegex(h.Error, 'identity changed'): h.verify_existing(role)
+
+    def test_start_binding_persisted_before_herdr_start(self):
+        original = h.herdr
+        def check(*args, **kwargs):
+            if args[:2] == ('agent','start'):
+                team = h.load(h.state_file(h.context()))
+                self.assertEqual(team['roles'][-1]['agent_name'], args[2])
+                self.assertEqual(team['roles'][-1]['pane_id'], args[args.index('--pane')+1])
+                raise h.Error('blocked')
+            return original(*args, **kwargs)
+        with patch.object(h, 'herdr', side_effect=check):
+            with self.assertRaisesRegex(h.Error, 'partially applied'): h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))
+        team = h.load(h.state_file(h.context()))
+        self.assertEqual(team['pending_operation']['operation'], 'agent_start')
+
+    def test_lead_preview_and_apply_with_verified_identity(self):
+        team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
+        def fake(*args, **kwargs):
+            if args[:2] == ('pane','get'):
+                return {'pane': {'pane_id':'w1:p1', 'workspace_id':'w1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
+            if args[:2] == ('agent','get') and args[2] == 'w1:p1':
+                return {'agent': {'name':'old-lead', 'pane_id':'w1:p1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
+            if args[:2] == ('agent','get'):
+                raise h.HerdrError('not found', code='agent_not_found')
+            if args[:2] == ('agent','rename'):
+                self.actions.append(args); return {}
+            raise AssertionError(args)
+        with patch.object(h, 'herdr', side_effect=fake):
+            preview = h.name_lead(ns(apply=False, current=None))
+            self.assertEqual(preview['new'], 'lead-w1p1')
+            self.assertIsInstance(preview['team'], str)
+            self.assertEqual(preview['team'], str(h.state_file(h.context())))
+            self.assertFalse(any(a[:2] == ('agent','rename') for a in self.actions))
+            result = h.name_lead(ns(apply=True, current='old-lead', expect_session=preview['agent_session']['value']))
+            self.assertEqual(result['team'], preview['team'])
+            self.assertIn(('agent','rename','w1:p1','lead-w1p1'), self.actions)
+            with self.assertRaisesRegex(h.Error, 'does not match'): h.name_lead(ns(apply=True, current='wrong', expect_session='original-session'))
+            team['status'] = 'partial'; h.save(h.state_file(h.context()), team)
+            with self.assertRaisesRegex(h.Error, 'not ready'): h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+
+    def test_unnamed_lead_uses_pane_target_and_rejects_collision(self):
+        h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))
+        occupied = False
+        unavailable = False
+        def fake(*args, **kwargs):
+            if args[:2] == ('pane', 'get'):
+                return {'pane': {'pane_id':'w1:p1', 'workspace_id':'w1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
+            if args == ('agent', 'get', 'w1:p1'):
+                if unavailable: raise h.Error('pane lookup unavailable')
+                return {'agent': {'name':None, 'pane_id':'w1:p1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
+            if args == ('agent', 'get', 'lead-w1p1'):
+                if occupied: return {'agent': {'name':'lead-w1p1', 'pane_id':'w1:p9'}}
+                raise h.HerdrError('not found', code='agent_not_found')
+            if args[:2] == ('agent', 'rename'):
+                self.actions.append(args); return {}
+            raise AssertionError(args)
+        with patch.object(h, 'herdr', side_effect=fake):
+            preview = h.name_lead(ns(apply=False, current=None))
+            self.assertIsNone(preview['current'])
+            self.assertEqual(preview['new'], 'lead-w1p1')
+            h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+            self.assertIn(('agent','rename','w1:p1','lead-w1p1'), self.actions)
+            occupied = True
+            with self.assertRaisesRegex(h.Error, 'already occupied'):
+                h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+            unavailable = True
+            with self.assertRaisesRegex(h.Error, 'pane lookup unavailable'):
+                h.name_lead(ns(apply=True, current=None, expect_session='original-session'))
+
+
+class AdoptNamingTests(AdoptTests):
+    def test_legacy_and_workspace_names_adopt_without_rename(self):
+        for names in (('developer-w1','reviewer-w1'), ('htabcdef-1-developer','htabcdef-2-reviewer')):
+            with self.subTest(names=names):
+                self.agents = {name: dict(self.agents[old], name=name) for old, name in zip(self.agents, names)}
+                self.args.role = [f'developer={names[0]}', f'reviewer={names[1]}']
+                self.args.dry_run = True
+                team = self.adopt()['team']
+                self.assertEqual([r['agent_name'] for r in team['roles']], list(names))
+                self.assertTrue(all(c[:2] in (('agent','get'),('pane','get')) for c in self.calls))
+
+    def test_invalid_and_ambiguous_adopt_never_guesses(self):
+        self.args.role = ['developer=Developer', 'reviewer=review']
+        with self.assertRaisesRegex(h.Error, 'Invalid agent name'): self.adopt()
+        self.args.role = []
+        with self.assertRaisesRegex(h.Error, 'missing'): self.adopt()
+        self.assertFalse(self.calls)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

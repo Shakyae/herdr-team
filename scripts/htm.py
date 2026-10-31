@@ -60,6 +60,12 @@ class Error(Exception):
     pass
 
 
+class HerdrError(Error):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
 def assert_keys(obj, allowed, where):
     extra = set(obj) - set(allowed)
     if extra:
@@ -311,7 +317,16 @@ def process(argv, timeout=40, raw=False):
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Error(f"Command unavailable/timed out ({argv[:3]}): {e}") from e
     if r.returncode:
-        raise Error(f"Command failed ({r.returncode}): {' '.join(argv[:3])}: {(r.stderr or r.stdout)[-900:]}")
+        message = f"Command failed ({r.returncode}): {' '.join(argv[:3])}: {(r.stderr or r.stdout)[-900:]}"
+        for output in (r.stderr, r.stdout):
+            try:
+                parsed = json.loads(output)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            err = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(err, dict):
+                raise HerdrError(message, code=err.get("code"))
+        raise Error(message)
     if raw:
         return r.stdout
     try:
@@ -319,7 +334,8 @@ def process(argv, timeout=40, raw=False):
     except json.JSONDecodeError as e:
         raise Error(f"Expected Herdr JSON from {' '.join(argv[:3])}: {r.stdout[-600:]}") from e
     if not isinstance(out, dict) or out.get("status") in ("error", "failed") or out.get("error"):
-        raise Error(f"Herdr error: {str(out)[:900]}")
+        err = out.get("error") if isinstance(out, dict) else None
+        raise HerdrError(f"Herdr error: {str(out)[:900]}", code=err.get("code") if isinstance(err, dict) else None)
     return out.get("result", out)
 
 
@@ -424,6 +440,42 @@ def lookup_agent(name):
         return agent_data(herdr("agent", "get", name))
     except Error:
         return None
+
+
+def agent_name_for(role, pane_id):
+    if not isinstance(pane_id, str) or not PANE_ID_RE.fullmatch(pane_id):
+        raise Error(f"Invalid pane ID for agent name: {pane_id!r}")
+    name = f"{role}-{pane_id.replace(':', '')}".lower()
+    if not NAME_RE.fullmatch(name):
+        raise Error(f"Invalid derived agent name: {name!r}")
+    return name
+
+
+def require_name_available(name, team_path, roles=()):
+    if any(r.get("agent_name") == name for r in roles):
+        raise Error(f"Agent name already registered in this team: {name}")
+    for other_path in (STATE / "teams").glob("*.json"):
+        if other_path == team_path:
+            continue
+        other = load(other_path)
+        if any(r.get("agent_name") == name for r in other.get("roles", [])):
+            raise Error(f"Agent name {name} already registered by team {other_path}")
+    try:
+        found = herdr("agent", "get", name)
+    except Error as e:
+        if isinstance(e, HerdrError) and e.code == "agent_not_found":
+            return
+        raise Error(f"Cannot verify agent name availability for {name}: {e}") from e
+    if found is not None:
+        raise Error(f"Agent name already occupied: {name}")
+    raise Error(f"Cannot verify agent name availability for {name}")
+
+
+def pending_plan(plan):
+    result = copy.deepcopy(plan)
+    for role in result["roles"]:
+        role.update({"agent_name": None, "pending": True})
+    return result
 
 
 def verify_existing(team_role):
@@ -552,7 +604,7 @@ def init(cfg, args):
     if args.dry_run:
         wt = worktree_details(plan, args, False)
         return {"dry_run": True, "no_mutations": True, "cwd": str(cwd), "worktree": wt,
-                "plan": plan, "requires_herdr": True}
+                "plan": pending_plan(plan), "requires_herdr": True}
     ctx = context()
     for role in plan["roles"]:
         if role["kind"] == "hermes":
@@ -574,6 +626,11 @@ def init(cfg, args):
                 if not verify_existing(role):
                     raise Error(f"Registered Agent {role['agent_name']} not live. Do not silently replace; investigate or create a new team.")
             return {"reused": True, "team": old}
+        for role in plan["roles"]:
+            # 保守上界：pane 后缀可能不止一位（如 w1:p10），按两位估算；
+            # 宁可提前拒绝合法边缘长度，也不要建完 pane 才失败。真实 pane id 仍做最终 NAME_RE 校验。
+            if len(role["role"]) > 28 - len(ctx["workspace"]):
+                raise Error(f"role 名过长，无法保证派生出合法 agent 名（上限按两位 pane 后缀保守估算）: {role['role']}")
         # Hermes can share mutable profile/session state across terminals.
         # Detect other HTM-managed teams using the same profile. External
         # Hermes processes remain invisible; owner must inspect them manually.
@@ -587,7 +644,6 @@ def init(cfg, args):
                 raise Error(f"Hermes profile already reserved by another managed team {other_path}; use dedicated test profiles")
         wt = requested_wt
         work_cwd = str(wt["path"]) if wt else str(cwd)
-        digest = hashlib.sha256((ctx["workspace"]+":"+ctx["lead_pane"]).encode()).hexdigest()[:6]
         roles = []
         team = {"version": 3, "template": args.template, "context": ctx, "created_at": now(),
                 "status": "partial", "roles": roles, "plan": plan, "cwd": str(cwd), "worktree": wt,
@@ -619,10 +675,14 @@ def init(cfg, args):
                             lambda: herdr("pane", "split", pane_ids[src], "--direction", direction, "--cwd", work_cwd, "--no-focus"))
                 pane_ids[target] = r["pane"]["pane_id"]
             for idx, role in enumerate(plan["roles"]):
-                name = f"ht{digest}-{idx+1}-{role['role'][:9]}"
-                name = name[:32]
+                try:
+                    name = agent_name_for(role["role"], pane_ids[idx])
+                    require_name_available(name, path, roles)
+                except Error as e:
+                    raise Error(f"Pane {pane_ids[idx]} already created; agent not named or started: {e}") from e
                 info = {**role, "pane_id": pane_ids[idx], "agent_name": name, "cwd": work_cwd}
                 roles.append(info)
+                # Persist the pane/name binding before attempting agent start.
                 save(path, team)
                 detail = {"name": name, "pane": pane_ids[idx], "kind": role["kind"]}
                 def start():
@@ -660,6 +720,8 @@ def adopt(cfg, args):
         role, name = spec.split("=", 1)
         if role not in expected_roles:
             raise Error(f"Unknown role {role}")
+        if not NAME_RE.fullmatch(name):
+            raise Error(f"Invalid agent name: {name!r}")
         if role in assignments or not name:
             raise Error(f"Duplicate role or empty agent name: {role}")
         if name in assignments.values():
@@ -764,6 +826,68 @@ def current_team():
     if not path.exists():
         raise Error("No registered team for this Lead pane; use init first")
     return load(path)
+
+
+def name_lead(args):
+    expected = getattr(args, "expect_session", None)
+    if args.apply and (not isinstance(expected, str) or not expected.strip()):
+        raise Error("先跑一次预览，把输出里的 agent_session.value 传回 --expect-session")
+    ctx = context()
+    path = state_file(ctx)
+    team = load(path) if path.exists() else None
+    if team is not None and (team.get("context") != ctx or team.get("status") != "ready"):
+        raise Error("Team context mismatch or team is not ready")
+    pane_id = ctx["lead_pane"]
+    name = agent_name_for("lead", pane_id)
+    pane_result = herdr("pane", "get", pane_id)
+    pane = pane_result.get("pane") if isinstance(pane_result, dict) else None
+    if not isinstance(pane, dict) or pane.get("pane_id") != pane_id or pane.get("workspace_id") != ctx["workspace"] or not pane.get("agent"):
+        raise Error("Lead pane has no verifiable agent")
+    found = agent_data(herdr("agent", "get", pane_id))
+    if not isinstance(found, dict) or found.get("pane_id") != pane_id:
+        raise Error("Lead agent identity or pane cannot be verified")
+    kind = agent_kind_of(pane)
+    pane_session = pane.get("agent_session")
+    session = found.get("agent_session")
+    value = session.get("value") if isinstance(session, dict) else None
+    if (not kind or kind != agent_kind_of(found) or not isinstance(pane_session, dict) or
+            not isinstance(value, str) or not value.strip() or len(value) < 8 or
+            pane_session.get("value") != value):
+        raise Error("Lead agent session identity or kind cannot be verified")
+    if expected is not None and expected != value:
+        raise Error("Expected session does not match lead pane")
+    current = found.get("name")
+    if current is not None and (not isinstance(current, str) or not NAME_RE.fullmatch(current)):
+        raise Error("Lead agent name is invalid")
+    if args.current and args.current != current:
+        raise Error("Specified current agent does not match lead pane")
+    if current == name:
+        raise Error("Lead agent already has the derived name")
+    require_name_available(name, path, team.get("roles", []) if team is not None else ())
+    if args.apply:
+        def same_identity():
+            actual = agent_data(herdr("agent", "get", pane_id))
+            actual_session = actual.get("agent_session") if isinstance(actual, dict) else None
+            return (isinstance(actual, dict) and actual.get("pane_id") == pane_id and
+                    agent_kind_of(actual) == kind and isinstance(actual_session, dict) and
+                    actual_session.get("value") == value)
+        with locked():
+            latest = load(path) if path.exists() else None
+            if ((latest is None) != (team is None) or
+                    (latest is not None and (latest.get("context") != ctx or latest.get("status") != "ready"))):
+                raise Error("Team context mismatch or team is not ready")
+            if not same_identity():
+                raise Error("Lead agent identity changed before rename")
+            herdr("agent", "rename", pane_id, name)
+            try:
+                verified_after = same_identity()
+            except Error as e:
+                raise Error("rename 后身份无法核验，需人工核对") from e
+            if not verified_after:
+                raise Error("rename 后身份已变化，需人工核对")
+    return {"dry_run": not args.apply, "current": current, "new": name, "pane_id": pane_id,
+            "team": str(path) if team is not None else None,
+            "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
 
 
 def require_run(runid):
@@ -1201,6 +1325,8 @@ def main():
     adoptp.add_argument("template"); adoptp.add_argument("--role", action="append", default=[])
     adoptp.add_argument("--set", action="append", default=[]); adoptp.add_argument("--cwd")
     adoptp.add_argument("--dry-run", action="store_true")
+    leadp = sp.add_parser("name-lead")
+    leadp.add_argument("--current"); leadp.add_argument("--expect-session", help="required for --apply: agent_session.value from preview"); leadp.add_argument("--apply", action="store_true", help="rename using the previewed --expect-session")
     sp.add_parser("status")
     runp = sp.add_parser("run")
     rsp = runp.add_subparsers(dest="run_cmd", required=True)
@@ -1232,9 +1358,10 @@ def main():
             emit({k: {"roles": list(template(cfg,k)["roles"]), "workflow": template(cfg,k)["workflow"]}
                   for k in cfg["templates"]}); return 0
         if args.cmd == "plan":
-            emit(initial_plan(cfg, args.template, args)); return 0
+            emit(pending_plan(initial_plan(cfg, args.template, args))); return 0
         if args.cmd == "init": emit(init(cfg, args)); return 0
         if args.cmd == "adopt": emit(adopt(cfg, args)); return 0
+        if args.cmd == "name-lead": emit(name_lead(args)); return 0
         if args.cmd == "status":
             team = current_team()
             live = []

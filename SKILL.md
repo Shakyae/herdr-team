@@ -37,6 +37,8 @@ python3 /path/to/herdr-team/scripts/htm.py run gate --run-id <RUN_ID> --decision
 python3 /path/to/herdr-team/scripts/htm.py run finish --run-id <RUN_ID>
 ```
 
+- 新建 Worker 使用真实 Pane ID 派生名称；`name-lead` 默认预览（无 team 亦可），只有显式 `--apply` 才重命名当前 Lead Agent；用 `--expect-session <预览的 session value>` 核对跨命令身份，不会自动重命名已有 Agent。
+- `name-lead` 要求 Lead 的 Agent 具备可验证的稳定 session 身份（`agent_session.value`），`--apply` 必须传入预览输出的 `--expect-session`。经 Happier 包装启动的 Claude Code 目前不上报 `agent_session`，因此该环境下 `name-lead` 会拒绝执行——这是环境限制，不是功能缺陷；不要用伪造身份或跳过校验的方式绕过。
 - `run gate --decision revise`：Worker 反馈不通过，进入新一轮，必要时先派 Developer `--remediation`，然后重新让 Reviewer/Tester 检查。
 - `run collect`：**只**根据任务专属 JSON + 已知 Agent 状态完成结算，终端快照不算证据。
 - `run pause/resume`：管理已保存的执行状态；不会自动启动或杀死 Worker。
