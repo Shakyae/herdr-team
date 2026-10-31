@@ -93,6 +93,160 @@ class PublicIdContextTests(unittest.TestCase):
             self.assertEqual(h.context(require=False), {'workspace': 'invalid', 'lead_tab': '', 'lead_pane': ''})
 
 
+class AdoptTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = Path(self.tmp.name).resolve() / 'checkout'
+        self.cwd.mkdir()
+        self.state = patch.object(h, 'STATE', Path(self.tmp.name) / 'state')
+        self.state.start(); self.addCleanup(self.state.stop)
+        env = patch.dict(os.environ, {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1',
+                                    'HERDR_PANE_ID': 'w1:p1', 'HERDR_TAB_ID': 'w1:t1'})
+        env.start(); self.addCleanup(env.stop)
+        self.cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+        self.agents = {name: {'name': name, 'agent': 'claude', 'agent_status': 'idle',
+                              'pane_id': f'w1:p{i}', 'cwd': str(self.cwd),
+                              'agent_session': {'kind': 'id', 'source': 'herdr:claude', 'value': f'session-{i}'}}
+                       for i, name in enumerate(('dev', 'review'), 2)}
+        self.calls = []
+        def fake(*args, **kw):
+            self.calls.append(args)
+            if args[:2] == ('agent', 'get'):
+                if args[2] not in self.agents:
+                    raise h.Error('not found')
+                return {'agent': copy.deepcopy(self.agents[args[2]])}
+            if args[:2] == ('pane', 'get'):
+                return {'pane': {'workspace_id': 'w1'}}
+            raise AssertionError(f'unexpected Herdr call: {args}')
+        mock = patch.object(h, 'herdr', side_effect=fake)
+        mock.start(); self.addCleanup(mock.stop)
+        self.args = ns(template='dev-lite', role=['developer=dev', 'reviewer=review'],
+                       set=[], cwd=str(self.cwd), dry_run=False)
+
+    def adopt(self):
+        return h.adopt(self.cfg, self.args)
+
+    def test_success(self):
+        result = self.adopt(); team = result['team']
+        self.assertTrue(result['adopted']); self.assertEqual(team['status'], 'ready')
+        self.assertEqual(team['resources'], [])
+        for role, name in zip(team['roles'], ('dev', 'review')):
+            self.assertTrue(role['adopted']); self.assertEqual(role['agent_name'], name)
+            self.assertEqual(role['pane_id'], self.agents[name]['pane_id'])
+            self.assertEqual(role['cwd'], str(self.cwd))
+            self.assertEqual(role['agent_session'], self.agents[name]['agent_session'])
+        self.assertTrue(all(c[:2] in (('agent', 'get'), ('pane', 'get')) for c in self.calls))
+
+    def test_repeat_preserves_team(self):
+        import hashlib
+        self.adopt(); path = h.state_file(h.context())
+        before = hashlib.sha256(path.read_bytes()).digest()
+        with self.assertRaisesRegex(h.Error, 'already registered'): self.adopt()
+        self.assertEqual(before, hashlib.sha256(path.read_bytes()).digest())
+
+    def test_partial_roles(self):
+        self.args.role = ['developer=dev']
+        with self.assertRaisesRegex(h.Error, 'missing'): self.adopt()
+
+    def test_unknown_role(self):
+        self.args.role.append('tester=x')
+        with self.assertRaisesRegex(h.Error, 'Unknown role'): self.adopt()
+
+    def test_missing_agent(self):
+        del self.agents['dev']
+        with self.assertRaisesRegex(h.Error, 'not live'): self.adopt()
+
+    def test_kind_mismatch_or_missing(self):
+        for kind in ('codex', None):
+            with self.subTest(kind=kind):
+                self.agents['dev']['agent'] = kind
+                with self.assertRaisesRegex(h.Error, 'kind'): self.adopt()
+
+    def test_unsafe_status(self):
+        for status in ('working', 'blocked', 'unknown'):
+            with self.subTest(status=status):
+                self.agents['dev']['agent_status'] = status
+                with self.assertRaisesRegex(h.Error, f'is {status}'): self.adopt()
+
+    def test_cross_workspace(self):
+        self.agents['dev']['pane_id'] = 'w2:p2'
+        with self.assertRaisesRegex(h.Error, 'different workspace'): self.adopt()
+
+    def test_adopt_rejects_lead_pane(self):
+        self.agents['dev']['pane_id'] = 'w1:p1'
+        with self.assertRaisesRegex(h.Error, 'Lead pane'): self.adopt()
+        self.assertNotIn(('pane', 'get', 'w1:p1'), self.calls)
+
+    def test_cwd_mismatch(self):
+        other = Path(self.tmp.name) / 'other'; other.mkdir()
+        self.agents['review']['cwd'] = str(other)
+        with self.assertRaisesRegex(h.Error, 'cwd mismatch'): self.adopt()
+
+    def test_session_missing(self):
+        for session in (None, {'kind': 'id', 'source': 'herdr:claude', 'value': ''}):
+            with self.subTest(session=session):
+                self.agents['dev']['agent_session'] = session
+                with self.assertRaisesRegex(h.Error, 'no stable session identity'): self.adopt()
+
+    def test_unfinished_run(self):
+        # Run metadata matches the adopted workspace.
+        h.save(h.STATE / 'runs' / 'abc.json', {'id': 'run123', 'status': 'active',
+               'context': {'workspace': 'w1'}, 'roles': [{'pane_id': 'w1:p2'}]})
+        with self.assertRaisesRegex(h.Error, 'run123'): self.adopt()
+
+    def test_unfinished_run_cross_workspace_metadata(self):
+        h.save(h.STATE / 'runs' / 'abc.json', {'id': 'runCROSS', 'status': 'active',
+               'context': {'workspace': 'wB'}, 'roles': [{'pane_id': 'w1:p2'}]})
+        with self.assertRaisesRegex(h.Error, 'runCROSS'): self.adopt()
+
+    def test_unfinished_run_finished_ignored(self):
+        h.save(h.STATE / 'runs' / 'abc.json', {'id': 'run123', 'status': 'finished',
+               'roles': [{'pane_id': 'w1:p2'}]})
+        self.assertTrue(self.adopt()['adopted'])
+
+    def test_unfinished_run_cancelled_ignored(self):
+        h.save(h.STATE / 'runs' / 'abc.json', {'id': 'run123', 'status': 'cancelled',
+               'roles': [{'pane_id': 'w1:p2'}]})
+        self.assertTrue(self.adopt()['adopted'])
+
+    def test_other_team(self):
+        path = h.STATE / 'teams' / 'other.json'
+        h.save(path, {'roles': [{'pane_id': 'w1:p2'}]})
+        with self.assertRaises(h.Error) as caught: self.adopt()
+        self.assertIn(str(path), str(caught.exception))
+
+    def test_session_race(self):
+        original = h.herdr
+        count = 0
+        def racing(*args, **kwargs):
+            nonlocal count
+            result = original(*args, **kwargs)
+            if args[:3] == ('agent', 'get', 'dev'):
+                count += 1
+                if count == 2: result['agent']['agent_session']['value'] = 'changed-session'
+            return result
+        with patch.object(h, 'herdr', side_effect=racing):
+            with self.assertRaisesRegex(h.Error, 'changed during adopt'): self.adopt()
+        self.assertFalse(h.state_file(h.context()).exists())
+
+    def test_dry_run(self):
+        self.args.dry_run = True
+        result = self.adopt()
+        self.assertTrue(result['dry_run']); self.assertTrue(result['no_mutations'])
+        self.assertEqual(len(result['team']['roles']), 2)
+        self.assertFalse(h.STATE.exists())
+
+    def test_verify_session_drift_and_legacy(self):
+        role = {'agent_name': 'dev', 'pane_id': 'w1:p2', 'kind': 'claude', 'cwd': str(self.cwd),
+                'agent_session': copy.deepcopy(self.agents['dev']['agent_session'])}
+        self.assertTrue(h.verify_existing(role))
+        self.agents['dev']['agent_session']['value'] = 'changed-session'
+        with self.assertRaisesRegex(h.Error, 'session identity changed'): h.verify_existing(role)
+        del role['agent_session']
+        self.assertTrue(h.verify_existing(role))
+
+
 class AdversarialTests(unittest.TestCase):
     def setUp(self):
         test_htm.RuntimeTests.setUp(self)

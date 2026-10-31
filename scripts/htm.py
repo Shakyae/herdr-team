@@ -441,6 +441,12 @@ def verify_existing(team_role):
         raise Error(f"Agent {team_role['agent_name']} has no verifiable kind")
     if kind != team_role["kind"]:
         raise Error(f"Agent {team_role['agent_name']} has unexpected kind {kind}")
+    if "agent_session" in team_role:
+        expected = team_role["agent_session"].get("value")
+        session = found.get("agent_session")
+        actual = session.get("value") if isinstance(session, dict) else None
+        if actual != expected:
+            raise Error(f"Agent {team_role['agent_name']} session identity changed (expected {expected}, got {actual}); refusing reuse")
     if found.get("name") and found["name"] != team_role["agent_name"]:
         raise Error("Agent name mismatch")
     if found.get("cwd") and str(Path(found["cwd"]).resolve()) != team_role.get("cwd"):
@@ -635,6 +641,121 @@ def init(cfg, args):
             save(path, team)
             raise Error(f"Initialization partially applied; inspect state {path} and Herdr panes: {e}") from e
         return {"reused": False, "team": team}
+
+
+def adopt(cfg, args):
+    ctx = context()
+    path = state_file(ctx)
+    def check_fresh():
+        if path.exists() or path.is_symlink():
+            raise Error(f"A team is already registered for this Lead pane ({path}); adopt only registers a fresh team. Use a different Lead pane.")
+    check_fresh()
+    opts = argparse.Namespace(set=args.set, layout=None, arrange=None, worktree=None)
+    plan = initial_plan(cfg, args.template, opts)
+    assignments = {}
+    expected_roles = {r["role"] for r in plan["roles"]}
+    for spec in args.role:
+        if "=" not in spec:
+            raise Error(f"Role must be role=agent-name: {spec}")
+        role, name = spec.split("=", 1)
+        if role not in expected_roles:
+            raise Error(f"Unknown role {role}")
+        if role in assignments or not name:
+            raise Error(f"Duplicate role or empty agent name: {role}")
+        if name in assignments.values():
+            raise Error(f"Agent {name} assigned to multiple roles")
+        assignments[role] = name
+    if set(assignments) != expected_roles:
+        raise Error(f"All template roles are required; missing: {', '.join(sorted(expected_roles - set(assignments)))}")
+
+    def check_reservations(roles):
+        adopted_panes = {x["pane_id"] for x in roles}
+        for run_path in (STATE / "runs").glob("*.json"):
+            run = load(run_path)
+            if run.get("status") in ("finished", "cancelled"):
+                continue
+            # pane_id carries its workspace prefix and is globally unique; do not gate
+            # this check on run.context.workspace, which can be stale or inconsistent.
+            if adopted_panes & {r.get("pane_id") for r in run.get("roles", []) if r.get("pane_id")}:
+                raise Error(f"Worker reserved by unfinished Run {run.get('id')}")
+        for other_path in (STATE / "teams").glob("*.json"):
+            if other_path == path:
+                continue
+            other = load(other_path)
+            for existing in other.get("roles", []):
+                if any(existing.get("pane_id") == r["pane_id"] or existing.get("agent_name") == r["agent_name"] for r in roles):
+                    raise Error(f"Worker already registered by team {other_path}")
+                if other.get("status") in ("ready", "partial") and any(
+                        r["kind"] == "hermes" and existing.get("kind") == "hermes" and
+                        existing.get("profile") == r["profile"] for r in roles):
+                    raise Error(f"Hermes profile already reserved by another managed team {other_path}; use dedicated test profiles")
+
+    roles = []
+    requested_cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else None
+    for role in plan["roles"]:
+        name = assignments[role["role"]]
+        found = lookup_agent(name)
+        if not isinstance(found, dict) or not found:
+            raise Error(f"Agent {name} is not live; cannot adopt")
+        kind = agent_kind_of(found)
+        if not kind:
+            raise Error(f"Agent {name} has no verifiable kind")
+        if kind != role["kind"]:
+            raise Error(f"Agent {name} has unexpected kind {kind}")
+        status = agent_status_of(found)
+        if status not in ("idle", "done"):
+            raise Error(f"Agent {name} is {status}; adopt requires idle or done")
+        pane = found.get("pane")
+        pane_id = found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)
+        if not isinstance(pane_id, str) or not PANE_ID_RE.fullmatch(pane_id):
+            raise Error(f"Agent {name} has no valid pane ID")
+        if pane_id == ctx["lead_pane"]:
+            raise Error(f"Agent {name} occupies the Lead pane {pane_id}; adopt requires a separate worker pane")
+        if pane_id.split(":")[0] != ctx["workspace"]:
+            raise Error(f"Agent {name} pane belongs to a different workspace")
+        if any(r["pane_id"] == pane_id for r in roles):
+            raise Error(f"Pane {pane_id} assigned to multiple roles")
+        result = herdr("pane", "get", pane_id)
+        actual_pane = result.get("pane") if isinstance(result, dict) else None
+        if not isinstance(actual_pane, dict) or actual_pane.get("workspace_id") != ctx["workspace"]:
+            raise Error(f"Pane {pane_id} is missing or belongs to a different workspace")
+        raw_cwd = found.get("cwd")
+        if not isinstance(raw_cwd, str) or not raw_cwd or not Path(raw_cwd).is_dir():
+            raise Error(f"Agent {name} has no valid cwd directory")
+        cwd = str(Path(raw_cwd).resolve())
+        if (requested_cwd and cwd != requested_cwd) or (roles and cwd != roles[0]["cwd"]):
+            raise Error(f"Agent {name} cwd mismatch")
+        session = found.get("agent_session")
+        if (not isinstance(session, dict) or
+                any(not isinstance(session.get(k), str) or not session[k].strip() for k in ("kind", "source", "value")) or
+                len(session["value"]) < 8):
+            raise Error(f"Agent {name} has no stable session identity; cannot adopt")
+        info = {**role, "pane_id": pane_id, "agent_name": name, "cwd": cwd, "adopted": True,
+                "agent_session": {k: session[k] for k in ("kind", "source", "value")}}
+        check_reservations([info])
+        if kind == "hermes":
+            if found.get("profile") and found["profile"] != role["profile"]:
+                raise Error("Hermes profile mismatch")
+            profile_check(role["profile"])
+        roles.append(info)
+    team = {"version": 3, "template": args.template, "context": ctx, "created_at": now(),
+            "status": "ready", "roles": roles, "plan": plan, "cwd": roles[0]["cwd"],
+            "worktree": None, "resources": [], "pending_operation": None, "adopted": True}
+    if args.dry_run:
+        return {"dry_run": True, "no_mutations": True, "team": team}
+    with locked():
+        check_fresh()
+        check_reservations(roles)
+        for role in roles:
+            found = lookup_agent(role["agent_name"])
+            pane = found.get("pane") if isinstance(found, dict) else None
+            pane_id = (found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)) if isinstance(found, dict) else None
+            session = found.get("agent_session") if isinstance(found, dict) else None
+            if (pane_id != role["pane_id"] or agent_kind_of(found) != role["kind"] or
+                    not isinstance(session, dict) or session.get("value") != role["agent_session"]["value"]):
+                raise Error(f"Agent {role['agent_name']} changed during adopt; refusing registration")
+        save(path, team)
+    return {"adopted": True, "team": team}
 
 
 def current_team():
@@ -1076,6 +1197,10 @@ def main():
     initp.add_argument("--layout", choices=("side", "tab")); initp.add_argument("--arrange", choices=("auto", "rows", "cols", "grid"))
     initp.add_argument("--worktree", choices=("on", "off", "auto")); initp.add_argument("--cwd")
     initp.add_argument("--repo"); initp.add_argument("--task"); initp.add_argument("--dry-run", action="store_true")
+    adoptp = sp.add_parser("adopt")
+    adoptp.add_argument("template"); adoptp.add_argument("--role", action="append", default=[])
+    adoptp.add_argument("--set", action="append", default=[]); adoptp.add_argument("--cwd")
+    adoptp.add_argument("--dry-run", action="store_true")
     sp.add_parser("status")
     runp = sp.add_parser("run")
     rsp = runp.add_subparsers(dest="run_cmd", required=True)
@@ -1109,6 +1234,7 @@ def main():
         if args.cmd == "plan":
             emit(initial_plan(cfg, args.template, args)); return 0
         if args.cmd == "init": emit(init(cfg, args)); return 0
+        if args.cmd == "adopt": emit(adopt(cfg, args)); return 0
         if args.cmd == "status":
             team = current_team()
             live = []
