@@ -1,6 +1,6 @@
-# Herdr Team Manager v4.2.0-beta.1
+# Herdr Team Manager v4.2.0-beta.2
 
-[MIT License](LICENSE) · **Beta / Pre-release，未经真实 Herdr 全流程验收，不适用于生产无人值守运行。**
+[MIT License](LICENSE) · **Beta / Pre-release，已完成真实 Herdr 端到端联调（P1 自动返工、P2 崩溃恢复），仍不适用于生产无人值守运行。**
 
 **本次目标：修复 v4.1 独立审计中的派单、结果回收、配置复用、并行互斥、异常恢复及安装问题。** 保留 `/herdr-team` Skill、七模板、YAML/JSON 配置和 Herdr TUI。**本版本不提供真正自主运行的后台 Lead，也不具有系统级沙盒/Owner 身份认证。**
 
@@ -8,8 +8,8 @@
 
 - **适合：** 隔离 Mock 测试、无敏感数据的 Herdr CLI 联调、独立测试 Git 仓库中的有限试运行。
 - **不适合：** 在未经沙盒隔离的情况下运行 私人原始数据/生产仓库或高危自动化；不适合无人值守地保证 Lead 永不提前退出。
-- **已完成：** 以 Run/Dispatch ID 绑定的 Worker JSON 工件、未知/旧输出不能结算、跨 Run Worker 互斥、完整配置复用校验、关键测试 Gate、只读恢复视图、取消操作、Hermes 参数收紧、Worktree dirty 预检、隔离升级回滚。
-- **仍未实现：** 独立的后台模型监督循环、真实 Owner 审批服务、OS 沙盒强制隔离、真实 Herdr/Hermes 目标环境的端到端验收。配置中的 `escalate/report` 主要是 Lead 汇报指导，并非独立消息通知。
+- **已完成：** 以 Run/Dispatch ID 绑定的 Worker JSON 工件、未知/旧输出不能结算、跨 Run Worker 互斥、完整配置复用校验、关键测试 Gate、只读恢复视图、取消操作、Hermes 参数收紧、Worktree dirty 预检、隔离升级回滚；真实 Herdr 端到端联调（Reviewer 负面判定→自动 revise→remediation→复审闭环；SIGKILL 杀 driver 后 `--resume` 恢复）。
+- **仍未实现：** 独立的后台模型监督循环、真实 Owner 审批服务、OS 沙盒强制隔离、Hermes 目标环境的端到端验收。配置中的 `escalate/report` 主要是 Lead 汇报指导，并非独立消息通知。真实联调的边界（本次 SIGKILL 只针对 driver、未杀 Worker；未验证外部 exactly-once）见 `CHANGELOG.md` 与 `docs/trial-guide.md`。
 
 ## 功能与核心架构
 
@@ -30,6 +30,7 @@ herdr-team/
   references/operations.md      运行与恢复协议
   references/templates.md       模板说明
   references/worktrees.md      Git Worktree 约束
+  docs/trial-guide.md          真实任务试用说明（能力、限制、建议）；docs/integration-test-plan.md 为内部联调记录，install-local.sh 不复制它，但 Skills CLI 在线安装会包含它，其中含开发者本机路径，请勿外传
   tests/test_htm.py             原 18 项更新后的回归
   tests/test_regressions_v42.py 新增攻击/故障反例测试
 install-local.sh                离线新装、事务升级、回滚
@@ -56,7 +57,20 @@ pyproject.toml / uv.lock         Python 版本及可选 YAML 依赖
 npx skills add herdrdev/herdr --skill herdr -g
 ```
 
-正式安装到 Claude Code 和 Codex：
+**推荐固定本次试用版 `v4.2.0-beta.2`**（不跟随 main），可直接复制执行：
+
+```bash
+npx skills add https://github.com/Shakyae/herdr-team/tree/v4.2.0-beta.2 \
+  --skill herdr-team \
+  -g -a claude-code -a codex -y
+bash ~/.agents/skills/herdr-team/scripts/bootstrap-config.sh
+```
+
+`v4.2.0-beta.2` 是当前推荐的公开试用版。跟随 `main` 会拿到尚未发布验收的改动，不建议在试用中使用。
+
+共享目录预期为 `~/.agents/skills/herdr-team/`。Skills CLI 根据 Agent 约定建立链接；Codex 可以直接使用共享目录，不要求额外出现 `~/.codex/skills/herdr-team` 链接。安装输出和实际文件应同时核对。
+
+仅供开发者跟踪 `main`（不是试用推荐）：
 
 ```bash
 npx skills add Shakyae/herdr-team \
@@ -65,16 +79,12 @@ npx skills add Shakyae/herdr-team \
 bash ~/.agents/skills/herdr-team/scripts/bootstrap-config.sh
 ```
 
-共享目录预期为 `~/.agents/skills/herdr-team/`。Skills CLI 根据 Agent 约定建立链接；Codex 可以直接使用共享目录，不要求额外出现 `~/.codex/skills/herdr-team` 链接。安装输出和实际文件应同时核对。
-
-如要固定本次 Beta，而不是跟随 main，可将来源换成 `https://github.com/Shakyae/herdr-team/tree/v4.2.0-beta.1`。
-
 ### 本地源码安装
 
 ```bash
 git clone https://github.com/Shakyae/herdr-team.git
 cd herdr-team
-git checkout v4.2.0-beta.1
+git checkout v4.2.0-beta.2
 uv sync --extra yaml
 npx skills add . --skill herdr-team -g -a claude-code -a codex -y
 bash ~/.agents/skills/herdr-team/scripts/bootstrap-config.sh
@@ -106,7 +116,16 @@ bash install-local.sh --rollback /实际输出的/backup-xxxxxxxx
 - 不覆盖已有的 `~/.config/herdr-team/team.yaml`，也不替换已存在的其他 Agent Skill 路径。
 - 如果旧版本是 Skills CLI 安装的，**不建议混用两种升级器**。先确认它使用的 canonical 实际路径及软链接后再决定操作；升级脚本默认只管理它识别的 `~/.agents/skills/herdr-team/` 目录。
 - 旧 `/team` Skill 保持不动；必要时用户自行停用。**不要删除官方 `herdr` Skill。**
-- Skills CLI 安装可用 `npx skills update herdr-team -g -y` 更新；固定 Beta 的用户应显式选择下一个 tag。源码安装用 `git fetch --tags` 后 checkout 新 tag，再运行原安装方式，不要覆盖在途 Run。
+- Skills CLI 安装需升级到本试用版时，显式指定 tag 重新安装（不要依赖 `npx skills update` 跟随 main）：
+
+```bash
+npx skills add https://github.com/Shakyae/herdr-team/tree/v4.2.0-beta.2 \
+  --skill herdr-team \
+  -g -a claude-code -a codex -y
+bash ~/.agents/skills/herdr-team/scripts/bootstrap-config.sh
+```
+
+- 源码安装升级：`git fetch --tags` 后 checkout 新 tag，再运行原安装方式，不要覆盖在途 Run。
 - 维护者后续发布：先更新 README / CHANGELOG / Python 版本并完成测试与安全扫描，再正常提交推送；用新 tag 和 `gh release create <tag> --prerelease` 发布下一 Beta。只有完成真实 Herdr 验收后才考虑 Stable，禁止移动已发布 tag 或强推。
 
 ## 验证与使用
@@ -199,7 +218,7 @@ uv run --extra yaml python scripts/htm.py --config /path/to/team.yaml plan custo
 
 ## 质量验收边界
 
-随包 Mock/隔离测试用于证明状态机规则、结果绑定、Git Worktree 与升级回滚脚本的局部性质。**未连接真实 Herdr/Hermes，不等于多 Agent 在真机可持续自主交付**。在真实开发任务上线之前，还需人工完成：Herdr CLI 兼容、真实 Worker 产出 JSON、一次故意 Reviewer 驳回和返工、网络断线恢复、Hermes Profile 专用环境隔离以及外部权限沙盒测试。
+随包 Mock/隔离测试用于证明状态机规则、结果绑定、Git Worktree 与升级回滚脚本的局部性质。真实 Herdr + 真实 Claude Code Worker 的端到端联调已完成两项：一次真实的 Reviewer 驳回 → 自动 revise → remediation → 复审闭环，以及一次 driver 被 SIGKILL 后的 `--resume` 恢复（详见 `CHANGELOG.md` 的 v4.2.0-beta.2）。**这不等于多 Agent 在真机可持续自主交付**。仍未验证：Hermes 目标环境的端到端、网络断线恢复、Hermes Profile 专用环境隔离、外部权限沙盒、外部 exactly-once 投递。
 
 ## License 与贡献
 

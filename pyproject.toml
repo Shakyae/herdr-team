@@ -1,6 +1,6 @@
 [project]
 name = "herdr-team"
-version = "4.2.0b1"
+version = "4.2.0b2"
 description = "A supervised Herdr multi-agent collaboration skill for CLI agents"
 readme = "README.md"
 requires-python = ">=3.9"

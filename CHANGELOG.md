@@ -1,5 +1,37 @@
 # Changelog
 
+## v4.2.0-beta.2 (2026-11-01) — Real Herdr end-to-end acceptance
+
+This pre-release records the first real Herdr end-to-end acceptance runs. It remains a pre-release: Hermes, OS sandbox isolation and exactly-once delivery are still unverified, and it is not suitable for unattended production use.
+
+### Real Herdr end-to-end runs
+
+Two independent Runs were executed in an isolated workspace `wF` with a real Herdr instance and real Claude Code Workers; both finished.
+
+**P1 (Run `99f5b2f7d020`, finished) — automatic remediation loop**
+
+- Real byte injection: `beta: 2` → `beta: 3`; OUT.md sha `c42d28f9…` → `e00c1be7…`.
+- A real Reviewer returned `needs-work` with a self-contained diff.
+- The driver issued `gate revise` automatically; the event cluster (`driver_started` → `gate` → `driver_stopped`) completed in 1.21 ms, with matching `drive-*.stdout.steps` records.
+- A `remediation=true` dispatch was sent to the developer automatically.
+- After the fix the Run returned to the oracle; the second review dispatch under the reviewer role re-verified the fix and returned `pass`. (The ledger records the reviewer role's agent and session once; the two dispatch records do not each carry their own agent field, so "the same agent instance" is a reasonable inference, not proven per-dispatch.)
+- Lead accept + `run finish` → finished.
+
+**P2 (Run `3db2cf1cc33d`, finished) — crash recovery**
+
+- The kill point was hit: SIGKILL delivered to pid 52866, confirmed by `returncode=-9`.
+- Without `--resume` the driver was refused with `resume_required`, and the ledger was byte-identical before and after (sha `e32fd557…`).
+- The first `--resume` step was a `collect` on the **same** dispatch; no new dispatch was created.
+- Final accept + finish → finished.
+
+### Boundaries
+
+- SIGKILL terminated the driver only, **not** the Claude worker. The artifact mtime is 80.5 seconds after the kill point: the worker kept working after the driver died and wrote its report. What was verified is that recovery collects the real artifact, **not** that work completed before the crash was preserved.
+- Not verified: external exactly-once delivery, OS sandbox isolation, atomicity at arbitrary crash points.
+- The first `--resume` collect found the worker still `working`, returned `uncertain` and exited `stuck_unsettled`. This is fail-closed design, not a failure.
+
+Nothing in this section changes functional code or runtime behaviour; it only records real end-to-end acceptance conclusions.
+
 ## v4.2.0-beta.1 (2026-10-30) — First public Beta
 
 This pre-release packages the existing v4.2 reliability work. It is not Stable: real Herdr/Hermes end-to-end acceptance has not been completed.

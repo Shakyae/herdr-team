@@ -5,7 +5,7 @@ argument-hint: "init <template> [--dry-run] | run -- <goal> | status | templates
 disable-model-invocation: true
 ---
 
-# Herdr Team Manager v4.2.0-beta.1 — Lead 操作协议
+# Herdr Team Manager v4.2.0-beta.2 — Lead 操作协议
 
 > 适用 **Herdr TUI（`herdr`）**，Lead 当前优先 Claude Code。请先阅读本 Skill 的 `references/operations.md` 及已安装的 Herdr 官方 Skill。`$ARGUMENTS` 是用户原始指令。**Skill 不是一个独立运行的后台 Supervisor，也不构成操作系统安全沙盒。**
 
@@ -80,4 +80,4 @@ python3 /path/to/herdr-team/scripts/htm.py run finish --run-id <RUN_ID>
 - v4.1 的 Team/Run 持久化状态不自动迁移到 v4.2。升级前先清点未完成 Run；切勿在尚有在途派单时简单复用旧 Pane。
 - 不引入 DSH、Compound、Recall 或 AGENTS.md 自动工程记忆。
 
-真实环境仍未联调；先在专用无敏感数据 Workspace 做 dry-run、Mock 通过后的真机验证。具体见 `references/operations.md`。
+真实 Herdr 端到端联调已完成两项：Reviewer 负面判定→自动 revise→remediation→复审闭环，以及 SIGKILL 杀 driver 后用 `--resume` 收回到真实产物；Hermes 模板、OS 沙盒与 exactly-once 仍未验收，边界见 `CHANGELOG.md`。先在专用无敏感数据 Workspace 做 dry-run，再用真实任务试跑。具体见 `references/operations.md`。

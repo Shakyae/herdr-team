@@ -76,6 +76,9 @@ rollback_failure() {
 }
 trap rollback_failure ERR
 cp -R -- "$source/SKILL.md" "$source/README.md" "$source/CHANGELOG.md" "$source/LICENSE" "$source/pyproject.toml" "$source/uv.lock" "$source/config" "$source/references" "$source/scripts" "$source/tests" "$stage/"
+# 只装面向用户的试用指南；docs/ 下的内部联调方案含本机绝对路径，不随包安装。
+mkdir -p "$stage/docs"
+cp -R -- "$source/docs/trial-guide.md" "$stage/docs/"
 python3 "$stage/scripts/htm.py" validate >/dev/null
 if [[ "$mode" == "--upgrade" ]]; then
   backup="$backup_root/backup-$(date -u +%Y%m%dT%H%M%SZ)-$$"
