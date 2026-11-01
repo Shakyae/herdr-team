@@ -31,6 +31,9 @@ service-account*.json
 .npmrc
 .pypirc
 
+# 本地审核证据目录
+.herdr-lead-evidence/
+
 # Agent-local data, install state and caches
 .agents/
 .claude/
