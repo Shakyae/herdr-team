@@ -30,7 +30,7 @@ herdr-team/
   references/operations.md      运行与恢复协议
   references/templates.md       模板说明
   references/worktrees.md      Git Worktree 约束
-  docs/trial-guide.md          真实任务试用说明（能力、限制、建议）；docs/integration-test-plan.md 为内部联调记录，install-local.sh 不复制它，但 Skills CLI 在线安装会包含它，其中含开发者本机路径，请勿外传
+  docs/trial-guide.md          真实任务试用说明（能力、限制、建议）
   tests/test_htm.py             原 18 项更新后的回归
   tests/test_regressions_v42.py 新增攻击/故障反例测试
 install-local.sh                离线新装、事务升级、回滚
