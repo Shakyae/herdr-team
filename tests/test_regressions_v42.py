@@ -129,20 +129,56 @@ def test_worktree_ignores_foreign_git_environment(worktree_repos, tmp_path, monk
 def test_clean_git_env_strips_local_state_but_preserves_system_environment(monkeypatch):
     removed = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
                'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-               'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_PREFIX',
-               'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_IMPLICIT_WORK_TREE',
+               'GIT_NAMESPACE', 'GIT_PREFIX', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+               'GIT_IMPLICIT_WORK_TREE',
                'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_REPLACE_REF_BASE',
                'GIT_NO_REPLACE_OBJECTS', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
                'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0')
-    for key in removed:
-        monkeypatch.setenv(key, 'polluted')
+    kept_bounds = ('GIT_CEILING_DIRECTORIES',)
+    for key in removed + kept_bounds:
+        monkeypatch.setenv(key, 'polluted' if key not in kept_bounds else str(Path('/tmp')))
     for key in ('PATH', 'HOME', 'LANG', 'TMPDIR', 'SSH_AUTH_SOCK'):
         monkeypatch.setenv(key, 'preserved')
     before = os.environ.copy()
     env = h.clean_git_env()
     assert all(key not in env for key in removed)
+    # A caller-supplied search ceiling must survive, or discovery widens.
+    assert all(key in env for key in kept_bounds)
     assert all(env[key] == 'preserved' for key in ('PATH', 'HOME', 'LANG', 'TMPDIR', 'SSH_AUTH_SOCK'))
     assert dict(os.environ) == before
+
+
+def test_ceiling_bound_stops_discovery_at_unrelated_parent_repo(tmp_path, monkeypatch):
+    outer = tmp_path / 'outer'
+    vendor = outer / 'vendor'
+    (outer).mkdir()
+    vendor.mkdir()
+    gitc = ('git', '-C', str(outer))
+    subprocess.run([*gitc, 'init', '-q', '-b', 'main'], check=True)
+    subprocess.run([*gitc, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
+    cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+    monkeypatch.setenv('HTM_WORKTREE_DIR', str(tmp_path / 'managed'))
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(outer))
+
+    args = opts('dev-review', worktree='on', task='ceiling-stop')
+    with pytest.raises(h.Error, match='not inside a Git repository'):
+        h.worktree_details(h.initial_plan(cfg, args.template, args), args, True, cwd=vendor)
+    assert not (tmp_path / 'managed').exists()
+    heads = subprocess.run([*gitc, 'branch', '--list', 'htm/*'], text=True,
+                           capture_output=True, check=True).stdout.strip()
+    assert heads == ''
+
+
+def test_discovery_returns_parent_repo_without_ceiling(tmp_path, monkeypatch):
+    outer = tmp_path / 'outer'
+    vendor = outer / 'vendor'
+    outer.mkdir()
+    vendor.mkdir()
+    gitc = ('git', '-C', str(outer))
+    subprocess.run([*gitc, 'init', '-q', '-b', 'main'], check=True)
+    subprocess.run([*gitc, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
+    monkeypatch.delenv('GIT_CEILING_DIRECTORIES', raising=False)
+    assert h.detect_git_root(vendor) == outer.resolve()
 
 
 def test_dirty_check_uses_requested_repository(worktree_repos, monkeypatch):

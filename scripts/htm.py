@@ -564,14 +564,17 @@ def initial_plan(cfg, name, opts):
 
 
 def clean_git_env():
-    # Repository-local state and command-scoped config must not override -C.
+    # Strip variables that retarget git at another repository, plus variables
+    # whose removal only restores a tighter default (GIT_DISCOVERY_ACROSS_
+    # FILESYSTEM defaults to crossing-disabled). GIT_CEILING_DIRECTORIES is
+    # deliberately kept: stripping it would delete the caller's search bound
+    # and let discovery escape into an unrelated parent repository.
     removed = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-               "GIT_CEILING_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
-               "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_IMPLICIT_WORK_TREE",
+               "GIT_NAMESPACE", "GIT_PREFIX", "GIT_IMPLICIT_WORK_TREE",
                "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE",
                "GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
-               "GIT_CONFIG_COUNT"}
+               "GIT_CONFIG_COUNT", "GIT_DISCOVERY_ACROSS_FILESYSTEM"}
     return {key: value for key, value in os.environ.items()
             if key not in removed and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
 

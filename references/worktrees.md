@@ -8,7 +8,7 @@ Use `--worktree=off|auto|on` at `init` (or configure in YAML). No automatic comm
 
 In both modes `--repo` is optional. When omitted, the repository root is detected from the Lead working directory (`--cwd`, or the current directory). A directory outside a Git repository is a hard error when a worktree is requested; the Skill installation directory is never used as a fallback. An explicit `--repo` takes priority and must be the exact Git root.
 
-Worktree Git commands ignore inherited repository-local state and command-scoped Git configuration, including `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_CEILING_DIRECTORIES`. Discovery therefore follows the CWD's Git ancestry even if an inherited ceiling would normally stop it; pass an exact `--repo` to constrain selection explicitly. Global/system Git configuration and unrelated environment (including authentication settings) remain available.
+Worktree Git commands ignore inherited variables that retarget another repository, including `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, command-scoped config (`GIT_CONFIG*`), and `GIT_DISCOVERY_ACROSS_FILESYSTEM` (whose removal restores Git's default of not crossing filesystems). Variables that bound how far discovery searches are preserved: an inherited `GIT_CEILING_DIRECTORIES` still stops the search, so a directory separated from a parent repository by a ceiling is reported as not inside a Git repository rather than silently resolving to that parent. Global/system Git configuration and unrelated environment (including authentication settings) remain available.
 
 Run `uv run --extra yaml pytest -q` for full regression coverage; `unittest discover` does not collect the pytest-based Git environment regression matrix.
 

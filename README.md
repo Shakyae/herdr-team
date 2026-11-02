@@ -138,7 +138,7 @@ bash ~/.agents/skills/herdr-team/scripts/bootstrap-config.sh
 uv sync --extra yaml
 uv run --extra yaml python scripts/htm.py validate
 uv run --extra yaml python scripts/htm.py init dev-review --layout side --dry-run
-uv run --extra yaml python -m unittest discover -s tests -v
+uv run --extra yaml pytest -q
 bash -n install-local.sh
 bash -n scripts/bootstrap-config.sh
 npx skills add . --list
