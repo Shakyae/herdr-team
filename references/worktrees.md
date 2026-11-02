@@ -8,6 +8,10 @@ Use `--worktree=off|auto|on` at `init` (or configure in YAML). No automatic comm
 
 In both modes `--repo` is optional. When omitted, the repository root is detected from the Lead working directory (`--cwd`, or the current directory). A directory outside a Git repository is a hard error when a worktree is requested; the Skill installation directory is never used as a fallback. An explicit `--repo` takes priority and must be the exact Git root.
 
+Worktree Git commands ignore inherited repository-local state and command-scoped Git configuration, including `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_CEILING_DIRECTORIES`. Discovery therefore follows the CWD's Git ancestry even if an inherited ceiling would normally stop it; pass an exact `--repo` to constrain selection explicitly. Global/system Git configuration and unrelated environment (including authentication settings) remain available.
+
+Run `uv run --extra yaml pytest -q` for full regression coverage; `unittest discover` does not collect the pytest-based Git environment regression matrix.
+
 **v4.2 additional check:** When explicitly provided, `--repo` must be the exact Git repository root. Before creating a new Worktree, the runner checks `git status --porcelain --untracked-files=normal` and **refuses dirty repositories or untracked files**. Commit/stash/relocate content explicitly rather than assuming the Worker sees local modifications. The preflight is read-only; no automatic stash, commit, or clean takes place.
 
 Managed path defaults to `~/.local/share/herdr-team/worktrees/<repo-hash>/<task>`. Override the parent with `HTM_WORKTREE_DIR` during tests. Worker terminals launch with `--cwd` set to the worktree; Lead stays in the main directory. This creates *one shared task Worktree*, not one Worktree per Worker: therefore avoid simultaneous mutating tasks against the same files and allow read-only Reviewer/Tester stages after Developer finishes.
