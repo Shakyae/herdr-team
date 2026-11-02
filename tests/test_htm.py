@@ -11,6 +11,17 @@ import types
 import unittest
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_git_env(monkeypatch):
+    # Fixtures must create their own repositories, never inherit the caller's Git state.
+    for key in list(os.environ):
+        if key.startswith('GIT_'):
+            monkeypatch.delenv(key)
+
+
 MODULE = Path(__file__).resolve().parents[1] / 'scripts' / 'htm.py'
 spec = importlib.util.spec_from_file_location('htm', MODULE)
 h = importlib.util.module_from_spec(spec)
@@ -105,6 +116,76 @@ class ConfigTests(unittest.TestCase):
                 ops = h.layout_ops(n,mode)
                 self.assertEqual(len(ops),n-1)
                 self.assertEqual(set(x[2] for x in ops),set(range(1,n)))
+
+
+class WorktreeDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.repo = self.base / 'repo'
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', str(self.repo)], check=True, capture_output=True)
+        self.sub = self.repo / 'sub'
+        self.sub.mkdir()
+        self.other = self.base / 'other'
+        self.other.mkdir()
+        subprocess.run(['git', 'init', str(self.other)], check=True, capture_output=True)
+        self.cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+        self.env = patch.dict(os.environ, {'HTM_WORKTREE_DIR': str(self.base / 'managed')})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def details(self, mode='auto', task='example', repo=None, cwd=None, template='dev-review', **kw):
+        args = opts(template, worktree=mode, task=task, repo=repo)
+        plan = h.initial_plan(self.cfg, template, args)
+        return h.worktree_details(plan, args, False, cwd=cwd, **kw)
+
+    def test_auto_root_and_subdirectory(self):
+        root = self.details(cwd=self.repo)
+        self.assertEqual(root, self.details(cwd=self.sub))
+        self.assertEqual(root['repo'], str(self.repo))
+        self.assertEqual(root['branch'], 'htm/example')
+
+    def test_explicit_priority_and_exact_root(self):
+        self.assertEqual(self.details(repo=str(self.other), cwd=self.repo)['repo'], str(self.other))
+        with self.assertRaisesRegex(h.Error, 'exact Git root'):
+            self.details(repo=str(self.sub), cwd=self.other)
+
+    def test_missing_repo_never_falls_back(self):
+        with self.assertRaisesRegex(h.Error, 'not inside a Git repository') as caught:
+            self.details(cwd=self.base)
+        self.assertNotIn(str(h.ROOT), str(caught.exception))
+
+    def test_modes_and_task(self):
+        self.assertIsNone(self.details(task=None, cwd=self.base))
+        self.assertIsNone(self.details(template='research', cwd=self.base))
+        self.assertIsNone(self.details(mode='off', cwd=self.base))
+        self.assertEqual(self.details(mode='on', cwd=self.repo)['repo'], str(self.repo))
+        with self.assertRaisesRegex(h.Error, '--task'):
+            self.details(mode='on', task=None, cwd=self.repo)
+        with self.assertRaisesRegex(h.Error, 'Invalid --task'):
+            self.details(task='Invalid!', cwd=self.repo)
+
+    def test_detection_output_and_errors(self):
+        for code, stdout, stderr, message in [(0, '', '', 'no usable repository root'),
+                (0, 'relative', '', 'no usable repository root'),
+                (128, '', 'fatal: Permission denied', 'Unable to inspect'),
+                (128, '', 'fatal: not a git repository', 'not inside a Git repository'),
+                (128, '', 'fatal: cannot change to', 'inaccessible')]:
+            with self.subTest(stderr=stderr, stdout=stdout), patch.object(h.subprocess, 'run', return_value=types.SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)):
+                with self.assertRaisesRegex(h.Error, message):
+                    h.detect_git_root(self.base)
+
+    def test_getcwd_is_evaluated_each_call(self):
+        with patch.object(h.os, 'getcwd', side_effect=[str(self.repo), str(self.other)]):
+            self.assertEqual(self.details()['repo'], str(self.repo))
+            self.assertEqual(self.details()['repo'], str(self.other))
+
+    def test_symlink_root_identity(self):
+        alias = self.base / 'alias'
+        alias.symlink_to(self.repo, target_is_directory=True)
+        self.assertEqual(self.details(cwd=alias), self.details(cwd=self.repo))
 
 
 class RuntimeTests(unittest.TestCase):

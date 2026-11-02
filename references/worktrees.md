@@ -3,10 +3,16 @@
 Use `--worktree=off|auto|on` at `init` (or configure in YAML). No automatic commit/push/merge or worktree deletion is performed.
 
 - `off`: use the project `--cwd` for all Workers.
-- `auto`: for development templates, create a worktree only when `--repo PATH` and `--task slug` are explicitly supplied; otherwise use `--cwd`. For research/audit/guided-execution, do not create a worktree.
-- `on`: require both `--repo` and `--task`, then run `git worktree add -b htm/<task> <managed-path> HEAD` using a subprocess argument list (no shell). Branch name and path are constrained. Existing target branch/path fails closed, not overwritten.
+- `auto`: for development templates, create a worktree when `--task slug` is supplied; without a task, use `--cwd`. For research/audit/guided-execution, do not create a worktree.
+- `on`: require `--task`, then run `git worktree add -b htm/<task> <managed-path> HEAD` using a subprocess argument list (no shell). Branch name and path are constrained. Existing target branch/path fails closed, not overwritten.
 
-**v4.2 additional check:** `--repo` must be the exact Git repository root. Before creating a new Worktree, the runner checks `git status --porcelain --untracked-files=normal` and **refuses dirty repositories or untracked files**. Commit/stash/relocate content explicitly rather than assuming the Worker sees local modifications. The preflight is read-only; no automatic stash, commit, or clean takes place.
+In both modes `--repo` is optional. When omitted, the repository root is detected from the Lead working directory (`--cwd`, or the current directory). A directory outside a Git repository is a hard error when a worktree is requested; the Skill installation directory is never used as a fallback. An explicit `--repo` takes priority and must be the exact Git root.
+
+Worktree Git commands ignore inherited variables that retarget another repository, including `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, command-scoped config (`GIT_CONFIG*`), and `GIT_DISCOVERY_ACROSS_FILESYSTEM` (whose removal restores Git's default of not crossing filesystems). Variables that bound how far discovery searches are preserved: an inherited `GIT_CEILING_DIRECTORIES` still stops the search, so a directory separated from a parent repository by a ceiling is reported as not inside a Git repository rather than silently resolving to that parent. Global/system Git configuration and unrelated environment (including authentication settings) remain available.
+
+Run `uv run --extra yaml pytest -q` for full regression coverage; `unittest discover` does not collect the pytest-based Git environment regression matrix.
+
+**v4.2 additional check:** When explicitly provided, `--repo` must be the exact Git repository root. Before creating a new Worktree, the runner checks `git status --porcelain --untracked-files=normal` and **refuses dirty repositories or untracked files**. Commit/stash/relocate content explicitly rather than assuming the Worker sees local modifications. The preflight is read-only; no automatic stash, commit, or clean takes place.
 
 Managed path defaults to `~/.local/share/herdr-team/worktrees/<repo-hash>/<task>`. Override the parent with `HTM_WORKTREE_DIR` during tests. Worker terminals launch with `--cwd` set to the worktree; Lead stays in the main directory. This creates *one shared task Worktree*, not one Worktree per Worker: therefore avoid simultaneous mutating tasks against the same files and allow read-only Reviewer/Tester stages after Developer finishes.
 

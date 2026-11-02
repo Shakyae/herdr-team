@@ -311,9 +311,9 @@ def locked():
         os.close(fd)
 
 
-def process(argv, timeout=40, raw=False):
+def process(argv, timeout=40, raw=False, env=None):
     try:
-        r = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+        r = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Error(f"Command unavailable/timed out ({argv[:3]}): {e}") from e
     if r.returncode:
@@ -563,26 +563,77 @@ def initial_plan(cfg, name, opts):
             "layout_arrange_resolved": resolved_arrange}
 
 
+def clean_git_env():
+    # Strip variables that retarget git at another repository, plus variables
+    # whose removal only restores a tighter default (GIT_DISCOVERY_ACROSS_
+    # FILESYSTEM defaults to crossing-disabled). GIT_CEILING_DIRECTORIES is
+    # deliberately kept: stripping it would delete the caller's search bound
+    # and let discovery escape into an unrelated parent repository.
+    removed = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+               "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+               "GIT_NAMESPACE", "GIT_PREFIX", "GIT_IMPLICIT_WORK_TREE",
+               "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE",
+               "GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+               "GIT_CONFIG_COUNT", "GIT_DISCOVERY_ACROSS_FILESYSTEM"}
+    return {key: value for key, value in os.environ.items()
+            if key not in removed and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+
+
 def git_root(repo):
-    return Path(process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], raw=True).strip()).resolve()
+    return Path(process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                        raw=True, env=clean_git_env()).strip()).resolve()
 
 
-def worktree_details(plan, args, apply, allow_exists=False):
+def detect_git_root(cwd):
+    cwd = Path(cwd).expanduser().resolve()
+    try:
+        result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                                text=True, capture_output=True, timeout=40, check=False, env=clean_git_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Error(f"Unable to invoke git for {cwd}: {exc}") from exc
+    out = (result.stdout or "").strip()
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()[-1000:]
+        if "not a git repository" in stderr.lower():
+            raise Error(f"{cwd} is not inside a Git repository; pass --repo or run from a Git working tree")
+        if "cannot change to" in stderr.lower():
+            raise Error(f"{cwd} does not exist or is inaccessible; pass --repo explicitly")
+        raise Error(f"Unable to inspect Git repository at {cwd}: {stderr}")
+    if not out or not Path(out).is_absolute():
+        raise Error(f"Git returned no usable repository root for {cwd}")
+    return Path(out).resolve()
+
+
+def resolve_worktree_repo(explicit, cwd):
+    if explicit:
+        repo = Path(explicit).expanduser().resolve()
+        root = git_root(repo)
+        if repo != root:
+            raise Error("--repo must point to an exact Git root; cross-subdirectory worktree assumptions are unsafe")
+        return root
+    return detect_git_root(cwd)
+
+
+def worktree_details(plan, args, apply, allow_exists=False, cwd=None, expected=None):
     requested = plan["settings"]["execution"]["worktree"]
-    if requested == "off":
+    mode_auto = requested == "auto" and plan["category"] == "development"
+    if requested != "on" and not mode_auto:
         return None
-    if requested == "auto" and (plan["category"] != "development" or not args.task or not args.repo):
+    if mode_auto and not args.task:
         return None
-    if not args.repo or not args.task:
-        raise Error("Worktree requires both --repo PATH and --task lowercase-slug; use --worktree=off to skip")
+    if not args.task:
+        raise Error("Worktree requires --task lowercase-slug")
     if not SLUG_RE.fullmatch(args.task):
         raise Error("Invalid --task (must be a lowercase slug)")
-    repo = Path(args.repo).expanduser().resolve()
-    root = git_root(repo)
-    if repo != root:
-        raise Error("--repo must point to an exact Git root; cross-subdirectory worktree assumptions are unsafe")
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError as exc:
+            raise Error(f"Cannot determine current working directory: {exc}; pass --cwd explicitly") from exc
+    root = resolve_worktree_repo(args.repo, cwd)
     if not allow_exists:
-        dirty = process(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"], raw=True)
+        dirty = process(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
+                        raw=True, env=clean_git_env())
         if dirty.strip():
             raise Error("Source Git repo is dirty or contains untracked files. Commit/stash explicitly before building a HEAD-only worktree")
     digest = hashlib.sha256(str(root).encode()).hexdigest()[:10]
@@ -591,18 +642,24 @@ def worktree_details(plan, args, apply, allow_exists=False):
     if wt.exists() and not allow_exists:
         raise Error(f"Worktree path already exists; do not overwrite: {wt}")
     detail = {"repo": str(root), "path": str(wt), "branch": branch}
+    if expected is not None and detail != expected:
+        raise Error("Worktree identity changed since preflight; refusing to create a different resource")
     if apply:
         wt.parent.mkdir(parents=True, exist_ok=True)
-        process(["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt), "HEAD"], timeout=60, raw=True)
+        process(["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt), "HEAD"],
+                timeout=60, raw=True, env=clean_git_env())
     return detail
 
 
 def init(cfg, args):
     plan = initial_plan(cfg, args.template, args)
-    cwd = Path(args.cwd or os.getcwd()).expanduser().resolve()
+    try:
+        cwd = Path(args.cwd or os.getcwd()).expanduser().resolve()
+    except OSError as exc:
+        raise Error(f"Cannot determine current working directory: {exc}; pass --cwd explicitly") from exc
     if not cwd.is_dir(): raise Error(f"CWD does not exist: {cwd}")
     if args.dry_run:
-        wt = worktree_details(plan, args, False)
+        wt = worktree_details(plan, args, False, cwd=cwd)
         return {"dry_run": True, "no_mutations": True, "cwd": str(cwd), "worktree": wt,
                 "plan": pending_plan(plan), "requires_herdr": True}
     ctx = context()
@@ -611,7 +668,7 @@ def init(cfg, args):
             profile_check(role["profile"])
     path = state_file(ctx)
     with locked():
-        requested_wt = worktree_details(plan, args, False, allow_exists=path.exists())
+        requested_wt = worktree_details(plan, args, False, allow_exists=path.exists(), cwd=cwd)
         if path.exists():
             old = load(path)
             if old.get("version") != 3:
@@ -659,7 +716,7 @@ def init(cfg, args):
             return result
         try:
             if wt:
-                operate("git_worktree_add", wt, lambda: worktree_details(plan, args, True))
+                operate("git_worktree_add", wt, lambda: worktree_details(plan, args, True, cwd=cwd, expected=requested_wt))
             if plan["settings"]["layout"]["mode"] == "tab":
                 r = operate("tab_create", {"cwd": work_cwd},
                             lambda: herdr("tab", "create", "--workspace", ctx["workspace"], "--cwd", work_cwd,
