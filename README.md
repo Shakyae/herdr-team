@@ -151,7 +151,7 @@ npx skills add Shakyae/herdr-team --list
 uv sync --project ~/.agents/skills/herdr-team --extra yaml
 uv run --project ~/.agents/skills/herdr-team --extra yaml python ~/.agents/skills/herdr-team/scripts/htm.py validate
 uv run --project ~/.agents/skills/herdr-team --extra yaml python ~/.agents/skills/herdr-team/scripts/htm.py templates
-uv run --project ~/.agents/skills/herdr-team --extra yaml python -m unittest discover -s ~/.agents/skills/herdr-team/tests -v
+uv run --project ~/.agents/skills/herdr-team --extra yaml pytest -q ~/.agents/skills/herdr-team/tests
 ```
 
 在 Herdr 中启动 Lead Claude Code；先试无敏感数据的临时 Workspace：

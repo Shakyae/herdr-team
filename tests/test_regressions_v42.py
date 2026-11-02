@@ -155,7 +155,8 @@ def test_ceiling_bound_stops_discovery_at_unrelated_parent_repo(tmp_path, monkey
     vendor.mkdir()
     gitc = ('git', '-C', str(outer))
     subprocess.run([*gitc, 'init', '-q', '-b', 'main'], check=True)
-    subprocess.run([*gitc, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
+    subprocess.run([*gitc, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
     cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
     monkeypatch.setenv('HTM_WORKTREE_DIR', str(tmp_path / 'managed'))
     monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(outer))
@@ -176,7 +177,8 @@ def test_discovery_returns_parent_repo_without_ceiling(tmp_path, monkeypatch):
     vendor.mkdir()
     gitc = ('git', '-C', str(outer))
     subprocess.run([*gitc, 'init', '-q', '-b', 'main'], check=True)
-    subprocess.run([*gitc, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
+    subprocess.run([*gitc, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
     monkeypatch.delenv('GIT_CEILING_DIRECTORIES', raising=False)
     assert h.detect_git_root(vendor) == outer.resolve()
 
