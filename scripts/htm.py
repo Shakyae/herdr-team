@@ -567,20 +567,53 @@ def git_root(repo):
     return Path(process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], raw=True).strip()).resolve()
 
 
-def worktree_details(plan, args, apply, allow_exists=False):
+def detect_git_root(cwd):
+    cwd = Path(cwd).expanduser().resolve()
+    try:
+        result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                                text=True, capture_output=True, timeout=40, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Error(f"Unable to invoke git for {cwd}: {exc}") from exc
+    out = (result.stdout or "").strip()
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()[-1000:]
+        if "not a git repository" in stderr.lower():
+            raise Error(f"{cwd} is not inside a Git repository; pass --repo or run from a Git working tree")
+        if "cannot change to" in stderr.lower():
+            raise Error(f"{cwd} does not exist or is inaccessible; pass --repo explicitly")
+        raise Error(f"Unable to inspect Git repository at {cwd}: {stderr}")
+    if not out or not Path(out).is_absolute():
+        raise Error(f"Git returned no usable repository root for {cwd}")
+    return Path(out).resolve()
+
+
+def resolve_worktree_repo(explicit, cwd):
+    if explicit:
+        repo = Path(explicit).expanduser().resolve()
+        root = git_root(repo)
+        if repo != root:
+            raise Error("--repo must point to an exact Git root; cross-subdirectory worktree assumptions are unsafe")
+        return root
+    return detect_git_root(cwd)
+
+
+def worktree_details(plan, args, apply, allow_exists=False, cwd=None, expected=None):
     requested = plan["settings"]["execution"]["worktree"]
-    if requested == "off":
+    mode_auto = requested == "auto" and plan["category"] == "development"
+    if requested != "on" and not mode_auto:
         return None
-    if requested == "auto" and (plan["category"] != "development" or not args.task or not args.repo):
+    if mode_auto and not args.task:
         return None
-    if not args.repo or not args.task:
-        raise Error("Worktree requires both --repo PATH and --task lowercase-slug; use --worktree=off to skip")
+    if not args.task:
+        raise Error("Worktree requires --task lowercase-slug")
     if not SLUG_RE.fullmatch(args.task):
         raise Error("Invalid --task (must be a lowercase slug)")
-    repo = Path(args.repo).expanduser().resolve()
-    root = git_root(repo)
-    if repo != root:
-        raise Error("--repo must point to an exact Git root; cross-subdirectory worktree assumptions are unsafe")
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError as exc:
+            raise Error(f"Cannot determine current working directory: {exc}; pass --cwd explicitly") from exc
+    root = resolve_worktree_repo(args.repo, cwd)
     if not allow_exists:
         dirty = process(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"], raw=True)
         if dirty.strip():
@@ -591,6 +624,8 @@ def worktree_details(plan, args, apply, allow_exists=False):
     if wt.exists() and not allow_exists:
         raise Error(f"Worktree path already exists; do not overwrite: {wt}")
     detail = {"repo": str(root), "path": str(wt), "branch": branch}
+    if expected is not None and detail != expected:
+        raise Error("Worktree identity changed since preflight; refusing to create a different resource")
     if apply:
         wt.parent.mkdir(parents=True, exist_ok=True)
         process(["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt), "HEAD"], timeout=60, raw=True)
@@ -599,10 +634,13 @@ def worktree_details(plan, args, apply, allow_exists=False):
 
 def init(cfg, args):
     plan = initial_plan(cfg, args.template, args)
-    cwd = Path(args.cwd or os.getcwd()).expanduser().resolve()
+    try:
+        cwd = Path(args.cwd or os.getcwd()).expanduser().resolve()
+    except OSError as exc:
+        raise Error(f"Cannot determine current working directory: {exc}; pass --cwd explicitly") from exc
     if not cwd.is_dir(): raise Error(f"CWD does not exist: {cwd}")
     if args.dry_run:
-        wt = worktree_details(plan, args, False)
+        wt = worktree_details(plan, args, False, cwd=cwd)
         return {"dry_run": True, "no_mutations": True, "cwd": str(cwd), "worktree": wt,
                 "plan": pending_plan(plan), "requires_herdr": True}
     ctx = context()
@@ -611,7 +649,7 @@ def init(cfg, args):
             profile_check(role["profile"])
     path = state_file(ctx)
     with locked():
-        requested_wt = worktree_details(plan, args, False, allow_exists=path.exists())
+        requested_wt = worktree_details(plan, args, False, allow_exists=path.exists(), cwd=cwd)
         if path.exists():
             old = load(path)
             if old.get("version") != 3:
@@ -659,7 +697,7 @@ def init(cfg, args):
             return result
         try:
             if wt:
-                operate("git_worktree_add", wt, lambda: worktree_details(plan, args, True))
+                operate("git_worktree_add", wt, lambda: worktree_details(plan, args, True, cwd=cwd, expected=requested_wt))
             if plan["settings"]["layout"]["mode"] == "tab":
                 r = operate("tab_create", {"cwd": work_cwd},
                             lambda: herdr("tab", "create", "--workspace", ctx["workspace"], "--cwd", work_cwd,

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Worktree `--repo` is optional: detect the Git root from the Lead `--cwd` (or current directory); an explicit exact-root `--repo` takes priority. Development `auto` with `--task` now errors outside a Git repository instead of silently returning no worktree. `on` still requires `--task`; existing safety checks remain in force.
+
 ## v4.2.0-beta.2 (2026-11-01) — Real Herdr end-to-end acceptance
 
 This pre-release records the first real Herdr end-to-end acceptance runs. It remains a pre-release: Hermes, OS sandbox isolation and exactly-once delivery are still unverified, and it is not suitable for unattended production use.

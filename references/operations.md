@@ -45,7 +45,7 @@ Hermes 启动允许 `launch_args: []` 或 `['chat']`，Profile 固定由 `-p <pr
 
 ## Worktree 与真实文件权限
 
-`--worktree on --repo /absolute/git/root --task lower-case-slug` 在托管目录内创建 Git Worktree。对源 repo 进行只读 `git status --porcelain`，如有已修改或未跟踪文件就拒绝；Worktree 只复制 Git HEAD 可见内容。多个 Worker 共享单个 Worktree，不能当作多写入沙盒。仓库合并、push、删除 Worktree/分支必须单独审批，本 Runner 不会自动执行。
+`--worktree on --task lower-case-slug` 在托管目录内创建 Git Worktree；`--repo` 可省略，此时从 Lead 的 `--cwd`（默认当前目录）识别仓库根，非 Git 目录报错。显式 `--repo` 优先且必须是精确仓库根。开发模板的 `auto` 在提供 `--task` 时也采用同样规则，未提供任务时不创建 Worktree。对源 repo 进行只读 `git status --porcelain`，如有已修改或未跟踪文件就拒绝；Worktree 只复制 Git HEAD 可见内容。多个 Worker 共享单个 Worktree，不能当作多写入沙盒。仓库合并、push、删除 Worktree/分支必须单独审批，本 Runner 不会自动执行。
 
 `autonomy` 不是 OS 沙盒，`--effect` 不可信；`approval` 要求授权时，v4.2 的 `run approve` 会**拒绝**而不是接受同一 OS 用户终端输入。对安全敏感代码与真实生产项目，必须另设不同 OS 账户/容器等强制权限边界，不能用这些参数代替。
 

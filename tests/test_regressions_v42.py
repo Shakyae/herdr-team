@@ -31,6 +31,44 @@ def start_in_child(q, barrier):
         q.put(('blocked', str(e)))
 
 
+class WorktreeDetectionRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.repo = self.base / 'repo'
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', str(self.repo)], check=True, capture_output=True)
+        self.cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+        self.env = patch.dict(os.environ, {'HTM_WORKTREE_DIR': str(self.base / 'managed')})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_init_uses_cwd_not_script_or_process_directory(self):
+        args = opts('dev-review', worktree='auto', task='example', cwd=str(self.repo))
+        with patch.object(h.os, 'getcwd', return_value=str(h.ROOT)):
+            result = h.init(self.cfg, args)
+        self.assertEqual(result['worktree']['repo'], str(self.repo))
+
+    def test_init_outside_repository_fails(self):
+        args = opts('dev-review', worktree='auto', task='example', cwd=str(self.base))
+        with self.assertRaisesRegex(h.Error, 'not inside a Git repository'):
+            h.init(self.cfg, args)
+
+    def test_auto_dirty_repository_rejected(self):
+        (self.repo / 'untracked').write_text('dirty')
+        args = opts('dev-review', worktree='auto', task='example', cwd=str(self.repo))
+        with self.assertRaisesRegex(h.Error, 'dirty or contains untracked'):
+            h.init(self.cfg, args)
+
+    def test_expected_identity_mismatch_before_apply(self):
+        args = opts('dev-review', worktree='on', task='example')
+        plan = h.initial_plan(self.cfg, args.template, args)
+        with self.assertRaisesRegex(h.Error, 'identity changed since preflight'):
+            h.worktree_details(plan, args, True, cwd=self.repo, expected={'repo': '/different'})
+        self.assertFalse((self.base / 'managed').exists())
+
+
 class PublicIdContextTests(unittest.TestCase):
     def test_valid_workspace_ids(self):
         for ws in ('w1', 'w2', 'wA', 'wB', 'wZ', 'w12', 'wABC'):

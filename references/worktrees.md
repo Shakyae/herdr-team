@@ -3,8 +3,10 @@
 Use `--worktree=off|auto|on` at `init` (or configure in YAML). No automatic commit/push/merge or worktree deletion is performed.
 
 - `off`: use the project `--cwd` for all Workers.
-- `auto`: for development templates, create a worktree only when `--repo PATH` and `--task slug` are explicitly supplied; otherwise use `--cwd`. For research/audit/guided-execution, do not create a worktree.
-- `on`: require both `--repo` and `--task`, then run `git worktree add -b htm/<task> <managed-path> HEAD` using a subprocess argument list (no shell). Branch name and path are constrained. Existing target branch/path fails closed, not overwritten.
+- `auto`: for development templates, create a worktree when `--task slug` is supplied; without a task, use `--cwd`. For research/audit/guided-execution, do not create a worktree.
+- `on`: require `--task`, then run `git worktree add -b htm/<task> <managed-path> HEAD` using a subprocess argument list (no shell). Branch name and path are constrained. Existing target branch/path fails closed, not overwritten.
+
+In both modes `--repo` is optional. When omitted, the repository root is detected from the Lead working directory (`--cwd`, or the current directory). A directory outside a Git repository is a hard error when a worktree is requested; the Skill installation directory is never used as a fallback. An explicit `--repo` takes priority and must be the exact Git root.
 
 **v4.2 additional check:** `--repo` must be the exact Git repository root. Before creating a new Worktree, the runner checks `git status --porcelain --untracked-files=normal` and **refuses dirty repositories or untracked files**. Commit/stash/relocate content explicitly rather than assuming the Worker sees local modifications. The preflight is read-only; no automatic stash, commit, or clean takes place.
 

@@ -11,6 +11,8 @@
 - **已完成：** 以 Run/Dispatch ID 绑定的 Worker JSON 工件、未知/旧输出不能结算、跨 Run Worker 互斥、完整配置复用校验、关键测试 Gate、只读恢复视图、取消操作、Hermes 参数收紧、Worktree dirty 预检、隔离升级回滚；真实 Herdr 端到端联调（Reviewer 负面判定→自动 revise→remediation→复审闭环；SIGKILL 杀 driver 后 `--resume` 恢复）。
 - **仍未实现：** 独立的后台模型监督循环、真实 Owner 审批服务、OS 沙盒强制隔离、Hermes 目标环境的端到端验收。配置中的 `escalate/report` 主要是 Lead 汇报指导，并非独立消息通知。真实联调的边界（本次 SIGKILL 只针对 driver、未杀 Worker；未验证外部 exactly-once）见 `CHANGELOG.md` 与 `docs/trial-guide.md`。
 
+Worktree 初始化时 `--repo` 可省略：`--worktree=auto --task my-task`（开发模板）或 `--worktree=on --task my-task` 从 Lead 的 `--cwd`（默认当前目录）识别 Git 根目录；显式 `--repo` 优先且必须是精确 Git 根。需要 Worktree 而 CWD 不在仓库中时会报错；脏仓库等安全检查不变。
+
 ## 功能与核心架构
 
 本项目是可由 Claude Code / Codex 等兼容 CLI Agent 安装的 `herdr-team` Skill，而非独立模型服务。当前 Lead 协议和六个基础模板优先使用 Claude Code；Codex 安装兼容不等于 Codex Lead 已通过真实运行验收。
