@@ -11,6 +11,17 @@ import types
 import unittest
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_git_env(monkeypatch):
+    # Fixtures must create their own repositories, never inherit the caller's Git state.
+    for key in list(os.environ):
+        if key.startswith('GIT_'):
+            monkeypatch.delenv(key)
+
+
 MODULE = Path(__file__).resolve().parents[1] / 'scripts' / 'htm.py'
 spec = importlib.util.spec_from_file_location('htm', MODULE)
 h = importlib.util.module_from_spec(spec)

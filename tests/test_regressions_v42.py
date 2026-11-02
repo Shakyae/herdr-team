@@ -14,8 +14,10 @@ import types
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 import test_htm
-from test_htm import h, opts
+from test_htm import h, opts, isolate_git_env
 
 
 def ns(**kwargs):
@@ -67,6 +69,128 @@ class WorktreeDetectionRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(h.Error, 'identity changed since preflight'):
             h.worktree_details(plan, args, True, cwd=self.repo, expected={'repo': '/different'})
         self.assertFalse((self.base / 'managed').exists())
+
+
+@pytest.fixture
+def worktree_repos(tmp_path, monkeypatch):
+    repos = [tmp_path / name for name in ('a', 'b')]
+    for repo in repos:
+        subprocess.run(['git', 'init', str(repo)], check=True, capture_output=True)
+        (repo / 'source').write_text(repo.name)
+        subprocess.run(['git', '-C', str(repo), 'add', 'source'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.test', 'commit', '-m', 'initial'],
+                       check=True, capture_output=True)
+    monkeypatch.setenv('HTM_WORKTREE_DIR', str(tmp_path / 'managed'))
+    return repos
+
+
+def git_snapshot(repo, env):
+    return [subprocess.run(['git', '-C', str(repo), *args], env=env, check=True,
+                           capture_output=True, text=True).stdout
+            for args in (['worktree', 'list', '--porcelain'], ['show-ref'])]
+
+
+@pytest.mark.parametrize('variable', ['GIT_DIR', 'GIT_WORK_TREE', 'both', 'GIT_CONFIG_COUNT'])
+@pytest.mark.parametrize('explicit', [False, True])
+@pytest.mark.parametrize('inside', [False, True])
+def test_worktree_ignores_foreign_git_environment(worktree_repos, tmp_path, monkeypatch,
+                                                 variable, explicit, inside):
+    repo, foreign = worktree_repos
+    clean_env = os.environ.copy()
+    before = git_snapshot(foreign, clean_env)
+    if variable in ('GIT_DIR', 'both'):
+        monkeypatch.setenv('GIT_DIR', str(foreign / '.git'))
+    if variable in ('GIT_WORK_TREE', 'both'):
+        monkeypatch.setenv('GIT_WORK_TREE', str(foreign))
+    if variable == 'GIT_CONFIG_COUNT':
+        monkeypatch.setenv('GIT_CONFIG_COUNT', '1')
+        monkeypatch.setenv('GIT_CONFIG_KEY_0', 'core.worktree')
+        monkeypatch.setenv('GIT_CONFIG_VALUE_0', str(foreign))
+    cwd = repo if inside else tmp_path
+    args = opts('dev-review', worktree='on', task='env-test',
+                repo=str(cwd) if explicit else None)
+    cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+    plan = h.initial_plan(cfg, args.template, args)
+    if inside:
+        preflight = h.worktree_details(plan, args, False, cwd=cwd)
+        made = h.worktree_details(plan, args, True, cwd=cwd, expected=preflight)
+        assert made['repo'] == str(repo)
+        assert (Path(made['path']) / 'source').read_text() == 'a'
+        assert 'refs/heads/htm/env-test' in git_snapshot(repo, clean_env)[1]
+    else:
+        with pytest.raises(h.Error, match='not a git repository' if explicit else 'not inside a Git repository'):
+            h.worktree_details(plan, args, True, cwd=cwd)
+        assert not (tmp_path / 'managed').exists()
+        assert 'refs/heads/htm/env-test' not in git_snapshot(repo, clean_env)[1]
+    assert git_snapshot(foreign, clean_env) == before
+
+
+def test_clean_git_env_strips_local_state_but_preserves_system_environment(monkeypatch):
+    removed = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+               'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+               'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_PREFIX',
+               'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_IMPLICIT_WORK_TREE',
+               'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_REPLACE_REF_BASE',
+               'GIT_NO_REPLACE_OBJECTS', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS',
+               'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0')
+    for key in removed:
+        monkeypatch.setenv(key, 'polluted')
+    for key in ('PATH', 'HOME', 'LANG', 'TMPDIR', 'SSH_AUTH_SOCK'):
+        monkeypatch.setenv(key, 'preserved')
+    before = os.environ.copy()
+    env = h.clean_git_env()
+    assert all(key not in env for key in removed)
+    assert all(env[key] == 'preserved' for key in ('PATH', 'HOME', 'LANG', 'TMPDIR', 'SSH_AUTH_SOCK'))
+    assert dict(os.environ) == before
+
+
+def test_dirty_check_uses_requested_repository(worktree_repos, monkeypatch):
+    repo, foreign = worktree_repos
+    monkeypatch.setenv('GIT_DIR', str(foreign / '.git'))
+    monkeypatch.setenv('GIT_WORK_TREE', str(foreign))
+    (repo / 'source').write_text('dirty')
+    cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+    args = opts('dev-review', worktree='on', task='dirty-test', repo=str(repo))
+    with pytest.raises(h.Error, match='dirty or contains untracked'):
+        h.worktree_details(h.initial_plan(cfg, args.template, args), args, True, cwd=repo)
+    assert not Path(os.environ['HTM_WORKTREE_DIR']).exists()
+
+
+class WorktreeApplyRegressionTests(unittest.TestCase):
+    def setUp(self):
+        test_htm.RuntimeTests.setUp(self)
+
+    def test_apply_uses_explicit_cwd_across_preflight_and_creation(self):
+        repo = Path(self.tmp.name).resolve() / 'checkout'
+        subprocess.run(['git', 'init', str(repo)], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.test', 'commit', '--allow-empty', '-m', 'initial'],
+                       check=True, capture_output=True)
+        args = opts('dev-review', worktree='on', task='cross-cwd', cwd=str(repo), dry_run=False)
+        original = h.herdr
+        def with_session(*argv, **kw):
+            result = original(*argv, **kw)
+            if argv[:2] == ('agent', 'start'):
+                self.started[argv[2]]['agent_session'] = {
+                    'kind': 'id', 'source': 'mock', 'value': 'session-' + argv[2]}
+            return result
+        with patch.dict(os.environ, {'HTM_WORKTREE_DIR': str(Path(self.tmp.name) / 'managed')}), \
+                patch.object(h.os, 'getcwd', return_value=str(h.ROOT)), \
+                patch.object(h, 'herdr', side_effect=with_session):
+            team = h.init(self.cfg, args)['team']
+            self.assertTrue(h.init(self.cfg, args)['reused'])
+        self.assertEqual(team['status'], 'ready')
+        self.assertEqual(team['worktree']['repo'], str(repo))
+        self.assertTrue((Path(team['worktree']['path']) / '.git').is_file())
+        self.assertEqual(len(team['roles']), 2)
+        for role in team['roles']:
+            self.assertEqual(role['cwd'], team['worktree']['path'])
+            self.assertIn('agent_session', role)
+        splits = [call for call in self.actions if call[:2] == ('pane', 'split')]
+        self.assertTrue(all(call[call.index('--cwd') + 1] == team['worktree']['path'] for call in splits))
+        self.assertEqual(team['resources'][0]['operation'], 'git_worktree_add')
+        self.assertIsNone(team['pending_operation'])
 
 
 class PublicIdContextTests(unittest.TestCase):

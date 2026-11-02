@@ -311,9 +311,9 @@ def locked():
         os.close(fd)
 
 
-def process(argv, timeout=40, raw=False):
+def process(argv, timeout=40, raw=False, env=None):
     try:
-        r = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+        r = subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Error(f"Command unavailable/timed out ({argv[:3]}): {e}") from e
     if r.returncode:
@@ -563,15 +563,29 @@ def initial_plan(cfg, name, opts):
             "layout_arrange_resolved": resolved_arrange}
 
 
+def clean_git_env():
+    # Repository-local state and command-scoped config must not override -C.
+    removed = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+               "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+               "GIT_CEILING_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
+               "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_IMPLICIT_WORK_TREE",
+               "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE",
+               "GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+               "GIT_CONFIG_COUNT"}
+    return {key: value for key, value in os.environ.items()
+            if key not in removed and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+
+
 def git_root(repo):
-    return Path(process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], raw=True).strip()).resolve()
+    return Path(process(["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                        raw=True, env=clean_git_env()).strip()).resolve()
 
 
 def detect_git_root(cwd):
     cwd = Path(cwd).expanduser().resolve()
     try:
         result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-                                text=True, capture_output=True, timeout=40, check=False)
+                                text=True, capture_output=True, timeout=40, check=False, env=clean_git_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Error(f"Unable to invoke git for {cwd}: {exc}") from exc
     out = (result.stdout or "").strip()
@@ -615,7 +629,8 @@ def worktree_details(plan, args, apply, allow_exists=False, cwd=None, expected=N
             raise Error(f"Cannot determine current working directory: {exc}; pass --cwd explicitly") from exc
     root = resolve_worktree_repo(args.repo, cwd)
     if not allow_exists:
-        dirty = process(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"], raw=True)
+        dirty = process(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
+                        raw=True, env=clean_git_env())
         if dirty.strip():
             raise Error("Source Git repo is dirty or contains untracked files. Commit/stash explicitly before building a HEAD-only worktree")
     digest = hashlib.sha256(str(root).encode()).hexdigest()[:10]
@@ -628,7 +643,8 @@ def worktree_details(plan, args, apply, allow_exists=False, cwd=None, expected=N
         raise Error("Worktree identity changed since preflight; refusing to create a different resource")
     if apply:
         wt.parent.mkdir(parents=True, exist_ok=True)
-        process(["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt), "HEAD"], timeout=60, raw=True)
+        process(["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt), "HEAD"],
+                timeout=60, raw=True, env=clean_git_env())
     return detail
 
 
