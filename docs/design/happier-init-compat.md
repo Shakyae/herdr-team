@@ -90,18 +90,18 @@ def lead_identity(require=True) -> dict:
 
 `context()` 成为 `lead_identity()["context"]` 的薄封装，因此**所有既有落盘与 `!=` 比较零改动，三个既有 team 与六个 run 都不需要迁移**。`state_file` 的 key 仍是 `sha256("workspace|lead_pane")[:16]`（269-271），不分裂。
 
-**session 取值规则**
+**session 取值规则（按分支）**
 
-| 来源 | 取值 | 额外调用 |
-|---|---|---|
-| 有 `HERDR_SOCKET_PATH` | 在 `herdr session list --json` 的 `sessions[].socket_path` 中反查名字 | 是（仅此一路） |
-| 无 `HERDR_SOCKET_PATH` | `""`（空串＝交给 `herdr()` 默认解析，等价于现状） | 否 |
-| 派生路径 | 命中所属 session 名，必然非空 | 已含在探测中 |
+| 分支 | 来源 | 取值 | 额外调用 |
+|---|---|---|---|
+| 原生 `HERDR_ENV=1`（`HERDR_*` 齐全） | `HERDR_*` 环境变量 | 恒为 `""`（空串＝交给 `herdr()` 默认解析，与现状逐字节一致） | 否：不调 `herdr session list`，不按 `HERDR_SOCKET_PATH` 反查 |
+| 派生路径（无 `HERDR_ENV`） | `pane_of_current_process()` | 命中所属 session 名，必然非空 | 已含在探测中（`herdr session list --json` 全文件仅 `scripts/htm.py:365` 一处，位于该函数内） |
 
-**fail closed 规则（不得静默选 default）**：
+**优先级**：本节与 §4.2 冲突时，以 §4.2 的"原生分支零变化"原则为准——原生 `HERDR_ENV=1` 分支不反查 session，`session` 恒为 `""`。旧版"有 `HERDR_SOCKET_PATH` 就反查 session 名"的写法**已废弃**，不实现。
+
+**fail closed 规则（仅派生路径；原生分支不做任何探测，故以下规则均不适用）**：
 - `herdr session list --json` **命令本身失败**（非零退出、超时、输出不是合法 JSON）→ 直接 `raise Error`。`scripts/htm.py:314-339` 的 `process()` 已对这三类情况抛 `Error`/`HerdrError`，**不得捕获后降级为"找不到 session 所以跳过"**——那会把环境故障伪装成"无身份"，从而放行。
 - `session list` 成功但返回 0 个 running session → `raise Error`。
-- 反查 socket 匹配 **0 个或 >1 个** → `raise Error`。
 - 派生路径下多 session 且出现同名 Pane → `raise Error`（冲突存在时不做猜测）。
 
 **为什么不用 `HERDR_SESSION_NAME`**：**[实测]** Herdr 注入的 `HERDR_*` 只有 6 个（`HERDR_BIN_PATH`/`ENV`/`PANE_ID`/`SOCKET_PATH`/`TAB_ID`/`WORKSPACE_ID`），无此变量。
@@ -114,7 +114,7 @@ def herdr(*args, timeout=40, session=None):
     argv = ["herdr"] + (["--session", session] if session else []) + list(args)
 ```
 
-必须用**非空真值**判断：**[实测]** `herdr --session "" pane list` → `session name cannot be empty`；`herdr --session " " pane list` → `session name may only contain ASCII letters, numbers, '.', '_' and '-'`。默认 `session=None` 时拼出的 argv 与现在逐字节相同，15 处既有调用全部不受影响。session 名以 `herdr session list --json` 返回值为准，正则 `[A-Za-z0-9._-]+` 只是把 CLI 自身规则前置成 `Error`。
+必须用**非空真值**判断：**[实测]** `herdr --session "" pane list` → `session name cannot be empty`；`herdr --session " " pane list` → `session name may only contain ASCII letters, numbers, '.', '_' and '-'`。默认 `session=None` 时拼出的 argv 与现在逐字节相同，15 处既有调用全部不受影响。session 名以 `herdr session list --json` 返回值为准，正则 `[A-Za-z0-9._-]+` 只是把 CLI 自身规则前置成 `Error`；原生分支从不提供非空 session，因此该校验只在派生路径上触发。
 
 **需要透传 session 的位置**（6 个既有 `context()` 调用点之外还有间接链）：
 
@@ -130,6 +130,8 @@ def herdr(*args, timeout=40, session=None):
 | 890 `current_team`、963 `require_run`、1563 `run_list` | 只读账本 | 否 |
 
 `run_start`/`run_dispatch` 拿不到 `context()` 的返回值，因此 `current_team()`/`require_run()` 需另出返回 session 的内部变体。**不得用模块级全局变量传 session**（会跨调用泄漏）。
+
+上表"需 session=是"只表示该调用链**接受**把 `identity["session"]` 透传下去，不代表原生分支会去查 session：原生分支的 `session` 恒为 `""`，`herdr()` 收到空串即视同 `None`，拼出的 argv 与现状逐字节相同，因此透传在原生路径上是**无副作用的管道**（不新增任何 `herdr session list` 调用）。
 
 ### 4.4 阶段序列与二次校验
 
