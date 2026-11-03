@@ -4,11 +4,17 @@ import types
 import threading
 import time
 import unittest
+import pytest
 import sys
 from unittest.mock import patch
 
 import test_htm
 from test_htm import h, opts
+
+
+@pytest.fixture(autouse=True)
+def isolate_herdr_socket(monkeypatch):
+    monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
 
 
 REAL_HERDR = h.herdr
@@ -62,6 +68,35 @@ class DriveTests(unittest.TestCase):
             return result
         return patch.object(h, 'herdr', side_effect=fake)
 
+    def test_derived_session_routes_init_run_dispatch_collect_drive_and_cancel(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        calls = []
+        def routed(*args, **kwargs):
+            calls.append((args, kwargs))
+            return self.fake(*args, **kwargs)
+        lookups = []
+        def lookup(name, **kwargs):
+            lookups.append(kwargs.get('session'))
+            return self.started.get(name)
+        with patch.dict('os.environ', {}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity), \
+                patch.object(h, 'herdr', side_effect=routed), \
+                patch.object(h, 'lookup_agent', side_effect=lookup):
+            rid = self.start()
+            dispatched = h.run_dispatch(ns(run_id=rid, role='developer', message='mock', effect='write',
+                                           remediation=False, no_wait=True))
+            h.run_collect(ns(run_id=rid, dispatch_id=dispatched['dispatch_id']))
+            result = self.drive(rid, max_steps=1)
+            self.assertEqual(result['steps'][0]['action'], 'gate')
+            result = self.drive(rid, max_steps=1)
+            self.assertEqual(result['steps'][0]['action'], 'dispatch')
+            h.run_cancel(ns(run_id=rid, confirm_run_id=rid, reason='Cancel mock run explicitly'))
+            self.assertTrue(calls)
+            self.assertTrue(lookups)
+            self.assertTrue(all(kw.get('session') == 'alpha' for _, kw in calls), calls)
+            self.assertTrue(all(value == 'alpha' for value in lookups), lookups)
+            self.assertEqual(h.require_run(rid)['context'], {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+
     def test_drive_on_adopted_four_key_session(self):
         available = {
             'dev': {'name': 'dev', 'agent': 'claude', 'agent_status': 'idle', 'pane_id': 'w1:p2',
@@ -82,7 +117,7 @@ class DriveTests(unittest.TestCase):
                 available[args[2]]['agent_status'] = 'done'
                 return result
             return self.fake(*args, **kwargs)
-        with patch.object(h, 'herdr', side_effect=fake), patch.object(h, 'lookup_agent', side_effect=lambda n: available[names.get(n, n)]):
+        with patch.object(h, 'herdr', side_effect=fake), patch.object(h, 'lookup_agent', side_effect=lambda n, **kw: available[names.get(n, n)]):
             h.adopt(self.cfg, ns(template='dev-lite', role=['developer=dev', 'reviewer=rev'],
                                  set=[], cwd=self.tmp.name, dry_run=False))
             rid = h.run_start(self.cfg, ns(goal='Adopt four-key Herdr session'))['run_id']
@@ -98,10 +133,10 @@ class DriveTests(unittest.TestCase):
         h.run_dispatch(ns(run_id=rid, role='developer', message='mock', effect='write', remediation=False, no_wait=False))
         before = len(self.prompts())
         original = h.lookup_agent
-        def missing(name):
+        def missing(name, **kw):
             if name == role['agent_name']:
                 raise h.Error('{"error":{"code":"agent_not_found"}}')
-            return original(name)
+            return original(name, **kw)
         with patch.object(h, 'lookup_agent', side_effect=missing):
             out = self.drive(rid)
         self.assertEqual(out['stopped_reason'], 'identity')
@@ -342,8 +377,8 @@ class DriveTests(unittest.TestCase):
         rid = self.start()
         clock = [100.0]
         verify = h.verify_existing
-        def delayed_identity(role):
-            valid = verify(role)
+        def delayed_identity(role, **kw):
+            valid = verify(role, **kw)
             clock[0] += 2
             return valid
         with patch.object(h.time, 'monotonic', side_effect=lambda: clock[0]), \

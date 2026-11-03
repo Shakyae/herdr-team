@@ -244,7 +244,12 @@ def resolve(cfg, name, options=None):
     return item, config
 
 
-def context(require=True):
+def lead_identity(require=True):
+    if require and "HERDR_ENV" not in os.environ:
+        first = pane_of_current_process()
+        if first != pane_of_current_process():
+            raise Error("Herdr pane 身份不唯一，拒绝猜测（两次探测不一致）")
+        return {"context": {"workspace": first["workspace"], "lead_pane": first["pane"], "lead_tab": first["tab"]}, "session": first["session"]}
     if require and os.environ.get("HERDR_ENV") != "1":
         raise Error("Must run inside Herdr: HERDR_ENV=1")
     ws = os.environ.get("HERDR_WORKSPACE_ID", "")
@@ -259,7 +264,12 @@ def context(require=True):
                 raise Error(f"Invalid Herdr {label} id: {value!r}")
         if tab.split(":")[0] != ws or pane.split(":")[0] != ws:
             raise Error(f"Tab/Pane does not belong to workspace {ws}: tab={tab!r} pane={pane!r}")
-    return {"workspace": ws, "lead_pane": pane, "lead_tab": tab}
+    ctx = {"workspace": ws, "lead_pane": pane, "lead_tab": tab}
+    return {"context": ctx, "session": ""}
+
+
+def context(require=True):
+    return lead_identity(require)["context"]
 
 
 def now():
@@ -339,13 +349,85 @@ def process(argv, timeout=40, raw=False, env=None):
     return out.get("result", out)
 
 
-def herdr(*args, timeout=40):
-    return process(["herdr", *args], timeout=timeout)
+def herdr(*args, timeout=40, session=None):
+    if session is not None:
+        if not isinstance(session, str):
+            raise Error("Invalid Herdr session name")
+        if not session.strip():
+            session = None
+        elif not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+            raise Error("Invalid Herdr session name")
+    return process(["herdr", *(["--session", session] if session else []), *args], timeout=timeout)
 
 
-def pane_shell_ready(pane_id):
+def pane_of_current_process():
     try:
-        result = herdr("pane", "process-info", "--pane", pane_id)
+        sessions = herdr("session", "list", "--json")["sessions"]
+        if not isinstance(sessions, list):
+            raise ValueError("invalid sessions")
+        ancestors = set()
+        pid = os.getpid()
+        for _ in range(64):
+            if pid in ancestors:
+                raise ValueError("process ancestry cycle")
+            ancestors.add(pid)
+            pid = int(process(["/bin/ps", "-o", "ppid=", "-p", str(pid)], raw=True).strip())
+            if pid <= 1:
+                break
+        matches = []
+        seen_panes, seen_tabs = {}, {}
+        for session in sessions:
+            if not isinstance(session, dict):
+                raise ValueError("invalid session")
+            if session.get("running") is not True:
+                continue
+            name = session.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise Error("session 信息不完整，无法确认身份唯一性")
+            panes = herdr("pane", "list", session=name)["panes"]
+            if not isinstance(panes, list):
+                raise ValueError("invalid panes")
+            for pane in panes:
+                pane_id = pane["pane_id"]
+                workspace, tab_id = pane["workspace_id"], pane["tab_id"]
+                for seen, key, label in ((seen_panes, (workspace, pane_id), "Pane"),
+                                         (seen_tabs, (workspace, tab_id), "Tab")):
+                    if key in seen and seen[key] != name:
+                        raise Error(f"跨 session {label} ID 冲突: {key}")
+                    seen[key] = name
+                info = herdr("pane", "process-info", "--pane", pane_id, session=name)["process_info"]
+                shell_pid = info["shell_pid"]
+                foreground = info["foreground_processes"]
+                if type(shell_pid) is not int or not isinstance(foreground, list):
+                    raise ValueError("invalid process info")
+                pids = {shell_pid}
+                for item in foreground:
+                    if type(item["pid"]) is not int:
+                        raise ValueError("invalid process pid")
+                    pids.add(item["pid"])
+                if ancestors & pids:
+                    matches.append({"session": name, "workspace": pane["workspace_id"],
+                                    "tab": pane["tab_id"], "pane": pane_id})
+        if len(matches) > 1:
+            raise Error("Herdr pane 身份不唯一，拒绝猜测")
+        if not matches:
+            raise ValueError("no matching pane")
+        match = matches[0]
+        for label, pattern in (("workspace", WORKSPACE_ID_RE), ("tab", TAB_ID_RE), ("pane", PANE_ID_RE)):
+            if not isinstance(match[label], str) or not pattern.fullmatch(match[label]):
+                raise ValueError(f"invalid {label} id")
+        if match["tab"].split(":")[0] != match["workspace"] or match["pane"].split(":")[0] != match["workspace"]:
+            raise ValueError("pane/tab workspace mismatch")
+        return match
+    except (Error, KeyError, TypeError, ValueError, AttributeError) as e:
+        if isinstance(e, Error) and "身份不唯一，拒绝猜测" in str(e):
+            raise
+        raise Error(f"无法定位 Herdr pane: {e}") from e
+
+
+def pane_shell_ready(pane_id, session=None):
+    try:
+        result = herdr("pane", "process-info", "--pane", pane_id, session=session)
     except Error:
         return False
     info = result.get("process_info") if isinstance(result, dict) else None
@@ -371,20 +453,20 @@ def pane_shell_ready(pane_id):
 
 
 def start_agent_when_ready(name, kind, pane_id, workspace, created_panes,
-                           launch_args=(), attempts=8, interval=0.5):
+                           launch_args=(), attempts=8, interval=0.5, herdr_session=None):
     stats = {"shell_polls": 0, "busy_retries": 0, "attempts": 0}
     for attempt in range(1, attempts + 1):
         stats["attempts"] = attempt
         if pane_id not in created_panes:
             raise Error(f"Pane {pane_id} was not created by this init; refusing agent start")
-        result = herdr("pane", "get", pane_id)
+        result = herdr("pane", "get", pane_id, session=herdr_session)
         pane = result.get("pane") if isinstance(result, dict) else None
         if not isinstance(pane, dict) or pane.get("workspace_id") != workspace:
             raise Error(f"Pane {pane_id} is missing or belongs to a different workspace")
-        if pane_shell_ready(pane_id):
+        if pane_shell_ready(pane_id, session=herdr_session):
             try:
                 result = herdr("agent", "start", name, "--kind", kind, "--pane", pane_id,
-                               *launch_args, timeout=60)
+                               *launch_args, timeout=60, session=herdr_session)
                 return result, stats
             except Error as e:
                 if "agent_pane_busy" not in str(e):
@@ -435,9 +517,9 @@ def agent_status_of(obj):
     return status if isinstance(status, str) and status else "unknown"
 
 
-def lookup_agent(name):
+def lookup_agent(name, session=None):
     try:
-        return agent_data(herdr("agent", "get", name))
+        return agent_data(herdr("agent", "get", name, session=session))
     except Error:
         return None
 
@@ -451,7 +533,7 @@ def agent_name_for(role, pane_id):
     return name
 
 
-def require_name_available(name, team_path, roles=()):
+def require_name_available(name, team_path, roles=(), session=None):
     if any(r.get("agent_name") == name for r in roles):
         raise Error(f"Agent name already registered in this team: {name}")
     for other_path in (STATE / "teams").glob("*.json"):
@@ -461,7 +543,7 @@ def require_name_available(name, team_path, roles=()):
         if any(r.get("agent_name") == name for r in other.get("roles", [])):
             raise Error(f"Agent name {name} already registered by team {other_path}")
     try:
-        found = herdr("agent", "get", name)
+        found = herdr("agent", "get", name, session=session)
     except Error as e:
         if isinstance(e, HerdrError) and e.code == "agent_not_found":
             return
@@ -478,8 +560,8 @@ def pending_plan(plan):
     return result
 
 
-def verify_existing(team_role):
-    found = lookup_agent(team_role["agent_name"])
+def verify_existing(team_role, session=None):
+    found = lookup_agent(team_role["agent_name"], session=session)
     if not found or not isinstance(found, dict):
         return False
     pane = found.get("pane")
@@ -662,7 +744,8 @@ def init(cfg, args):
         wt = worktree_details(plan, args, False, cwd=cwd)
         return {"dry_run": True, "no_mutations": True, "cwd": str(cwd), "worktree": wt,
                 "plan": pending_plan(plan), "requires_herdr": True}
-    ctx = context()
+    identity = lead_identity()
+    ctx, herdr_session = identity["context"], identity["session"]
     for role in plan["roles"]:
         if role["kind"] == "hermes":
             profile_check(role["profile"])
@@ -680,7 +763,7 @@ def init(cfg, args):
             if old.get("status") == "partial":
                 raise Error("Previous init is partial. Inspect team state and orphan panes before retrying; no automatic duplicate creation.")
             for role in old["roles"]:
-                if not verify_existing(role):
+                if not verify_existing(role, session=herdr_session):
                     raise Error(f"Registered Agent {role['agent_name']} not live. Do not silently replace; investigate or create a new team.")
             return {"reused": True, "team": old}
         for role in plan["roles"]:
@@ -720,21 +803,21 @@ def init(cfg, args):
             if plan["settings"]["layout"]["mode"] == "tab":
                 r = operate("tab_create", {"cwd": work_cwd},
                             lambda: herdr("tab", "create", "--workspace", ctx["workspace"], "--cwd", work_cwd,
-                                          "--label", "htm-"+args.template, "--no-focus"))
+                                          "--label", "htm-"+args.template, "--no-focus", session=herdr_session))
                 root_pane = r["root_pane"]["pane_id"]
             else:
                 r = operate("pane_split", {"source": ctx["lead_pane"], "cwd": work_cwd},
-                            lambda: herdr("pane", "split", ctx["lead_pane"], "--direction", "right", "--cwd", work_cwd, "--no-focus"))
+                            lambda: herdr("pane", "split", ctx["lead_pane"], "--direction", "right", "--cwd", work_cwd, "--no-focus", session=herdr_session))
                 root_pane = r["pane"]["pane_id"]
             pane_ids = [root_pane] + [None]*(len(plan["roles"])-1)
             for src, direction, target in plan["layout_steps"]:
                 r = operate("pane_split", {"source": pane_ids[src], "direction": direction, "cwd": work_cwd},
-                            lambda: herdr("pane", "split", pane_ids[src], "--direction", direction, "--cwd", work_cwd, "--no-focus"))
+                            lambda: herdr("pane", "split", pane_ids[src], "--direction", direction, "--cwd", work_cwd, "--no-focus", session=herdr_session))
                 pane_ids[target] = r["pane"]["pane_id"]
             for idx, role in enumerate(plan["roles"]):
                 try:
                     name = agent_name_for(role["role"], pane_ids[idx])
-                    require_name_available(name, path, roles)
+                    require_name_available(name, path, roles, session=herdr_session)
                 except Error as e:
                     raise Error(f"Pane {pane_ids[idx]} already created; agent not named or started: {e}") from e
                 info = {**role, "pane_id": pane_ids[idx], "agent_name": name, "cwd": work_cwd}
@@ -745,13 +828,13 @@ def init(cfg, args):
                 def start():
                     launch_args = ["--", *role["launch_args"]] if role["launch_args"] else []
                     result, stats = start_agent_when_ready(
-                        name, role["kind"], pane_ids[idx], ctx["workspace"], pane_ids, launch_args)
+                        name, role["kind"], pane_ids[idx], ctx["workspace"], pane_ids, launch_args, herdr_session=herdr_session)
                     detail["readiness_attempts"] = stats["attempts"]
                     detail["readiness_shell_polls"] = stats["shell_polls"]
                     detail["readiness_busy_retries"] = stats["busy_retries"]
                     return result
                 operate("agent_start", detail, start)
-                found = lookup_agent(name)
+                found = lookup_agent(name, session=herdr_session)
                 session = found.get("agent_session") if isinstance(found, dict) else None
                 if (isinstance(session, dict) and
                         all(isinstance(session.get(k), str) and session[k].strip() for k in ("kind", "source", "value")) and
@@ -768,7 +851,8 @@ def init(cfg, args):
 
 
 def adopt(cfg, args):
-    ctx = context()
+    identity = lead_identity()
+    ctx, herdr_session = identity["context"], identity["session"]
     path = state_file(ctx)
     def check_fresh():
         if path.exists() or path.is_symlink():
@@ -822,7 +906,7 @@ def adopt(cfg, args):
     requested_cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else None
     for role in plan["roles"]:
         name = assignments[role["role"]]
-        found = lookup_agent(name)
+        found = lookup_agent(name, session=herdr_session)
         if not isinstance(found, dict) or not found:
             raise Error(f"Agent {name} is not live; cannot adopt")
         kind = agent_kind_of(found)
@@ -843,7 +927,7 @@ def adopt(cfg, args):
             raise Error(f"Agent {name} pane belongs to a different workspace")
         if any(r["pane_id"] == pane_id for r in roles):
             raise Error(f"Pane {pane_id} assigned to multiple roles")
-        result = herdr("pane", "get", pane_id)
+        result = herdr("pane", "get", pane_id, session=herdr_session)
         actual_pane = result.get("pane") if isinstance(result, dict) else None
         if not isinstance(actual_pane, dict) or actual_pane.get("workspace_id") != ctx["workspace"]:
             raise Error(f"Pane {pane_id} is missing or belongs to a different workspace")
@@ -875,7 +959,7 @@ def adopt(cfg, args):
         check_fresh()
         check_reservations(roles)
         for role in roles:
-            found = lookup_agent(role["agent_name"])
+            found = lookup_agent(role["agent_name"], session=herdr_session)
             pane = found.get("pane") if isinstance(found, dict) else None
             pane_id = (found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)) if isinstance(found, dict) else None
             session = found.get("agent_session") if isinstance(found, dict) else None
@@ -886,30 +970,36 @@ def adopt(cfg, args):
     return {"adopted": True, "team": team}
 
 
-def current_team():
-    ctx = context()
+def _current_team_with_session():
+    identity = lead_identity()
+    ctx = identity["context"]
     path = state_file(ctx)
     if not path.exists():
         raise Error("No registered team for this Lead pane; use init first")
-    return load(path)
+    return load(path), identity["session"]
+
+
+def current_team():
+    return _current_team_with_session()[0]
 
 
 def name_lead(args):
     expected = getattr(args, "expect_session", None)
     if args.apply and (not isinstance(expected, str) or not expected.strip()):
         raise Error("先跑一次预览，把输出里的 agent_session.value 传回 --expect-session")
-    ctx = context()
+    identity = lead_identity()
+    ctx, herdr_session = identity["context"], identity["session"]
     path = state_file(ctx)
     team = load(path) if path.exists() else None
     if team is not None and (team.get("context") != ctx or team.get("status") != "ready"):
         raise Error("Team context mismatch or team is not ready")
     pane_id = ctx["lead_pane"]
     name = agent_name_for("lead", pane_id)
-    pane_result = herdr("pane", "get", pane_id)
+    pane_result = herdr("pane", "get", pane_id, session=herdr_session)
     pane = pane_result.get("pane") if isinstance(pane_result, dict) else None
     if not isinstance(pane, dict) or pane.get("pane_id") != pane_id or pane.get("workspace_id") != ctx["workspace"] or not pane.get("agent"):
         raise Error("Lead pane has no verifiable agent")
-    found = agent_data(herdr("agent", "get", pane_id))
+    found = agent_data(herdr("agent", "get", pane_id, session=herdr_session))
     if not isinstance(found, dict) or found.get("pane_id") != pane_id:
         raise Error("Lead agent identity or pane cannot be verified")
     kind = agent_kind_of(pane)
@@ -929,10 +1019,10 @@ def name_lead(args):
         raise Error("Specified current agent does not match lead pane")
     if current == name:
         raise Error("Lead agent already has the derived name")
-    require_name_available(name, path, team.get("roles", []) if team is not None else ())
+    require_name_available(name, path, team.get("roles", []) if team is not None else (), session=herdr_session)
     if args.apply:
         def same_identity():
-            actual = agent_data(herdr("agent", "get", pane_id))
+            actual = agent_data(herdr("agent", "get", pane_id, session=herdr_session))
             actual_session = actual.get("agent_session") if isinstance(actual, dict) else None
             return (isinstance(actual, dict) and actual.get("pane_id") == pane_id and
                     agent_kind_of(actual) == kind and isinstance(actual_session, dict) and
@@ -944,7 +1034,7 @@ def name_lead(args):
                 raise Error("Team context mismatch or team is not ready")
             if not same_identity():
                 raise Error("Lead agent identity changed before rename")
-            herdr("agent", "rename", pane_id, name)
+            herdr("agent", "rename", pane_id, name, session=herdr_session)
             try:
                 verified_after = same_identity()
             except Error as e:
@@ -956,22 +1046,27 @@ def name_lead(args):
             "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
 
 
-def require_run(runid):
+def _require_run_with_session(runid):
     data = load(run_file(runid))
     if data.get("version") != 3:
         raise Error("Legacy Run state is not compatible with v4.2 result protocol; do not resend tasks automatically")
-    ctx = context()
+    identity = lead_identity()
+    ctx = identity["context"]
     if data.get("context") != ctx:
         raise Error("Run belongs to a different Lead pane/session")
-    return data
+    return data, identity["session"]
+
+
+def require_run(runid):
+    return _require_run_with_session(runid)[0]
 
 
 def run_start(cfg, args):
     with locked():
-        team = current_team()
+        team, herdr_session = _current_team_with_session()
         if team["status"] != "ready": raise Error("Team is not ready")
         for role in team["roles"]:
-            if not verify_existing(role): raise Error(f"Agent {role['agent_name']} not available")
+            if not verify_existing(role, session=herdr_session): raise Error(f"Agent {role['agent_name']} not available")
         names = {(team["context"]["workspace"], r["pane_id"]) for r in team["roles"]}
         for existing_path in (STATE / "runs").glob("*.json"):
             if existing_path.name.endswith(".driver.json"):
@@ -1087,7 +1182,7 @@ def reconcile_result(run, rec, observed_status):
 
 
 def run_dispatch(args):
-    run = require_run(args.run_id)
+    run, herdr_session = _require_run_with_session(args.run_id)
     if run["status"] != "active": raise Error("Run is not active")
     stage = stage_info(run)
     expected_index = run["stage_index"]
@@ -1113,9 +1208,9 @@ def run_dispatch(args):
                  and x["stage_index"] == run["stage_index"]]
     if approval_required and not approvals:
         raise Error(f"Approval required: run approve --run-id {args.run_id} --role {args.role} --effect {args.effect} --reason <user-authorized-reference>")
-    if not verify_existing(role):
+    if not verify_existing(role, session=herdr_session):
         raise Error(f"Agent {role['agent_name']} is not live; do not send to an unknown terminal")
-    live = lookup_agent(role["agent_name"])
+    live = lookup_agent(role["agent_name"], session=herdr_session)
     live_status = agent_status_of(live)
     if live_status not in ("idle", "done"):
         raise Error(f"Agent {role['agent_name']} is {live_status}; inspect before sending a new task")
@@ -1171,7 +1266,7 @@ def run_dispatch(args):
     if not args.no_wait:
         cmd += ["--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", str(timeout_ms)]
     try:
-        result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0))
+        result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0), session=herdr_session)
         if args.no_wait:
             with locked():
                 run = require_run(args.run_id)
@@ -1206,12 +1301,12 @@ def herdr_read(name):
 
 
 def run_collect(args):
-    run = require_run(args.run_id)
+    run, herdr_session = _require_run_with_session(args.run_id)
     rec = next((x for x in reversed(run["dispatches"]) if x["id"] == args.dispatch_id), None)
     if rec is None: raise Error("Unknown dispatch ID")
     role = get_role(run, rec["role"])
-    if not verify_existing(role): raise Error("Registered Agent is no longer live")
-    agent = lookup_agent(role["agent_name"])
+    if not verify_existing(role, session=herdr_session): raise Error("Registered Agent is no longer live")
+    agent = lookup_agent(role["agent_name"], session=herdr_session)
     st = agent_status_of(agent)
     with locked():
         run = require_run(args.run_id)
@@ -1292,11 +1387,11 @@ def run_drive(args):
     detail = None
     deadline = time.monotonic() + args.deadline_seconds
 
-    def check_identity(role):
+    def check_identity(role, herdr_session):
         try:
-            if not verify_existing(role):
+            if not verify_existing(role, session=herdr_session):
                 raise Error("not live or identity cannot be verified")
-            live = lookup_agent(role["agent_name"])
+            live = lookup_agent(role["agent_name"], session=herdr_session)
             pane = live.get("pane") if isinstance(live, dict) else None
             pane_id = (live.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)) if isinstance(live, dict) else None
             session = live.get("agent_session") if isinstance(live, dict) else None
@@ -1368,7 +1463,7 @@ def run_drive(args):
                 save(path, run)
                 started = True
             while True:
-                run = require_run(runid)
+                run, herdr_session = _require_run_with_session(runid)
                 if run["status"] != "active":
                     reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
                     break
@@ -1382,7 +1477,7 @@ def run_drive(args):
                 if pending:
                     rec = pending[0]
                     try:
-                        check_identity(get_role(run, rec["role"]))
+                        check_identity(get_role(run, rec["role"]), herdr_session)
                     except Error as e:
                         reason, detail = "identity", str(e)
                         break
@@ -1422,7 +1517,7 @@ def run_drive(args):
                 if remediation or not own:
                     role = get_role(run, target)
                     try:
-                        check_identity(role)
+                        check_identity(role, herdr_session)
                     except Error as e:
                         reason, detail = "identity", str(e)
                         break
@@ -1591,7 +1686,7 @@ def run_recover(args):
 def run_cancel(args):
     """Explicitly mark a Run abandoned; never claim completion or delete workers."""
     with locked():
-        run = require_run(args.run_id)
+        run, herdr_session = _require_run_with_session(args.run_id)
         if run["status"] in ("finished", "cancelled"):
             raise Error("Run is already terminal")
         if args.confirm_run_id != args.run_id or len(args.reason.strip()) < 12:
@@ -1600,9 +1695,9 @@ def run_cancel(args):
         if pending:
             raise Error(f"Cannot cancel while dispatches are unresolved: {pending}. Inspect and reconcile safely")
         for role in run["roles"]:
-            if not verify_existing(role):
+            if not verify_existing(role, session=herdr_session):
                 raise Error("Worker disappeared. Do not release its reservation before manual reconciliation")
-            info = lookup_agent(role["agent_name"])
+            info = lookup_agent(role["agent_name"], session=herdr_session)
             status = agent_status_of(info)
             if status not in ("idle", "done", "blocked"):
                 raise Error(f"Worker {role['agent_name']} is {status}; cannot safely release reservation")
@@ -1691,10 +1786,10 @@ def main():
         if args.cmd == "adopt": emit(adopt(cfg, args)); return 0
         if args.cmd == "name-lead": emit(name_lead(args)); return 0
         if args.cmd == "status":
-            team = current_team()
+            team, herdr_session = _current_team_with_session()
             live = []
             for r in team["roles"]:
-                actual = lookup_agent(r["agent_name"])
+                actual = lookup_agent(r["agent_name"], session=herdr_session)
                 live.append({"role": r["role"], "agent_name": r["agent_name"],
                              "registered_pane": r["pane_id"], "live": bool(actual),
                              "observed_state": agent_status_of(actual) if isinstance(actual, dict) else "missing"})

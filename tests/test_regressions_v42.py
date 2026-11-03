@@ -71,6 +71,11 @@ class WorktreeDetectionRegressionTests(unittest.TestCase):
         self.assertFalse((self.base / 'managed').exists())
 
 
+@pytest.fixture(autouse=True)
+def isolate_herdr_socket(monkeypatch):
+    monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
+
+
 @pytest.fixture
 def worktree_repos(tmp_path, monkeypatch):
     repos = [tmp_path / name for name in ('a', 'b')]
@@ -273,7 +278,7 @@ class PublicIdContextTests(unittest.TestCase):
             with self.subTest(key=key), patch.dict(os.environ, {**env, key: ''}, clear=True):
                 with self.assertRaisesRegex(h.Error, '^Missing Herdr pane/workspace/tab environment$'):
                     h.context()
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {'HERDR_ENV': '0'}, clear=True):
             with self.assertRaisesRegex(h.Error, '^Must run inside Herdr: HERDR_ENV=1$'):
                 h.context()
 
@@ -292,6 +297,181 @@ class PublicIdContextTests(unittest.TestCase):
             self.assertEqual(h.context(require=False), {'workspace': '', 'lead_tab': '', 'lead_pane': ''})
         with patch.dict(os.environ, {'HERDR_WORKSPACE_ID': 'invalid'}, clear=True):
             self.assertEqual(h.context(require=False), {'workspace': 'invalid', 'lead_tab': '', 'lead_pane': ''})
+
+
+class DerivedPaneContextTests(unittest.TestCase):
+    def setUp(self):
+        self.panes = [{'workspace_id': 'w1', 'tab_id': 'w1:t1', 'pane_id': 'w1:p1'}]
+        self.infos = {'w1:p1': {'shell_pid': 55, 'foreground_processes': [{'pid': 42}]}}
+        self.calls = []
+
+    def fake_herdr(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if args == ('session', 'list', '--json'):
+            return {'sessions': [{'name': 'default', 'running': True},
+                                 {'name': 'stopped', 'running': False}]}
+        if args == ('pane', 'list'):
+            return {'panes': self.panes}
+        if args[:2] == ('pane', 'process-info'):
+            return {'process_info': self.infos[args[3]]}
+        raise AssertionError(args)
+
+    def probe(self):
+        with patch.object(h, 'herdr', side_effect=self.fake_herdr), \
+             patch.object(h.os, 'getpid', return_value=42), \
+             patch.object(h, 'process', return_value='1\n'):
+            return h.pane_of_current_process()
+
+    def test_unique_match_and_session(self):
+        self.assertEqual(self.probe(), {'session': 'default', 'workspace': 'w1',
+                                        'tab': 'w1:t1', 'pane': 'w1:p1'})
+        self.assertEqual(self.calls[1], (('pane', 'list'), {'session': 'default'}))
+        self.assertEqual(self.calls[2][1], {'session': 'default'})
+
+    def test_zero_and_multiple_matches(self):
+        self.infos['w1:p1']['foreground_processes'] = []
+        with self.assertRaisesRegex(h.Error, '无法定位'):
+            self.probe()
+        self.infos['w1:p1']['shell_pid'] = 42
+        self.panes.append({'workspace_id': 'w1', 'tab_id': 'w1:t1', 'pane_id': 'w1:p2'})
+        self.infos['w1:p2'] = {'shell_pid': 42, 'foreground_processes': []}
+        with self.assertRaisesRegex(h.Error, '身份不唯一，拒绝猜测'):
+            self.probe()
+
+    def test_invalid_ids_and_prefixes(self):
+        for key, value in [('workspace_id', 'wI'), ('tab_id', 'bad'), ('pane_id', 'w1:p!'),
+                           ('tab_id', 'w2:t1'), ('pane_id', 'w2:p1')]:
+            with self.subTest(key=key, value=value):
+                pane = {'workspace_id': 'w1', 'tab_id': 'w1:t1', 'pane_id': 'w1:p1', key: value}
+                self.panes = [pane]
+                self.infos[value if key == 'pane_id' else 'w1:p1'] = {
+                    'shell_pid': 42, 'foreground_processes': []}
+                with self.assertRaisesRegex(h.Error, '无法定位'):
+                    self.probe()
+
+    def test_query_failure(self):
+        with patch.object(h, 'herdr', side_effect=h.Error('failed')):
+            with self.assertRaisesRegex(h.Error, '无法定位'):
+                h.pane_of_current_process()
+
+    def test_ancestor_chain_and_herdr_session_argument(self):
+        self.infos['w1:p1'] = {'shell_pid': 30, 'foreground_processes': []}
+        with patch.object(h, 'herdr', side_effect=self.fake_herdr), \
+             patch.object(h.os, 'getpid', return_value=42), \
+             patch.object(h, 'process', side_effect=['30\n', '1\n']) as ps:
+            self.assertEqual(h.pane_of_current_process()['pane'], 'w1:p1')
+            self.assertEqual(ps.call_args_list[0].args[0], ['/bin/ps', '-o', 'ppid=', '-p', '42'])
+            self.assertEqual(ps.call_args_list[1].args[0], ['/bin/ps', '-o', 'ppid=', '-p', '30'])
+        with patch.object(h, 'process', return_value={}) as process:
+            h.herdr('pane', 'list', session='default')
+            process.assert_called_once_with(['herdr', '--session', 'default', 'pane', 'list'], timeout=40)
+
+    def test_context_double_probe_and_no_environment_write(self):
+        identity = {'session': 'default', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', return_value=identity) as probe:
+            self.assertEqual(h.context(), {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+            self.assertEqual(probe.call_count, 2)
+            self.assertEqual(dict(os.environ), {})
+        with patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', side_effect=[identity, {**identity, 'session': 'other'}]):
+            with self.assertRaisesRegex(h.Error, '身份不唯一，拒绝猜测'):
+                h.context()
+
+    def test_session_explicit_no_global_leak(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity), \
+                patch.object(h, 'process', return_value={}) as process:
+            lead = h.lead_identity()
+            self.assertEqual(lead['context'], {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+            h.herdr('pane', 'get', 'w1:p1', session=lead['session'])
+            h.herdr('pane', 'get', 'w1:p1')
+            self.assertEqual(process.call_args_list[0].args[0], ['herdr', '--session', 'alpha', 'pane', 'get', 'w1:p1'])
+            self.assertEqual(process.call_args_list[1].args[0], ['herdr', 'pane', 'get', 'w1:p1'])
+            self.assertFalse(hasattr(h, '_DISCOVERED_SESSION'))
+            self.assertNotIn('HERDR_ENV', os.environ)
+
+    def test_inconsistent_probes_do_not_leak_session(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(h, 'pane_of_current_process', side_effect=[identity, {**identity, 'session': 'beta'}]), \
+                patch.object(h, 'process', return_value={}) as process:
+            with self.assertRaisesRegex(h.Error, '身份不唯一，拒绝猜测（两次探测不一致）'):
+                h.context()
+            h.herdr('pane', 'get', 'w1:p1')
+            process.assert_called_once_with(['herdr', 'pane', 'get', 'w1:p1'], timeout=40)
+
+    def test_cross_session_duplicate_pane_and_tab_rejected(self):
+        for field in ('pane_id', 'tab_id'):
+            with self.subTest(field=field):
+                other = {'workspace_id': 'w1', 'tab_id': 'w1:t2', 'pane_id': 'w1:p2'}
+                other[field] = self.panes[0][field]
+                def fake(*args, **kw):
+                    if args == ('session', 'list', '--json'):
+                        return {'sessions': [{'name': 'one', 'running': True}, {'name': 'two', 'running': True}]}
+                    if args == ('pane', 'list'):
+                        return {'panes': self.panes if kw['session'] == 'one' else [other]}
+                    return {'process_info': {'shell_pid': 42 if kw['session'] == 'one' else 99, 'foreground_processes': []}}
+                with patch.object(h, 'herdr', side_effect=fake), patch.object(h.os, 'getpid', return_value=42), \
+                        patch.object(h, 'process', return_value='1'):
+                    with self.assertRaisesRegex(h.Error, '跨 session .* ID 冲突'):
+                        h.pane_of_current_process()
+
+    def test_context_ledger_comparison_and_key_unchanged(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        legacy = {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(h, 'STATE', Path(tmp)), \
+                patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', return_value=identity):
+            h.save(h.run_file('abcdef123456'), {'version': 3, 'context': legacy})
+            self.assertEqual(h.context(), legacy)
+            self.assertEqual(h.state_file(h.context()), h.state_file(legacy))
+            self.assertEqual(h.require_run('abcdef123456')['context'], legacy)
+
+    def test_native_socket_preserves_default_session(self):
+        env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1',
+               'HERDR_PANE_ID': 'w1:p1', 'HERDR_SOCKET_PATH': '/tmp/socket'}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(h, 'herdr') as fake:
+                identity = h.lead_identity()
+                self.assertEqual(identity['session'], '')
+                h.context(False)
+                fake.assert_not_called()
+            with patch.object(h, 'process', return_value={}) as process:
+                h.herdr('pane', 'get', 'w1:p1', session=identity['session'])
+                process.assert_called_once_with(['herdr', 'pane', 'get', 'w1:p1'], timeout=40)
+
+    def test_running_session_with_incomplete_name_fails_closed(self):
+        for session in ({'running': True}, {'running': True, 'name': ''},
+                        {'running': True, 'name': '  '}, {'running': True, 'name': 123}):
+            with self.subTest(session=session):
+                def fake(*args, **kwargs):
+                    if args == ('session', 'list', '--json'):
+                        return {'sessions': [{'name': 'default', 'running': True}, session]}
+                    return self.fake_herdr(*args, **kwargs)
+                with patch.object(h, 'herdr', side_effect=fake), \
+                        patch.object(h.os, 'getpid', return_value=42), \
+                        patch.object(h, 'process', return_value='1'):
+                    with self.assertRaisesRegex(h.Error, 'session 信息不完整，无法确认身份唯一性'):
+                        h.pane_of_current_process()
+
+    def test_stopped_session_with_empty_name_is_ignored(self):
+        def fake(*args, **kwargs):
+            if args == ('session', 'list', '--json'):
+                return {'sessions': [{'name': 'default', 'running': True}, {'name': '', 'running': False}]}
+            return self.fake_herdr(*args, **kwargs)
+        with patch.object(h, 'herdr', side_effect=fake), \
+                patch.object(h.os, 'getpid', return_value=42), \
+                patch.object(h, 'process', return_value='1'):
+            self.assertEqual(h.pane_of_current_process()['session'], 'default')
+
+    def test_native_optional_and_missing_do_not_probe(self):
+        env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1'}
+        with patch.dict(os.environ, env, clear=True), patch.object(h, 'pane_of_current_process') as probe:
+            self.assertEqual(h.context(), {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+            del os.environ['HERDR_PANE_ID']
+            with self.assertRaisesRegex(h.Error, '^Missing Herdr pane/workspace/tab environment$'):
+                h.context()
+            self.assertEqual(h.context(False), {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': ''})
+            probe.assert_not_called()
 
 
 class AdoptTests(unittest.TestCase):
@@ -902,7 +1082,7 @@ class PaneShellReadinessTests(unittest.TestCase):
     def test_stats_shell_polls_only(self):
         calls, fake = self.fake()
         ready = iter([False, False, True])
-        def poll(pane_id):
+        def poll(pane_id, **kw):
             value = next(ready)
             if not value:
                 self.assertFalse(any(c[:2] == ('agent', 'start') for c in calls))

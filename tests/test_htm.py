@@ -17,6 +17,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_git_env(monkeypatch):
     # Fixtures must create their own repositories, never inherit the caller's Git state.
+    monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
     for key in list(os.environ):
         if key.startswith('GIT_'):
             monkeypatch.delenv(key)
@@ -241,7 +242,7 @@ class RuntimeTests(unittest.TestCase):
                 return {'agent': self.started[argv[2]]}
             raise AssertionError(f'unexpected Herdr request: {argv}')
         pm = patch.object(h,'herdr',side_effect=fake_herdr); pm.start(); self.addCleanup(pm.stop)
-        lookup = patch.object(h,'lookup_agent', side_effect=lambda n: self.started.get(n))
+        lookup = patch.object(h,'lookup_agent', side_effect=lambda n, **kw: self.started.get(n))
         lookup.start(); self.addCleanup(lookup.stop)
         reading = patch.object(h,'herdr_read',return_value='Done: inspected files; tests all pass (mock evidence).')
         reading.start(); self.addCleanup(reading.stop)
