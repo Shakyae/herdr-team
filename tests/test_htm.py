@@ -18,6 +18,7 @@ import pytest
 def isolate_git_env(monkeypatch):
     # Fixtures must create their own repositories, never inherit the caller's Git state.
     monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
+    monkeypatch.delenv('HERDR_SESSION', raising=False)
     for key in list(os.environ):
         if key.startswith('GIT_'):
             monkeypatch.delenv(key)
@@ -197,8 +198,18 @@ class RuntimeTests(unittest.TestCase):
         h.STATE = Path(self.tmp.name)/'state'
         self.addCleanup(setattr,h,'STATE',self.old_state)
         env = patch.dict(os.environ, {'HERDR_ENV':'1','HERDR_WORKSPACE_ID':'w1','HERDR_PANE_ID':'w1:p1',
-                                   'HERDR_TAB_ID':'w1:t1'})
+                                   'HERDR_TAB_ID':'w1:t1', 'HERDR_SESSION':''})
         env.start(); self.addCleanup(env.stop)
+        # The native branch cross-checks the environment against the real process
+        # ancestry probe. These tests are not about discovery, so fake that probe at
+        # the boundary and keep every other validation live.
+        def identity(*args, **kwargs):
+            return {'session': os.environ.get('HERDR_SESSION') or 'default',
+                    'workspace': os.environ.get('HERDR_WORKSPACE_ID', ''),
+                    'tab': os.environ.get('HERDR_TAB_ID', ''),
+                    'pane': os.environ.get('HERDR_PANE_ID', '')}
+        probe = patch.object(h, 'pane_of_current_process', side_effect=identity)
+        probe.start(); self.addCleanup(probe.stop)
         self.cfg,_ = h.read_cfg(h.DEFAULT_CONFIG)
         self.started = {}
         self.panes = 1
@@ -207,7 +218,9 @@ class RuntimeTests(unittest.TestCase):
         def fake_herdr(*argv, **kwargs):
             self.actions.append(argv)
             if argv[:2] == ('pane','get'):
-                return {'pane': {'workspace_id': 'w1'}}
+                workspace = argv[2].split(':')[0]
+                return {'pane': {'pane_id': argv[2], 'workspace_id': workspace,
+                                 'tab_id': workspace + ':t1'}}
             if argv[:2] == ('pane','process-info'):
                 return {'process_info': {'shell_pid': 123, 'foreground_process_group_id': 123, 'foreground_processes': [
                     {'pid': 123, 'argv0': 'zsh'}]}}
@@ -307,7 +320,10 @@ class RuntimeTests(unittest.TestCase):
     def test_uncertain_dispatch_blocks_duplicate(self):
         h.init(self.cfg,opts('research',dry_run=False,cwd=self.tmp.name))
         rid = h.run_start(self.cfg,types.SimpleNamespace(goal='Research'))['run_id']
-        def timed_out(*a,**kw): raise h.Error('timeout')
+        original = h.herdr
+        def timed_out(*a,**kw):
+            if a[:2] == ('agent','prompt'): raise h.Error('timeout')
+            return original(*a,**kw)
         with patch.object(h,'herdr',side_effect=timed_out):
             with self.assertRaisesRegex(h.Error,'uncertain'):
                 h.run_dispatch(types.SimpleNamespace(run_id=rid,role='researcher',message='Find sources',effect='read',remediation=False,no_wait=False))

@@ -15,6 +15,7 @@ from test_htm import h, opts
 @pytest.fixture(autouse=True)
 def isolate_herdr_socket(monkeypatch):
     monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
+    monkeypatch.delenv('HERDR_SESSION', raising=False)
 
 
 REAL_HERDR = h.herdr
@@ -111,7 +112,7 @@ class DriveTests(unittest.TestCase):
             if args[:2] == ('agent', 'get'):
                 return {'agent': available[args[2]]}
             if args[:2] == ('pane', 'get'):
-                return {'pane': {'workspace_id': 'w1', 'pane_id': args[2]}}
+                return {'pane': {'workspace_id': 'w1', 'pane_id': args[2], 'tab_id': 'w1:t1'}}
             if args[:2] == ('agent', 'prompt'):
                 result = self.fake(*args, **kwargs)
                 available[args[2]]['agent_status'] = 'done'
@@ -500,7 +501,10 @@ class DriveTests(unittest.TestCase):
         rid = self.start()
         def fake_subprocess(argv, **kwargs):
             self.assertEqual(argv[0], 'herdr')
-            return ns(returncode=0, stdout=json.dumps(self.fake(*argv[1:])), stderr='')
+            tail = argv[1:]
+            if tail[:1] == ['--session']:
+                tail = tail[2:]
+            return ns(returncode=0, stdout=json.dumps(self.fake(*tail)), stderr='')
         # Exercise the real herdr -> process -> subprocess.run path with only the OS boundary faked.
         with patch.object(h, 'herdr', new=REAL_HERDR), \
                 patch.object(h, 'process', wraps=h.process) as process, \

@@ -244,6 +244,21 @@ def resolve(cfg, name, options=None):
     return item, config
 
 
+def socket_session(socket):
+    """Return the unique named session whose current socket_path is exactly `socket`."""
+    result = herdr("session", "list", "--json")
+    sessions = result.get("sessions") if isinstance(result, dict) else None
+    if not isinstance(sessions, list):
+        raise Error("Invalid Herdr session list")
+    matches = [item for item in sessions if isinstance(item, dict) and item.get("socket_path") == socket]
+    if len(matches) != 1:
+        raise Error("Herdr socket does not identify exactly one session")
+    name = matches[0].get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise Error("Herdr socket does not identify exactly one named session")
+    return name
+
+
 def lead_identity(require=True):
     if require and "HERDR_ENV" not in os.environ:
         first = pane_of_current_process()
@@ -257,6 +272,7 @@ def lead_identity(require=True):
     tab = os.environ.get("HERDR_TAB_ID", "")
     if require and not (ws and pane and tab):
         raise Error("Missing Herdr pane/workspace/tab environment")
+    session = ""
     if require:
         for label, value, pattern in (("workspace", ws, WORKSPACE_ID_RE),
                                       ("tab", tab, TAB_ID_RE), ("pane", pane, PANE_ID_RE)):
@@ -264,8 +280,24 @@ def lead_identity(require=True):
                 raise Error(f"Invalid Herdr {label} id: {value!r}")
         if tab.split(":")[0] != ws or pane.split(":")[0] != ws:
             raise Error(f"Tab/Pane does not belong to workspace {ws}: tab={tab!r} pane={pane!r}")
+        # An inherited HERDR_* environment is not proof of ownership: it can be forged or
+        # stale. Prove the calling process actually lives in the pane before trusting it.
+        first = pane_of_current_process()
+        if first != pane_of_current_process():
+            raise Error("Herdr pane 身份不唯一，拒绝猜测（两次探测不一致）")
+        if any(first[key] != value for key, value in (("workspace", ws), ("tab", tab), ("pane", pane))):
+            raise Error(f"Herdr 进程归属与 HERDR_* 身份不一致: probe={first!r}")
+        session = first["session"]
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+            raise Error(f"Invalid Herdr session name: {session!r}")
+        env_session = os.environ.get("HERDR_SESSION", "")
+        if env_session and env_session != session:
+            raise Error(f"Herdr 进程归属 session 与环境不一致: {env_session!r} != {session!r}")
+        socket = os.environ.get("HERDR_SOCKET_PATH", "")
+        if socket and socket_session(socket) != session:
+            raise Error(f"Herdr socket 与进程归属不一致: {socket!r} != {session!r}")
     ctx = {"workspace": ws, "lead_pane": pane, "lead_tab": tab}
-    return {"context": ctx, "session": ""}
+    return {"context": ctx, "session": session}
 
 
 def context(require=True):
@@ -1287,10 +1319,16 @@ def run_dispatch(args):
                 "report": rec.get("report"), "error": rec.get("error"),
                 "warning": "Worker JSON is not independent verification; Lead must check evidence and tests"}
     except Error as e:
-        with locked():
-            run = require_run(args.run_id)
-            rec = next(x for x in run["dispatches"] if x["id"] == stamp)
-            rec["error"] = str(e); save(run_file(args.run_id), run)
+        # The delivery outcome is unknown, so the "might have been sent" warning must
+        # survive even if re-reading the ledger fails (e.g. an unstable identity probe).
+        try:
+            with locked():
+                run = require_run(args.run_id)
+                rec = next(x for x in run["dispatches"] if x["id"] == stamp)
+                rec["error"] = str(e); save(run_file(args.run_id), run)
+        except Error as recovery:
+            raise Error(f"Dispatch {stamp} uncertain; input might have been sent. Run collect before retry. "
+                        f"Original: {e}. State recheck also failed: {recovery}") from e
         raise Error(f"Dispatch {stamp} uncertain; input might have been sent. Run collect before retry. {e}") from e
 
 

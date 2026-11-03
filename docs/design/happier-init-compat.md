@@ -59,21 +59,27 @@ Herdr 0.9.5 **没有**可信调用者身份接口：**[实测]** `herdr api sche
 
 ### 4.2 修改 `context(require=True)`（247-265）
 
-**分支顺序与现有代码一致，只在"完全没有 `HERDR_ENV`"时新增一条兜底：**
+**分支顺序与现有代码一致；原生分支保留原有校验，并新增一次真实进程归属交叉检查；无 `HERDR_ENV` 时才走派生兜底：**
 
 | 情形 | 行为 | 二次探测 | 理由 |
 |---|---|---|---|
-| `HERDR_ENV == "1"` 且三个 ID 齐全 | 完全走现有逻辑，零变化 | **不做** | 原生可靠性不降级；不涉及 `process-info`，也就不存在需要二次校验的探测 |
-| `HERDR_ENV == "1"` 但 ID 缺失/非法 | **保持现有报错**（`Missing Herdr pane/workspace/tab environment` 等），**不退回派生** | 不适用 | 现有 `scripts/htm.py:253-254` 已这样处理，`tests/test_regressions_v42.py:270-276` 断言该文案。在"已声明在 Herdr 内但环境不完整"时改用另一套身份来源，会掩盖真实的环境错误 |
-| 无 `HERDR_ENV` | 调 `pane_of_current_process()` | **做** | 这是 Happier 的情形，也是唯一需要二次校验的分支 |
+| `HERDR_ENV == "1"` 且三个 ID 齐全 | 保留 ID presence/format/cross-workspace 校验，**再**用 `pane_of_current_process()` 做真实进程归属交叉检查：`workspace`/`tab`/`pane` 必逐项相等，session 以探测结果为准并被 `HERDR_SESSION`/`HERDR_SOCKET_PATH` 交叉确认 | **做**（两次探测须一致） | 业务兼容不退化；但继承来的 `HERDR_*` 可被伪造或已过期，不能单独作为身份证据 |
+| `HERDR_ENV == "1"` 但 ID 缺失/非法 | **保持现有报错**（`Missing Herdr pane/workspace/tab environment` 等），**不退回派生** | 不适用（在探测之前就失败） | 在"已声明在 Herdr 内但环境不完整"时改用另一套身份来源，会掩盖真实的环境错误 |
+| 无 `HERDR_ENV` | 调 `pane_of_current_process()` | **做** | 这是 Happier 的情形 |
 
-**只有派生分支做二次全量交集。** 原生分支既不探测也不校验，session 取空串、`herdr()` 走默认解析，行为与今天完全一致。因此"原生分支 session 为空却要与非空值比较"这一矛盾不存在。
+**原生路径不是"零变化"**：ID 的格式与互属校验、`context()` 的三键契约、落盘与比较都保持不变，但**新增了一次真实进程归属交叉检查**。这是本轮对 §4.2 旧结论的修正——原设计以"原生可靠性不降级"为由跳过探测，但它信任了可继承、可伪造的 `HERDR_*`，而 Herdr 0.9.5 没有服务端对端身份（§3），因此必须用内核父链 + `process-info` 的独立证据交叉验证。
 
-**`require=False` 契约保持不变**：返回 `{"workspace","lead_tab","lead_pane"}` 三键，提前返回、不解析 session、不调 herdr。`tests/test_regressions_v42.py:290-294`（两条断言在 :292 与 :294）无需修改。
+**核对规则（原生路径）**：
+1. 探测结果的 `workspace`/`tab`/`pane` 必须与环境三 ID **逐项相等**，否则 `raise Error`（文案含 `进程归属与 HERDR_* 身份不一致`）。
+2. 环境 `HERDR_SESSION` 非空时，必须等于探测到的 session 名。
+3. 环境 `HERDR_SOCKET_PATH` 非空时，必须用 `herdr session list --json` 中**`socket_path` 与它逐字节相等的唯一 session 名**证明该名字等于探测 session；0 个或多个匹配、名字为空、或匹配到的 session 与探测不符一律 `raise Error`。**不把缺失值默认成 `default`**。（socket 路径由 Herdr 自己生成，属比较即可；若出现规范化差异会因 0 匹配而 fail closed。）
+4. 探测结果自身必须通过既有 ID 正则与 workspace 前缀校验。
 
-**错误文案**：唯一需要改的既有断言是 `tests/test_regressions_v42.py:277-278`，建议改为匹配 `^Must run inside a Herdr pane: HERDR_ENV=1 is absent ...`。该用例在 `clear=True` 下运行，新路径会真的去调 herdr，因此必须注入 fake。
+**行为后果（有意）**：原生路径现在要求调用进程确实位于该 Pane 的进程树内。若有人用 `setsid`/`nohup` 等脱离 Pane 的方式运行 HTM 却仍保留 `HERDR_*`，将 fail closed 而不再"看似成功"。这是本方案要的语义：身份必须有内核证据，不能只靠环境变量。
 
-**fake 兼容性（可核验）**：`tests/test_htm.py:206` 的 `fake_herdr(*argv, **kwargs)` 支持新 keyword；`tests/test_regressions_v42.py` 的 `with_session`/`fake`/`racing`/`busy_twice`/`blocked`/`unknown` 六个 fake 均为 `*args, **kwargs` 或 `*argv, **kw` 形式，同样兼容。新增 `session=` keyword 不会破坏它们。其余 fake（`tests/test_drive.py` 与 `test_regressions_v42.py` 内更晚定义的同名 `fake`）在实现时需逐一确认。
+**`require=False` 契约保持不变**：返回 `{"workspace","lead_tab","lead_pane"}` 三键，提前返回、不解析 session、不探测、不调 herdr。
+
+**CLI 选择语义 [实测]**：`herdr --session <name>` 会**覆盖**继承的 `HERDR_SESSION` 与 `HERDR_SOCKET_PATH`（本机只读验证：`HERDR_SOCKET_PATH=/tmp/missing.sock herdr --session default pane list` 成功连到 default server；不带 `--session` 时同一变量导致 `server_not_running`）。`herdr session list --json` 则忽略两者、始终返回全局 session 表，因此适合用作"哪个 socket 属于哪个 session"的权威查询。**结论：一旦确认了 session，管理调用必须显式带 `--session`，否则 CLI 可能连到别的 server**——这正是本方案要防的误连。无法证明探测 session 与 CLI 目标 server 一致时，直接失败，不静默继续。
 
 **不要**把解析结果写回 `os.environ`：那会制造一个可被后续进程继承的伪造源。
 
@@ -94,12 +100,14 @@ def lead_identity(require=True) -> dict:
 
 | 分支 | 来源 | 取值 | 额外调用 |
 |---|---|---|---|
-| 原生 `HERDR_ENV=1`（`HERDR_*` 齐全） | `HERDR_*` 环境变量 | 恒为 `""`（空串＝交给 `herdr()` 默认解析，与现状逐字节一致） | 否：不调 `herdr session list`，不按 `HERDR_SOCKET_PATH` 反查 |
-| 派生路径（无 `HERDR_ENV`） | `pane_of_current_process()` | 命中所属 session 名，必然非空 | 已含在探测中（`herdr session list --json` 全文件仅 `scripts/htm.py:365` 一处，位于该函数内） |
+| 原生 `HERDR_ENV=1`（`HERDR_*` 齐全） | `pane_of_current_process()` 的真实归属，被 `HERDR_SESSION`/`HERDR_SOCKET_PATH` 交叉确认 | 已确认的实际 session 名，**必然非空**（默认 server 即 `default`） | 两次探测；有 `HERDR_SOCKET_PATH` 时额外一次 `session list` |
+| 派生路径（无 `HERDR_ENV`） | `pane_of_current_process()` | 命中所属 session 名，必然非空 | 两次探测（每轮内部含 `session list`） |
 
-**优先级**：本节与 §4.2 冲突时，以 §4.2 的"原生分支零变化"原则为准——原生 `HERDR_ENV=1` 分支不反查 session，`session` 恒为 `""`。旧版"有 `HERDR_SOCKET_PATH` 就反查 session 名"的写法**已废弃**，不实现。
+**路由方式**：确认后的 session 显式传给既有 `herdr(..., session=...)` 调用链，`lead_identity()["session"]` 是唯一来源。默认 session 用 `'default'` 显式锁定即可；所有默认 `herdr()` legacy 调用（未传 session）保持不改。
 
-**fail closed 规则（仅派生路径；原生分支不做任何探测，故以下规则均不适用）**：
+**旧结论作废**：原 §4.3 写"原生分支 `session` 恒为 `""`、不反查"。该写法**已废弃**，与 §4.2 的交叉检查冲突。现规则是：原生分支只要探测成功就返回已确认的 session（`default` 或其它），并由调用链显式传给 `herdr()`；这样即使 `HERDR_SOCKET_PATH` 指向别的 server，CLI 也不会连错。
+
+**fail closed 规则（两条路径共用）**：
 - `herdr session list --json` **命令本身失败**（非零退出、超时、输出不是合法 JSON）→ 直接 `raise Error`。`scripts/htm.py:314-339` 的 `process()` 已对这三类情况抛 `Error`/`HerdrError`，**不得捕获后降级为"找不到 session 所以跳过"**——那会把环境故障伪装成"无身份"，从而放行。
 - `session list` 成功但返回 0 个 running session → `raise Error`。
 - 派生路径下多 session 且出现同名 Pane → `raise Error`（冲突存在时不做猜测）。
@@ -114,7 +122,7 @@ def herdr(*args, timeout=40, session=None):
     argv = ["herdr"] + (["--session", session] if session else []) + list(args)
 ```
 
-必须用**非空真值**判断：**[实测]** `herdr --session "" pane list` → `session name cannot be empty`；`herdr --session " " pane list` → `session name may only contain ASCII letters, numbers, '.', '_' and '-'`。默认 `session=None` 时拼出的 argv 与现在逐字节相同，15 处既有调用全部不受影响。session 名以 `herdr session list --json` 返回值为准，正则 `[A-Za-z0-9._-]+` 只是把 CLI 自身规则前置成 `Error`；原生分支从不提供非空 session，因此该校验只在派生路径上触发。
+必须用**非空真值**判断：**[实测]** `herdr --session "" pane list` → `session name cannot be empty`；`herdr --session " " pane list` → `session name may only contain ASCII letters, numbers, '.', '_' and '-'`。默认 `session=None` 时拼出的 argv 与现在逐字节相同，15 处既有调用全部不受影响。session 名以 `herdr session list --json` 返回值为准，正则 `[A-Za-z0-9._-]+` 只是把 CLI 自身规则前置成 `Error`；两条路径都只传入探测确认过的非空名字。
 
 **需要透传 session 的位置**（6 个既有 `context()` 调用点之外还有间接链）：
 
@@ -131,11 +139,11 @@ def herdr(*args, timeout=40, session=None):
 
 `run_start`/`run_dispatch` 拿不到 `context()` 的返回值，因此 `current_team()`/`require_run()` 需另出返回 session 的内部变体。**不得用模块级全局变量传 session**（会跨调用泄漏）。
 
-上表"需 session=是"只表示该调用链**接受**把 `identity["session"]` 透传下去，不代表原生分支会去查 session：原生分支的 `session` 恒为 `""`，`herdr()` 收到空串即视同 `None`，拼出的 argv 与现状逐字节相同，因此透传在原生路径上是**无副作用的管道**（不新增任何 `herdr session list` 调用）。
+上表"需 session=是"表示该调用链必须把 `identity["session"]` 透传下去；两条路径都返回已确认的非空 session，因此 `herdr()` 都会显式拼 `--session`，CLI 因此不会因继承的 `HERDR_SOCKET_PATH` 连错 server。
 
 ### 4.4 阶段序列与二次校验
 
-**二次校验只适用于派生分支**（原生分支不做，见 §4.2）。序列为：
+**二次校验适用于两条路径**（原生与派生，见 §4.2）。序列为：
 
 | 阶段 | 动作 | 失败时 |
 |---|---|---|
@@ -210,7 +218,8 @@ def herdr(*args, timeout=40, session=None):
 **V4**（负例，必须与 V3 同时成立）：
 - 在非 Herdr 终端执行同一命令 → rc=2，且文案说明"进程树未唯一定位到 Herdr Pane"；
 - 单测（派生分支）：0 命中抛错、多命中抛错、两轮不一致抛错；
-- 单测（原生分支）：`HERDR_ENV=1` 且 ID 合法时**不**触发 `process-info`，且**不做**第二次探测（断言调用序列中无 `process-info`、无第二次 `pane list`）；
+- 单测（原生分支）：`HERDR_ENV=1` 且 ID 合法时**必须**执行两次真实归属探测并与三 ID 交叉核对；`HERDR_SESSION` 冲突、`HERDR_SOCKET_PATH` 指向别的 session、探测与 `HERDR_*` 不一致时均 fail closed；确认后的 session 必须以 `--session <name>` 出现在管理调用的 argv 中；`require=False` 不探测。
+- 单测（socket 解析）：0 个匹配、多个匹配、名字为空、socket 不匹配均 fail closed；`session list` 命令失败不得降级；
 - 单测：第 2 轮失败时**未产生任何副作用**（无 team 账本、无 worktree、无 Herdr 写入）。
 
 **V5** 清理：确认无未结算 Run 后 `herdr workspace close <V2 id>`。不要删除本地账本，不要触碰 `wH`/`wS`。
@@ -281,7 +290,7 @@ accept 后取对端 pid（macOS `LOCAL_PEERPID` / Linux `SO_PEERCRED`），映�
 
 ## 9. 已知限制与未验证项
 
-**已知限制**：`state_file` 只以 `workspace|lead_pane` 为键（269-271），不含 session。若两个独立 Herdr server 出现相同的 workspace+pane ID，它们会命中**同一个账本文件**；原生路径与历史账本**都不受保护**，当前无额外防护。加防护必须给账本或其 key 引入 session 维度，与 §4.3 冲突。§4.3 的 fail closed 规则只在派生路径上能提前暴露冲突。
+**已知限制**：`state_file` 只以 `workspace|lead_pane` 为键（269-271），不含 session。若两个独立 Herdr server 出现相同的 workspace+pane ID，它们会命中**同一个账本文件**；当前无跨 session 账本防护。加防护必须给账本或其 key 引入 session 维度，与 §4.3 冲突。§4.3 的交叉检查能确认"我属于哪个 session"，但不改变账本键。
 
 **未验证项**（不得当作已完成）：
 - B 未落地代码，未在真实 Happier Lead 上端到端跑通；
