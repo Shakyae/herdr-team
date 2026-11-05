@@ -6,7 +6,7 @@
 >
 > **已完成并通过独立 Reviewer 审查**：`agent_presence` 三态、证据诊断、受控 abandon、故障组与 R1 每角色预算、一次性角色槽、原子 recover-attempt、封组与闭合证明、迟到工件只留证、B1 取消状态白名单、B2 working 禁止 abandon、B3 blocked 终态保护、T17 取消 A/B 分级。
 >
-> **仅在模拟环境验证**：上述全部能力均在 mock Herdr + 注入 fake `TRUSTED_CONTROL` 下测试（370 passed / 1 skipped / 159 subtests，无 PyYAML）。这只证明守卫逻辑正确，**不证明**真实执行隔离、授权或副作用去重可用。
+> **仅在模拟环境验证**：上述全部能力均在 mock Herdr + 注入 fake `TRUSTED_CONTROL` 下测试（376 passed / 1 skipped / 159 subtests，无 PyYAML；377 passed 含 PyYAML）。这只证明守卫逻辑正确，**不证明**真实执行隔离、授权或副作用去重可用。
 >
 > **生产不可用**：`TRUSTED_CONTROL = None` 为固定值。B 类（有执行历史）Run 的 cancel、`recover-attempt`、恢复 gate 认证、`blocked_round_limit` 技术越限恢复，在真实环境全部 fail closed 并升级 Owner。A 类（从未派单）Run 的 cancel 可用。
 >
@@ -112,6 +112,8 @@
 
 - **A 类，无执行历史 Run**：同时满足 `dispatches` 为空、无 `fault_groups`、无 `recovery_authorizations`。此类允许在**不具备执行隔离证明**的情况下 cancel。
 - **B 类，有执行历史 Run**：其余一切情况（哪怕只有一个已 settled 的 dispatch，或仅存在组/授权记录）。保持原严格要求：所有执行者可信停止/隔离、副作用安全处置、身份可核验；缺证据 fail closed。
+
+两类判定前，`check_transition` 还会先施加一个状态白名单：只有 `active`、`blocked`、`blocked_round_limit`、`paused`、`recovery_active` 才允许进入 cancel 判定；`finished`/`cancelled` 走 `run_terminal`，其余任何状态（含未知值、缺失、`None`、空串）一律 `run_state_forbidden` 失败关闭且不写账本。`recovery_active` 列入白名单是因为恢复中的 Run 必须始终保留一条安全退出的路径。
 
 A 类不是「为可用性降低标准」，而是**该类别下隔离义务的对象不存在**：没有执行者，就没有需要停止或隔离的执行者，也没有需要核对身份的 Worker。这是逻辑推论，不是风险接受，也不把 idle/done 观察或调用者声明当作任何证明。
 

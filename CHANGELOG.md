@@ -26,7 +26,7 @@ Issue #2 remains **open**. This stage delivers the recovery primitives and their
 
 **Verified only against a mocked Herdr and a fake trusted control plane**
 
-Test counts: 370 passed / 1 skipped / 159 subtests without PyYAML; 371 passed / 159 subtests with it. These numbers prove the guards behave as designed. They do **not** prove real execution isolation, authorization or side-effect deduplication.
+Test counts: 376 passed / 1 skipped / 159 subtests without PyYAML; 377 passed / 159 subtests with it. These numbers prove the guards behave as designed. They do **not** prove real execution isolation, authorization or side-effect deduplication.
 
 **Not available in production**
 
