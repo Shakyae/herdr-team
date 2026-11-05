@@ -153,3 +153,28 @@ Issue #2 的生产门禁锁死（`TRUSTED_CONTROL=None` 无法 recover-attempt�
 
 收尾期间为绕开 `4d36bf75eca2` 的锁死，在 `w1A` 临时拆出 `p6` 启动独立复核
 Agent。审查结论取回后已关闭，`w1A` 恢复为 p1/p2/p3（dev-lite 团队本体）。
+
+---
+
+## 8. 合并后追加修复（PR #24）
+
+Issue #6 关闭后又经过一轮独立审查，发现并修复了一个**由 PR #21 自身引入的阻断级缺陷**：
+
+`finalize` 用 tier C（要求存活 UUID 锚点）重读账本做异步回写。一次性 Worker
+（`claude -p`，Happier 的启动形式）写完工件即退出，`finalize` 因此拒绝 Worker
+自己的合法报告，派单永久停在 `submission_uncertain`，collect / cancel / abandon
+全部不可用 —— 与 Issue #2 要消除的锁死完全同型。
+
+同源问题一并修复：`run_gate` / `run_finish`（只写账本状态、不触碰 Worker）同样
+被锚点要求卡住；`require_roles_owned` 在 `require_anchor=False` 时提前返回，跳过
+`total == 0` 的拒绝。锚点要求现在只保留给真正驱动 Worker 的 `dispatch` /
+`collect`，以及取消有执行历史的 Run。
+
+同时修复：Happier 派生分支补齐 `HERDR_SESSION` / `HERDR_SOCKET_PATH` 交叉校验；
+区分 Worker「不可观察」与「确实缺席」（前者在 C- 下不再被当作无冲突放行）。
+
+**这轮审查还有一条误判需要记下**：审查者报告 `tests/test_drive.py` 的 deadline
+测试被放宽，实际上 `git diff origin/main...HEAD -- tests/test_drive.py` 为空 ——
+该测试与 main 零差异，审查者比对的是历史中间态。独立审查不能免于核对基础事实。
+
+最终状态：main `34f40bb`，干净快照 `449 passed, 1 skipped, 175 subtests passed`。
