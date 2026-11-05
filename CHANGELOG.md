@@ -19,7 +19,7 @@ Issue #2 remains **open**. This stage delivers the recovery primitives and their
 - `run recover-attempt`: atomically retains a new attempt and its slots; never sends a prompt.
 - Fault-group closure with verifiable proof (member hashes must match collected reports, the named gate event must exist, no slot may remain unconsumed).
 - Late artifacts for historical uncertain/abandoned dispatches are retained as evidence only; they never flip status, never set report/hash and never become gate evidence.
-- B1: `cancel` accepts an explicit status whitelist (`active` / `blocked` / `blocked_round_limit` / `paused`); unknown, missing, `None` or empty statuses fail closed and leave the ledger byte-identical.
+- B1: `cancel` accepts an explicit status whitelist (`active` / `blocked` / `blocked_round_limit` / `paused` / `recovery_active`); unknown, missing, `None` or empty statuses fail closed and leave the ledger byte-identical. `recovery_active` is included so a Run under recovery always keeps a safe exit.
 - B2: `present + working` refuses abandon before the `--confirm-untracked` branch.
 - B3: a `blocked` dispatch with a valid report and `artifact_sha256` can never be collected again; the re-check inside the lock matches the one outside.
 - T17 cancel grading: a Run with no execution history (no dispatches, no fault groups, no recovery authorizations) may be cancelled without an isolation proof — the obligation has no object because no prompt was ever sent (`run_dispatch` saves the dispatch to the ledger before it sends the prompt). A Run with execution history keeps the full trusted stop/isolation requirement. Both classes record `cancel_scope` in the ledger.
