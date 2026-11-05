@@ -3656,9 +3656,13 @@ def run_pause(args, paused):
                                  "recovery_active may not be paused; pass, escalate or cancel")
             if run["status"] != "active": raise Error("Only active run can be paused")
             run["status"] = "paused"
-            event = {"at": now(), "type": "pause"}
-            if ownership == "legacy":
-                event["identity"] = "unverified"
+            # Record the identity confidence actually achieved, not just the
+            # absence of a session tag: a `verified` ledger whose Workers all
+            # contradict could otherwise pause silently and look audited.
+            verified, _total, conflicts, _unavailable = _inspect_roles(run, _session)
+            event = {"at": now(), "type": "pause",
+                     "identity": "verified" if (ownership == "verified" and verified and not conflicts)
+                     else "unverified"}
             run["events"].append(event)
         else:
             if run["status"] not in ("paused", "blocked", "blocked_round_limit"):
