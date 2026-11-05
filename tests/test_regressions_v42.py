@@ -1875,6 +1875,25 @@ class LedgerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(h.Error, '身份冲突'):
             h.require_run(self.rid, tier='C')
 
+    def test_cwd_mismatch_is_a_conflict_not_unobservable(self):
+        # Regression: contradiction detection used to be a message-substring
+        # whitelist, so a same-UUID agent living in a different checkout fell
+        # through to "unobservable" and a foreign ledger passed ownership.
+        data = self.ledger_with_uuids()
+        name = data['roles'][0]['agent_name']
+        self.live[name] = dict(self.live[name], cwd='/some/other/checkout')
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_name_mismatch_is_a_conflict_not_unobservable(self):
+        # Same hole, different message: an observed agent whose name changed is
+        # a contradiction, never an observability gap.
+        data = self.ledger_with_uuids()
+        name = data['roles'][0]['agent_name']
+        self.live[name] = dict(self.live[name], name='someone-else')
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
     def test_pause_allowed_without_identity_but_records_unverified(self):
         data = json.loads(h.run_file(self.rid).read_text())
         self.ledger_with_uuids({r['role']: '33333333-dead-beef-0000-000000000000' for r in data['roles']})

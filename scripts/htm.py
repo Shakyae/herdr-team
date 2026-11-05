@@ -335,11 +335,25 @@ def ledger_ownership(data, session, path):
     return "verified"
 
 
-# Only these verify_existing failures are contradictions about *who* the agents
-# are. Everything else (agent gone, pane lookup unavailable) is an observability
-# failure that must not be mislabelled as an ownership conflict.
-_IDENTITY_CONFLICT_MARKERS = ("identity changed", "unexpected pane", "unexpected kind",
-                              "identity or pane cannot be verified")
+# `verify_existing` raises for two very different reasons, and the difference
+# decides whether a ledger is rejected or merely tolerated:
+#
+#   AgentUnobservable -- the agent could not be looked at at all. Workers
+#                        legitimately die, so this is tolerable.
+#   Error             -- the agent WAS observed and contradicts the ledger
+#                        (identity, pane, kind, name, cwd). Never tolerable.
+#
+# A message-substring whitelist cannot make this call: every contradiction that
+# is not on the list (a name mismatch, a cwd mismatch) silently degrades into
+# "unobservable" and lets a foreign ledger through. The distinction is therefore
+# carried by the exception type raised at the observation site.
+class AgentUnobservable(Error):
+    """The agent could not be observed. Not evidence of anything."""
+
+
+# Diagnostic-only: recognises a ledger-level identity rejection when labelling a
+# `run drive` stop reason. It does NOT decide whether an action is allowed.
+_IDENTITY_STOP_MARKERS = ("身份冲突", "无法证明该账本", "属于 session")
 
 
 def _inspect_roles(data, session):
@@ -360,10 +374,12 @@ def _inspect_roles(data, session):
         try:
             if verify_existing(role, session=session):
                 verified += 1
+        except AgentUnobservable as e:
+            unavailable.append(f"Agent {role.get('agent_name')}: {e}")
         except Error as e:
-            message = str(e)
-            (conflicts if any(m in message for m in _IDENTITY_CONFLICT_MARKERS)
-             else unavailable).append(f"Agent {role.get('agent_name')}: {message}")
+            # Fail closed: anything else verify_existing raises means it looked
+            # at the agent and found a contradiction.
+            conflicts.append(f"Agent {role.get('agent_name')}: {e}")
     return verified, total, conflicts, unavailable
 
 
@@ -683,18 +699,27 @@ def pending_plan(plan):
 
 
 def verify_existing(team_role, session=None):
-    found = lookup_agent(team_role["agent_name"], session=session)
+    # `lookup_agent` swallows every Error and returns None, so an unobservable
+    # agent and a genuinely absent one arrive here identically as a falsy value.
+    # Ownership checks must not treat "could not look" as "does not match"; the
+    # caller in _inspect_roles separates the two by exception type.
+    try:
+        found = lookup_agent(team_role["agent_name"], session=session)
+    except Error as e:
+        raise AgentUnobservable(str(e)) from e
     if not found or not isinstance(found, dict):
         return False
     pane = found.get("pane")
     observed_pane = found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)
+    # Incomplete observations say nothing about WHO the agent is; a live agent
+    # contradicting the ledger does. Only the latter rejects an ownership claim.
     if not observed_pane:
-        raise Error(f"Agent {team_role['agent_name']} has no verifiable pane ID; refusing reuse")
+        raise AgentUnobservable(f"Agent {team_role['agent_name']} has no verifiable pane ID")
     if observed_pane != team_role["pane_id"]:
         raise Error(f"Agent {team_role['agent_name']} is live in unexpected pane {observed_pane}; refusing reuse")
     kind = agent_kind_of(found)
     if not kind:
-        raise Error(f"Agent {team_role['agent_name']} has no verifiable kind")
+        raise AgentUnobservable(f"Agent {team_role['agent_name']} has no verifiable kind")
     if kind != team_role["kind"]:
         raise Error(f"Agent {team_role['agent_name']} has unexpected kind {kind}")
     if "agent_session" in team_role:
@@ -3489,8 +3514,17 @@ def run_drive(args):
         except (Error, OSError, KeyError, TypeError, ValueError) as e:
             # Ledger/Worker identity failures are a distinct, actionable stop
             # reason; collapsing them into "error" hides why the driver refused.
+            # `AgentUnobservable` is the precise signal; the markers only label a
+            # ledger-level rejection. This is a diagnostic label for the stop
+            # reason and never gates access -- access decisions are made by
+            # _inspect_roles, which classifies by exception type.
             message = str(e)
-            reason = "identity" if any(m in message for m in _IDENTITY_CONFLICT_MARKERS) else "error"
+            if isinstance(e, AgentUnobservable):
+                reason = "identity_unavailable"
+            elif any(m in message for m in _IDENTITY_STOP_MARKERS):
+                reason = "identity"
+            else:
+                reason = "error"
             detail = message
         finally:
             if started:
