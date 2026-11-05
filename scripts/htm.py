@@ -351,6 +351,24 @@ class AgentUnobservable(Error):
     """The agent could not be observed. Not evidence of anything."""
 
 
+def _ownership_label(data, session):
+    """How ownership of this ledger can currently be evidenced.
+
+    Diagnostic only -- never an access decision. `upgrade` marks a ledger with no
+    session tag, which is the shape that can be reached from another session.
+    """
+    try:
+        ownership = ledger_ownership(data, session or "", None)
+    except Error:
+        return "foreign"
+    if ownership == "legacy":
+        return "legacy"
+    verified, _total, conflicts, _unavailable = _inspect_roles(data, session or "")
+    if conflicts:
+        return "conflict"
+    return "verified" if verified else "unverified"
+
+
 class LedgerIdentityError(Error):
     """The ledger itself was refused on ownership grounds.
 
@@ -1708,7 +1726,11 @@ def diagnose_dispatch(run_id, dispatch_id):
         classification = classify_diagnosis(presence, snapshot)
         git = git_evidence(rec)
         evidence = collect_evidence(run, rec, presence, snapshot, "diagnose", git)
-        return {"dispatch_id": dispatch_id, "status": rec["status"], "stage_index": rec.get("stage_index"),
+        # Tier C- does not demand a live UUID anchor, so the caller must be able
+        # to see how much proof of ownership this ledger actually carries.
+        return {"dispatch_id": dispatch_id, "status": rec["status"],
+                "ledger_session": _ownership_label(run, run.get("session")),
+                "stage_index": rec.get("stage_index"),
                 "stage_attempt": rec.get("stage_attempt", 1), "is_current": is_current(run, rec),
                 "presence": presence, "artifact": snapshot, "diagnosis": classification,
                 "evidence": evidence,
@@ -1771,6 +1793,10 @@ def run_abandon(args):
         before = {k: rec.get(k) for k in ("status", "observed_status", "error", "diagnosis")}
         rec.update({"status": "abandoned", "abandoned_at": now(), "abandon_reason": args.reason,
                     "abandon_evidence": evidence["dir"], "abandon_manifest_sha256": evidence["manifest_sha256"],
+                    # Abandon runs at tier C-, which trades a live UUID anchor for
+                    # reachability. Record what ownership evidence existed so a
+                    # `legacy`-ledger abandonment stays visible in the audit trail.
+                    "abandon_ledger_session": _ownership_label(run, run.get("session")),
                     "abandon_presence": presence, "abandon_fence_verified": False,
                     "abandon_owner_authorized": False,
                     "abandon_risk_accepted": bool(args.confirm_untracked)})
