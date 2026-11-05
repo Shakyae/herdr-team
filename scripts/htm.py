@@ -2756,7 +2756,13 @@ def require_recovery_gate_authentication(run, decision, auth, group):
 
 
 def is_decided_member(rec):
-    """A settled record, or a blocked record with a valid bound report."""
+    """A settled record, or a blocked record with a valid bound report.
+
+    "Decided" means the record needs no further collection. It does NOT mean
+    the stage may advance: a blocked record is a business negative even when
+    its report is valid, so gate pass/revise and finish must still refuse it.
+    Only a recorded revise turns it into a new attempt.
+    """
     return rec.get("status") == "settled" or (rec.get("status") == "blocked" and has_valid_report(rec))
 
 
@@ -2882,12 +2888,16 @@ def run_gate(args):
                                  "cannot be converted into a business revise")
             if run["round"] + 1 > run["settings"]["orchestration"]["max_rounds"]:
                 run["pending_round_limit"] = {"kind": "business", "source": "recovery-revise"}
-        # Only the CURRENT attempt matters. Historical blocked/abandoned
-        # dispatches are decided records and never positive evidence either.
+        # Only the CURRENT attempt matters. Abandoned dispatches are decided
+        # records and never positive evidence; a blocked one is a business
+        # negative that `revise` (not `pass`) is meant to consume, so it stays
+        # out of this "still open?" predicate. `pass` over a blocked member is
+        # refused by the complete/pass check below, with a message that names
+        # the actual reason instead of calling it unresolved.
         if args.decision in ("pass", "revise"):
             pending = [x for x in run["dispatches"] if x["stage_index"] == run["stage_index"] and
                        x.get("stage_attempt", 1) == run["stage_attempt"] and
-                       not is_decided_member(x)]
+                       x["status"] not in ("settled", "blocked", "abandoned")]
             if pending:
                 raise Error(f"Cannot {args.decision} stage with unresolved/blocked dispatches: {[x['id'] for x in pending]}")
         good = None
@@ -2922,8 +2932,13 @@ def run_gate(args):
                     if rec.get("status") != "settled" or report.get("status") != "complete" \
                             or report.get("verdict") != "pass":
                         raise Error(f"Required role {role_name} has no complete/pass recovery report")
-                elif report.get("verdict") != "pass":
-                    raise Error(f"Latest remediation/worker artifact for {role_name} is not pass")
+                elif rec.get("status") != "settled" or report.get("status") != "complete" \
+                        or report.get("verdict") != "pass":
+                    # A `blocked` record carrying a pass verdict is still a
+                    # business negative: status, report status and verdict must
+                    # ALL be affirmative before it can back a stage pass.
+                    raise Error(f"Latest remediation/worker artifact for {role_name} is not a "
+                                f"settled complete/pass result")
                 _report, digest = read_result(run, rec)
                 if digest != rec.get("artifact_sha256"):
                     raise Error(f"Worker artifact for {role_name} changed after collection")
@@ -3265,11 +3280,22 @@ def run_finish(args):
             raise Error(f"Cannot finish; next required stage is {stage_info(run)['stage']}")
         # Attempt-scoped: at the finish sentinel `stage_index` is len(stages),
         # so this predicate matches nothing and cannot be the last line of
-        # defence. Gate transitions must have refused unresolved current work;
-        # historical blocked/abandoned are decided records, not blockers.
+        # defence. Gate transitions must have refused unresolved current work.
+        # A historical `blocked` is NOT a decided record that finish may walk
+        # past: it is an unresolved business negative, so it blocks finishing
+        # just like an unresolved historical dispatch does below.
         if pending_dispatches(run, UNRESOLVED + ("blocked",)):
             raise GuardError("dispatch_unresolved", "current attempt still has unresolved work")
-        unresolved_history = [d["id"] for d in run["dispatches"] if d["status"] in UNRESOLVED]
+        # Design case 32: a blocked record is consumed once its stage goes on
+        # to pass in a later attempt — then it is history and the Run finishes.
+        # A blocked record whose stage never passed afterwards is the last word
+        # on that stage: an unresolved business negative that finish must not
+        # walk past.
+        passed_stages = {e.get("stage_index") for e in run["events"]
+                         if e.get("type") == "gate" and e.get("decision") == "pass"}
+        unresolved_history = [d["id"] for d in run["dispatches"]
+                              if d["status"] in UNRESOLVED or
+                              (d["status"] == "blocked" and d.get("stage_index") not in passed_stages)]
         if unresolved_history:
             raise GuardError("history_unresolved",
                              f"unresolved historical dispatches: {unresolved_history}")
