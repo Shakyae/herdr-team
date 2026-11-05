@@ -392,6 +392,31 @@ class DerivedPaneContextTests(unittest.TestCase):
             h.herdr('pane', 'list', session='default')
             process.assert_called_once_with(['herdr', '--session', 'default', 'pane', 'list'], timeout=40)
 
+    def test_derived_branch_cross_checks_an_inherited_session(self):
+        # Happier's claude keeps HERDR_SESSION / HERDR_SOCKET_PATH. The derived
+        # branch used to ignore them entirely, so it applied a weaker rule than
+        # the native branch to exactly the values an attacker can inherit or
+        # forge. Disagreement with the kernel evidence must reject.
+        identity = {'session': 'inner', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {'HERDR_SESSION': 'outer'}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity):
+            with self.assertRaisesRegex(h.Error, '进程归属 session 与环境不一致'):
+                h.lead_identity()
+
+    def test_derived_branch_accepts_a_matching_inherited_session(self):
+        identity = {'session': 'inner', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {'HERDR_SESSION': 'inner'}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity):
+            self.assertEqual(h.lead_identity()['session'], 'inner')
+
+    def test_derived_branch_rejects_a_foreign_socket(self):
+        identity = {'session': 'inner', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {'HERDR_SOCKET_PATH': '/tmp/outer.sock'}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity), \
+                patch.object(h, 'socket_session', return_value='outer'):
+            with self.assertRaisesRegex(h.Error, 'Herdr socket 与进程归属不一致'):
+                h.lead_identity()
+
     def test_context_double_probe_and_no_environment_write(self):
         identity = {'session': 'default', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
         with patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', return_value=identity) as probe:

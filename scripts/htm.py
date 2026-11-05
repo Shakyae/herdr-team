@@ -264,7 +264,19 @@ def lead_identity(require=True):
         first = pane_of_current_process()
         if first != pane_of_current_process():
             raise Error("Herdr pane 身份不唯一，拒绝猜测（两次探测不一致）")
-        return {"context": {"workspace": first["workspace"], "lead_pane": first["pane"], "lead_tab": first["tab"]}, "session": first["session"]}
+        session = first["session"]
+        # The same rule the native branch applies: an inherited HERDR_* value is
+        # weak evidence, but a CONTRADICTION between it and the kernel evidence
+        # is meaningful. Happier's claude keeps both variables, so discarding
+        # them here throws away the only cross-check available. Absent or blank
+        # values are fine -- only disagreement rejects.
+        env_session = os.environ.get("HERDR_SESSION", "")
+        if env_session and env_session != session:
+            raise Error(f"Herdr 进程归属 session 与环境不一致: {env_session!r} != {session!r}")
+        socket = os.environ.get("HERDR_SOCKET_PATH", "")
+        if socket and socket_session(socket) != session:
+            raise Error(f"Herdr socket 与进程归属不一致: {socket!r} != {session!r}")
+        return {"context": {"workspace": first["workspace"], "lead_pane": first["pane"], "lead_tab": first["tab"]}, "session": session}
     if require and os.environ.get("HERDR_ENV") != "1":
         raise Error("Must run inside Herdr: HERDR_ENV=1")
     ws = os.environ.get("HERDR_WORKSPACE_ID", "")
