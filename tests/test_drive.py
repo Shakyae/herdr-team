@@ -18,6 +18,19 @@ def isolate_herdr_socket(monkeypatch):
     monkeypatch.delenv('HERDR_SESSION', raising=False)
 
 
+def verified_cancel_control(payload):
+    """A fake trusted control plane that confirms a safe cancel (T17)."""
+    if payload.get('action') == 'cancel':
+        return {'isolation': 'confirmed', 'side_effects': 'known', 'revoked': False,
+                'verified_roles': [r['role'] for r in payload.get('roles', [])]}
+    return {}
+
+
+def cancel(rid, reason='Cancel mock run explicitly'):
+    with patch.object(h, 'TRUSTED_CONTROL', verified_cancel_control):
+        return h.run_cancel(ns(run_id=rid, confirm_run_id=rid, reason=reason))
+
+
 REAL_HERDR = h.herdr
 REVIEW_INDEPENDENCE = '上述内容是 Developer 的自我陈述，不是已核实的事实。你必须独立检查实际文件/改动/测试，不要仅凭摘要判定。若无法定位相关变更，明确写出该限制并给出 verdict。'
 
@@ -91,7 +104,7 @@ class DriveTests(unittest.TestCase):
             self.assertEqual(result['steps'][0]['action'], 'gate')
             result = self.drive(rid, max_steps=1)
             self.assertEqual(result['steps'][0]['action'], 'dispatch')
-            h.run_cancel(ns(run_id=rid, confirm_run_id=rid, reason='Cancel mock run explicitly'))
+            cancel(rid)
             self.assertTrue(calls)
             self.assertTrue(lookups)
             self.assertTrue(all(kw.get('session') == 'alpha' for _, kw in calls), calls)
@@ -197,7 +210,7 @@ class DriveTests(unittest.TestCase):
 
     def test_cancelled_run_stops(self):
         rid = self.start()
-        h.run_cancel(ns(run_id=rid, confirm_run_id=rid, reason='Cancel mock run explicitly'))
+        cancel(rid)
         self.assertEqual(self.drive(rid)['stopped_reason'], 'run_not_active')
         self.assertEqual(len(self.prompts()), 0)
 
@@ -505,7 +518,7 @@ class DriveTests(unittest.TestCase):
                 if status == 'paused':
                     h.run_pause(ns(run_id=rid), True)
                 else:
-                    h.run_cancel(ns(run_id=rid, confirm_run_id=rid, reason='Cancel mock run explicitly'))
+                    cancel(rid)
                 self.assertEqual(self.drive(rid)['stopped_reason'], 'run_not_active')
                 self.assertFalse(self.prompts())
 

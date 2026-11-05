@@ -398,7 +398,10 @@ def require_target_role(data, session, role_name, path):
     """
     role = next((r for r in data.get("roles", []) if r.get("role") == role_name), None)
     if role is None:
-        raise Error(f"Unknown worker role {role_name} in ledger {path}")
+        # An unknown role is a caller error with its own established message
+        # (get_role). Identity checking has nothing to add: a role that is not
+        # in the ledger cannot be dispatched anyway.
+        return None
     if not (role.get("agent_session") or {}).get("value"):
         raise Error(f"账本 {path} 的角色 {role_name} 未记录 Worker 身份；无法验证目标 Worker，拒绝执行")
     if not verify_existing(role, session=session):
@@ -707,6 +710,64 @@ def verify_existing(team_role, session=None):
     if team_role["kind"] == "hermes" and found.get("profile") and found["profile"] != team_role["profile"]:
         raise Error("Hermes profile mismatch")
     return True
+
+
+def agent_presence(role):
+    """Three-state observation of a bound Worker. Never proof that it stopped.
+
+    Rules (design §3): confirmed_absent requires BOTH `agent get` returning
+    error.code == agent_not_found AND `pane get` on the bound pane returning
+    error.code == pane_not_found. Exit codes are never consulted. Timeouts,
+    unknown codes, unparseable data and identity drift are all `unavailable`.
+    """
+    code = None
+    try:
+        found = herdr("agent", "get", role["agent_name"])
+    except HerdrError as e:
+        code = e.code
+        if code != "agent_not_found":
+            return {"state": "unavailable", "code": code or "agent_error", "detail": str(e)[:300]}
+        found = None
+    except Error as e:
+        return {"state": "unavailable", "code": "herdr_unavailable", "detail": str(e)[:300]}
+    if found is not None:
+        found = agent_data(found)
+        if not isinstance(found, dict):
+            return {"state": "unavailable", "code": "invalid_agent_data", "detail": "agent get returned no mapping"}
+        pane = found.get("pane")
+        observed_pane = found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)
+        session = found.get("agent_session")
+        expected = role.get("agent_session") or {}
+        same_session = isinstance(session, dict) and all(
+            isinstance(expected.get(k), str) and expected.get(k).strip() and session.get(k) == expected.get(k)
+            for k in ("kind", "source", "value"))
+        reasons = []
+        if not observed_pane or observed_pane != role["pane_id"]:
+            reasons.append("pane")
+        if agent_kind_of(found) != role["kind"]:
+            reasons.append("kind")
+        if not same_session:
+            reasons.append("session")
+        if found.get("name") and found["name"] != role["agent_name"]:
+            reasons.append("name")
+        if found.get("cwd") and str(Path(found["cwd"]).resolve()) != str(Path(role["cwd"]).resolve()):
+            reasons.append("cwd")
+        if role["kind"] == "hermes" and found.get("profile") and found["profile"] != role.get("profile"):
+            reasons.append("profile")
+        if reasons:
+            return {"state": "unavailable", "code": "identity_mismatch",
+                    "detail": "bound identity does not match: " + ",".join(reasons)}
+        return {"state": "present", "code": None, "status": agent_status_of(found)}
+    # agent_not_found: only a matching pane_not_found proves absence.
+    try:
+        herdr("pane", "get", role["pane_id"])
+    except HerdrError as e:
+        if e.code == "pane_not_found":
+            return {"state": "confirmed_absent", "code": "agent_not_found"}
+        return {"state": "unavailable", "code": e.code or "pane_error", "detail": str(e)[:300]}
+    except Error as e:
+        return {"state": "unavailable", "code": "herdr_unavailable", "detail": str(e)[:300]}
+    return {"state": "unavailable", "code": "pane_exists", "detail": "bound pane still exists"}
 
 
 def profile_check(name):
@@ -1314,14 +1375,21 @@ def reconcile_result(run, rec, observed_status):
     """Fail closed on unknown status or missing/invalid report."""
     data = {"observed_status": observed_status, "collected_at": now()}
     if observed_status not in ("idle", "done", "blocked"):
+        # Unknown/unclassifiable observation: never settles, even with a valid report.
         data["status"] = "uncertain"
         data["error"] = f"Unexpected agent status: {observed_status}"
         return data
     try:
         report, digest = read_result(run, rec)
     except Error as e:
-        data["status"] = "uncertain" if observed_status != "blocked" else "blocked"
+        # An observed blocked with no valid business report is NOT a business
+        # blocked result: it is unresolved. Storing `blocked` here was the
+        # permanent lock described in Issue #2 (neither abandonable nor
+        # gateable). Keep the observation, classify as uncertain.
+        data["status"] = "uncertain"
         data["error"] = str(e)
+        if observed_status == "blocked":
+            data["diagnosis"] = "blocked_without_valid_report"
         return data
     data.update({"status": "blocked" if observed_status == "blocked" or report["status"] == "blocked" else "settled",
                  "report": report, "artifact_sha256": digest, "result_file": str(result_path(run["id"], rec["id"]))})
@@ -1329,13 +1397,1244 @@ def reconcile_result(run, rec, observed_status):
     return data
 
 
+# --- Issue #2: evidence retention, diagnosis, controlled abandon -------------
+#
+# First release scope: only the `active` Run state is covered. Every path that
+# needs an external trusted execution-fence receipt, independent Owner
+# authorization or a human authentication service is NOT implemented and fails
+# closed with a stable reason code (see REASON_CODES / check_transition).
+
+REASON_CODES = (
+    "run_terminal", "stale_snapshot", "run_state_forbidden", "history_unresolved",
+    "fault_group_open", "dispatch_unresolved", "recovery_authorization_invalid",
+    "recovery_budget_exhausted", "identity_mismatch", "execution_not_fenced",
+    "side_effects_unknown", "approval_required", "artifact_invalid",
+    "parallel_limit", "policy_forbidden",
+)
+UNRESOLVED = ("submission_uncertain", "submitted_unsettled", "uncertain")
+DECIDED = ("settled", "blocked", "abandoned")
+STATUS_HINTS = {
+    "run_terminal": "Run is already finished/cancelled; inspect only",
+    "stale_snapshot": "Ledger changed; re-read and re-run the same command",
+    "run_state_forbidden": "This operation is not allowed in the current Run status",
+    "history_unresolved": "A historical attempt is unresolved; diagnose it before finishing",
+    "fault_group_open": "A recovery fault group is open; resolve it as a whole",
+    "dispatch_unresolved": "A dispatch for the current attempt is unresolved",
+    "recovery_authorization_invalid": "No valid recovery authorization (first release: never issued)",
+    "recovery_budget_exhausted": "Recovery budget is exhausted; escalate to the Owner",
+    "identity_mismatch": "Worker identity no longer matches the ledger binding",
+    "execution_not_fenced": "No trusted stop/isolation receipt; escalate (first release: unsupported)",
+    "side_effects_unknown": "Side effects or idempotency cannot be proven; escalate",
+    "approval_required": "Independent Owner approval is required (first release: disabled)",
+    "artifact_invalid": "Artifact identity, hash or verdict does not satisfy the gate",
+    "parallel_limit": "max_parallel reached; collect pending dispatches first",
+    "policy_forbidden": "Policy/effect/confirmation check failed",
+}
+
+
+class GuardError(Error):
+    """Stable, machine-readable refusal. Not a success and never a retry hint."""
+
+    def __init__(self, code, detail=""):
+        if code not in REASON_CODES:
+            raise AssertionError(f"unknown reason code {code}")
+        self.code = code
+        self.detail = detail
+        super().__init__(f"[{code}] {detail or STATUS_HINTS[code]}")
+
+
+def is_current(run, rec):
+    return (rec.get("stage_index") == run.get("stage_index") and
+            rec.get("stage_attempt", 1) == run.get("stage_attempt", 1))
+
+
+def pending_dispatches(run, statuses=UNRESOLVED):
+    """Current-attempt dispatches only. Historical ones are decided records."""
+    return [d for d in run.get("dispatches", []) if is_current(run, d) and d.get("status") in statuses]
+
+
+def check_transition(run, operation, rec=None, allow_history=False):
+    """Shared pre-check used by every write entry point.
+
+    Returns normally when the operation may proceed; raises GuardError with a
+    stable reason code otherwise. Read-only commands call the same function and
+    catch GuardError to report a diagnosis, never to obtain write permission.
+
+    Deliberately conservative: anything requiring an external fence, an
+    independent authorization or a human attestation is refused here so that no
+    entry point can accidentally bypass it.
+    """
+    if run.get("status") in ("finished", "cancelled"):
+        raise GuardError("run_terminal")
+    if operation == "cancel" and run.get("status") not in (
+            "active", "blocked", "blocked_round_limit", "paused", "recovery_active"):
+        raise GuardError("run_state_forbidden",
+                         f"Run status {run.get('status')!r} cannot be cancelled")
+    if operation == "recover-attempt":
+        # T7: only an active Run, or a blocked_round_limit Run whose technical
+        # over-limit is externally verifiable (it is not in this release), may
+        # enter recovery. recovery_active may not open a second chain.
+        if run.get("status") not in ("active", "blocked_round_limit"):
+            raise GuardError("run_state_forbidden",
+                             f"Run status {run.get('status')!r} cannot enter recovery")
+    elif operation not in ("diagnose", "list", "recover", "cancel"):
+        # `cancel` is the designed escape hatch for EVERY non-terminal Run
+        # (design T17). Without this exemption, blocked / paused /
+        # blocked_round_limit Runs cannot be closed at all — exactly the
+        # lock-up Issue #2 exists to remove. run_cancel still enforces its own
+        # unresolved-dispatch and Worker identity/fencing checks, so safety is
+        # not weakened here.
+        if run.get("status") not in ("active", "recovery_active"):
+            raise GuardError("run_state_forbidden",
+                             f"Run status {run.get('status')}; this operation requires an active Run")
+    if rec is not None:
+        if operation == "abandon" and not is_current(run, rec):
+            raise GuardError("history_unresolved",
+                             "historical dispatches are decided records; diagnose and escalate, "
+                             "never re-abandon")
+        if not allow_history and not is_current(run, rec):
+            raise GuardError("stale_snapshot",
+                             f"dispatch {rec.get('id')} belongs to stage {rec.get('stage_index')}"
+                             f"/attempt {rec.get('stage_attempt', 1)}, not the current attempt")
+
+
+def result_snapshot(run, rec):
+    """Describe the bound artifact without trusting it. Never follows symlinks."""
+    path = result_path(run["id"], rec["id"])
+    info = {"path": str(path), "exists": False, "kind": None, "size": None,
+            "sha256": None, "parsed": False, "identity": None, "error": None,
+            "valid": False, "verdict": None, "report_status": None}
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        info["error"] = "missing"
+        return info
+    except OSError as e:
+        info["error"] = f"lstat failed: {e}"
+        return info
+    info["exists"] = True
+    info["size"] = st.st_size
+    if stat.S_ISLNK(st.st_mode):
+        info["kind"] = "symlink"
+        info["error"] = "symlink is not followed"
+        return info
+    if not stat.S_ISREG(st.st_mode):
+        info["kind"] = "special"
+        info["error"] = "not a regular file"
+        return info
+    info["kind"] = "regular"
+    try:
+        content = path.read_bytes()
+    except OSError as e:
+        info["error"] = f"unreadable: {e}"
+        return info
+    info["sha256"] = hashlib.sha256(content).hexdigest()
+    if st.st_size > 1024 * 1024:
+        info["error"] = "larger than 1 MiB"
+        return info
+    try:
+        doc = json.loads(content)
+    except ValueError as e:
+        info["error"] = f"invalid JSON: {e}"
+        return info
+    info["parsed"] = True
+    if isinstance(doc, dict):
+        info["identity"] = {k: doc.get(k) for k in
+                            ("run_id", "dispatch_id", "role", "stage", "stage_attempt", "status", "verdict")}
+    try:
+        report, digest = read_result(run, rec)
+    except Error as e:
+        info["error"] = str(e)
+        return info
+    info.update({"valid": True, "verdict": report.get("verdict"), "report_status": report.get("status"),
+                 "sha256": digest, "error": None})
+    return info
+
+
+def classify_diagnosis(presence, snapshot):
+    """Four-way diagnosis from observable evidence only (design §5.1).
+
+    No trusted execution receipt exists in this release, so `completed_report_lost`
+    and `not_executed` can never be asserted: a missing artifact next to an
+    absent OR present Worker, and a corrupt artifact next to a present Worker,
+    all remain `undetermined`. Guessing would let an unverifiable observation
+    become recovery evidence.
+    """
+    if snapshot.get("valid"):
+        return "report_present"
+    return "undetermined"
+
+
+def collect_evidence(run, rec, presence, snapshot, trigger, git_summary=None):
+    """Persist an immutable evidence snapshot. Original artifact is never moved."""
+    root = STATE / "evidence" / run["id"] / rec["id"]
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    snapshot_id = now().replace(":", "").replace("-", "")[:15] + "-" + uuid.uuid4().hex[:6]
+    dest = root / snapshot_id
+    dest.mkdir(mode=0o700)  # exclusive: never reuses an existing evidence directory
+    artifact_copy = None
+    if snapshot.get("exists") and snapshot.get("kind") == "regular":
+        src = result_path(run["id"], rec["id"])
+        try:
+            with open(src, "rb") as f:
+                raw = f.read()
+            artifact_copy = dest / "artifact.raw"
+            fd = os.open(artifact_copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+                f.flush(); os.fsync(f.fileno())
+            if hashlib.sha256(artifact_copy.read_bytes()).hexdigest() != hashlib.sha256(raw).hexdigest():
+                raise Error("evidence copy failed digest re-read")
+        except (OSError, Error) as e:
+            artifact_copy = None
+            snapshot = dict(snapshot, copy_error=str(e))
+    manifest = {
+        "run_id": run["id"], "dispatch_id": rec["id"], "snapshot_id": snapshot_id,
+        "captured_at": now(), "trigger": trigger,
+        "role": rec.get("role"), "stage_index": rec.get("stage_index"),
+        "stage_attempt": rec.get("stage_attempt", 1), "dispatch_status": rec.get("status"),
+        "prompt": rec.get("prompt"),
+        "presence": presence, "artifact": snapshot, "artifact_copy": str(artifact_copy) if artifact_copy else None,
+        "git": git_summary,
+        "limits": "First release: no trusted execution fence, no independent Owner authorization, "
+                  "no human authentication service. Evidence proves what was observed, not that work stopped.",
+    }
+    fd = os.open(dest / "manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        f.flush(); os.fsync(f.fileno())
+    return {"snapshot_id": snapshot_id, "dir": str(dest),
+            "manifest_sha256": hashlib.sha256((dest / "manifest.json").read_bytes()).hexdigest(),
+            "artifact_copy": str(artifact_copy) if artifact_copy else None}
+
+
+def git_evidence(rec):
+    """Read-only diff summary for the bound worktree. Never resets or cleans."""
+    cwd = rec.get("worktree") or rec.get("cwd")
+    if not cwd or not Path(cwd).is_dir():
+        return {"available": False, "reason": "worktree/cwd unknown or missing"}
+    result = {}
+    for name, argv in (("head", ["rev-parse", "HEAD"]),
+                       ("status", ["status", "--porcelain"]),
+                       ("diffstat", ["diff", "--stat"])):
+        try:
+            out = process(["git", "-C", str(cwd), *argv], raw=True, env=clean_git_env(), timeout=20)
+        except Error as e:
+            result[name] = f"unavailable: {e}"
+            continue
+        result[name] = out[-4000:]
+    return {"available": True, "cwd": str(cwd), **result}
+
+
+def diagnose_dispatch(run_id, dispatch_id):
+    """Read-only: classify one unresolved dispatch and record evidence."""
+    with locked():
+        run = require_run(run_id)
+        rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == dispatch_id), None)
+        if rec is None:
+            raise Error("Unknown dispatch ID")
+        check_transition(run, "diagnose", rec, allow_history=True)
+        role = get_role(run, rec["role"])
+        presence = agent_presence(role)
+        snapshot = result_snapshot(run, rec)
+        classification = classify_diagnosis(presence, snapshot)
+        git = git_evidence(rec)
+        evidence = collect_evidence(run, rec, presence, snapshot, "diagnose", git)
+        return {"dispatch_id": dispatch_id, "status": rec["status"], "stage_index": rec.get("stage_index"),
+                "stage_attempt": rec.get("stage_attempt", 1), "is_current": is_current(run, rec),
+                "presence": presence, "artifact": snapshot, "diagnosis": classification,
+                "evidence": evidence,
+                "note": "Read-only diagnosis: no ledger state changed. Trusted fence and owner "
+                        "authorization are unavailable in this release."}
+
+
+def validate_abandon_target(run, rec, quarantine_invalid):
+    """Return (presence, snapshot) or raise GuardError. Caller holds the lock."""
+    if not is_current(run, rec):
+        raise GuardError("history_unresolved",
+                         "historical dispatches are decided records; run diagnose and escalate")
+    if rec.get("status") not in UNRESOLVED:
+        raise GuardError("dispatch_unresolved", f"dispatch is already {rec.get('status')}")
+    snapshot = result_snapshot(run, rec)
+    if snapshot.get("valid"):
+        raise GuardError("artifact_invalid",
+                         "a valid identity-bound report exists; collect and gate it instead of abandoning")
+    if snapshot.get("exists") and snapshot.get("kind") == "regular":
+        if not quarantine_invalid:
+            raise GuardError("artifact_invalid",
+                             "invalid artifact present; pass --quarantine-invalid to retain bytes and abandon")
+    elif snapshot.get("exists"):
+        raise GuardError("artifact_invalid",
+                         f"artifact is a {snapshot.get('kind')}; special files and symlinks fail closed")
+    return snapshot
+
+
+def run_abandon(args):
+    """Explicit irreversible abandonment of ONE unresolved dispatch's result.
+
+    Requires a prior `run diagnose` snapshot (`--evidence`). Refuses whenever a
+    valid report exists. Does not dispatch, approve or claim success.
+    """
+    with locked():
+        run = require_run(args.run_id)
+        rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
+        if rec is None:
+            raise Error("Unknown dispatch ID")
+        check_transition(run, "abandon", rec)
+        if len(args.reason.strip()) < 12:
+            raise GuardError("policy_forbidden", "abandon requires a specific --reason (12+ chars)")
+        role = get_role(run, rec["role"])
+        presence = agent_presence(role)
+        snapshot = validate_abandon_target(run, rec, args.quarantine_invalid)
+        evidence_dir = STATE / "evidence" / run["id"] / rec["id"] / args.evidence
+        if not (evidence_dir / "manifest.json").is_file():
+            raise GuardError("policy_forbidden", f"unknown evidence snapshot {args.evidence!r}")
+        if presence["state"] == "present" and presence.get("status") == "working":
+            raise GuardError("execution_not_fenced", "Worker is present and working; cannot abandon while it is working")
+        if presence["state"] != "confirmed_absent" and not args.confirm_untracked:
+            raise GuardError("execution_not_fenced",
+                             "Worker presence is not proven absent; trusted execution isolation is "
+                             "unavailable in this release. Pass --confirm-untracked to record an "
+                             "explicit, audited risk acceptance — the ledger will mark it as such")
+        evidence = collect_evidence(run, rec, presence, snapshot, "abandon", git_evidence(rec))
+        before = {k: rec.get(k) for k in ("status", "observed_status", "error", "diagnosis")}
+        rec.update({"status": "abandoned", "abandoned_at": now(), "abandon_reason": args.reason,
+                    "abandon_evidence": evidence["dir"], "abandon_manifest_sha256": evidence["manifest_sha256"],
+                    "abandon_presence": presence, "abandon_fence_verified": False,
+                    "abandon_owner_authorized": False,
+                    "abandon_risk_accepted": bool(args.confirm_untracked)})
+        run["events"].append({
+            "at": now(), "type": "abandon", "dispatch_id": rec["id"], "stage": run["stages"][rec["stage_index"]],
+            "stage_index": rec["stage_index"], "stage_attempt": rec.get("stage_attempt", 1),
+            "operator": _local_operator(), "reason": args.reason,
+            "evidence_dir": evidence["dir"], "manifest_sha256": evidence["manifest_sha256"],
+            "presence": presence, "observed_status": rec.get("observed_status"),
+            "artifact": snapshot, "before": before,
+            "fence_verified": False, "owner_authorized": False,
+            "risk_accepted": bool(args.confirm_untracked),
+            "note": "Result eligibility terminated. Not a success and not proof the Worker stopped.",
+        })
+        save(run_file(args.run_id), run)
+    return {"dispatch_id": rec["id"], "status": "abandoned", "stage_index": rec["stage_index"],
+            "stage_attempt": rec.get("stage_attempt", 1), "evidence": evidence,
+            "recovery_authorization": "unavailable",
+            "next": "Redispatch requires an independent recovery authorization (not implemented in "
+                    "this release). Escalate to the Owner; do not re-send blindly.",
+            "warning": "abandoned is final for this dispatch and is not positive evidence"}
+
+
+def _run_diagnose(args):
+    return diagnose_dispatch(args.run_id, args.dispatch_id)
+
+
+def _local_operator():
+    """Best-effort local operator label. NOT a verified identity."""
+    try:
+        return {"source": "local_process", "user": getpass.getuser()}
+    except Exception:  # noqa: BLE001 - operator label must never break the command
+        return {"source": "local_process", "user": None}
+
+
+def abandoned_predecessors(run):
+    """Abandoned dispatches in the CURRENT stage_attempt — the reason a plain
+    redispatch must not silently consume the remaining retry slot."""
+    return [d for d in run["dispatches"] if is_current(run, d) and d.get("status") == "abandoned"]
+
+
+# --- Issue #2 M2: fault groups, per-role budgets, recovery authorization ------
+#
+# Scope of this release: fault groups, the R1 per-logical-root role budget, the
+# one-shot recovery authorization with per-role slots, and the restricted
+# recovery_active transitions. Every path that needs an external trusted
+# execution control plane stays unavailable in production: TRUSTED_CONTROL is
+# None here and only an isolated test may install a fake. CLI flags, local
+# JSON, booleans or risk declarations are never accepted as trusted proof, and
+# an abandon risk acceptance is never a recovery credential.
+
+
+TRUSTED_CONTROL = None  # Production stays None: no verified stop/isolation exists.
+RECOVERY_ACTIONS = ("recover-attempt", "recovery-dispatch", "recovery-gate")
+
+
+def trusted_control():
+    """Return the isolated test control plane, or fail closed.
+
+    There is no trusted execution control plane in production, so Worker
+    identity, isolation and side-effect receipts cannot be verified. Only an
+    isolated test replaces this hook with a fake; a fake proves the guards run,
+    not that real isolation exists.
+    """
+    if not callable(TRUSTED_CONTROL):
+        raise GuardError("execution_not_fenced",
+                         "no trusted execution control plane: stop/isolation, identity and "
+                         "side-effect receipts cannot be verified; automatic recovery is unavailable")
+    return TRUSTED_CONTROL
+
+
+def has_valid_report(rec):
+    return bool(rec.get("report")) and bool(rec.get("artifact_sha256"))
+
+
+def role_identity(role):
+    """The identity pins that a recovery attempt must re-verify for a role."""
+    session = role.get("agent_session") if isinstance(role, dict) else None
+    pins = {"agent_name": role.get("agent_name") if isinstance(role, dict) else None,
+            "pane_id": role.get("pane_id") if isinstance(role, dict) else None,
+            "kind": role.get("kind") if isinstance(role, dict) else None,
+            "cwd": role.get("cwd") if isinstance(role, dict) else None,
+            "agent_session": session if isinstance(session, dict) else None}
+    return pins
+
+
+def live_identity_problems(role):
+    """Strict observation of the LIVE Agent. The ledger echo is never proof.
+
+    Recovery authorization and slot use must verify the actual Agent: a
+    non-empty name, pane/kind, all three session fields, a resolvable cwd and
+    (for Hermes) a matching profile. Missing or drifted fields fail closed.
+    """
+    try:
+        found = agent_data(herdr("agent", "get", role["agent_name"]))
+    except HerdrError as e:
+        return [f"agent get failed: {e.code or 'error'}"]
+    except Error as e:
+        return [f"herdr unavailable: {e}"]
+    if not isinstance(found, dict):
+        return ["agent get returned no mapping"]
+    problems = []
+    if not isinstance(found.get("name"), str) or not found["name"].strip() \
+            or found["name"] != role["agent_name"]:
+        problems.append("name")
+    pane = found.get("pane")
+    observed_pane = found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)
+    if not observed_pane or observed_pane != role["pane_id"]:
+        problems.append("pane")
+    if not agent_kind_of(found) or agent_kind_of(found) != role["kind"]:
+        problems.append("kind")
+    session = found.get("agent_session")
+    expected = role.get("agent_session") or {}
+    if not (isinstance(session, dict) and all(
+            isinstance(expected.get(k), str) and expected[k].strip()
+            and session.get(k) == expected[k] for k in ("kind", "source", "value"))):
+        problems.append("session")
+    cwd = found.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        problems.append("cwd_missing")
+    else:
+        try:
+            if str(Path(cwd).resolve()) != str(Path(role.get("cwd") or "").resolve()):
+                problems.append("cwd")
+        except (OSError, RuntimeError):
+            problems.append("cwd_unresolvable")
+    if role.get("kind") == "hermes":
+        profile = found.get("profile")
+        if not isinstance(profile, str) or not profile.strip() or profile != (role.get("profile") or ""):
+            problems.append("profile")
+    return problems
+
+
+def require_live_identity(run, role_name):
+    """Raise identity_mismatch unless the live Agent matches its binding."""
+    role = get_role(run, role_name)
+    if not identity_pins_complete(role):
+        raise GuardError("identity_mismatch",
+                         f"role {role_name} has incomplete identity pins in the ledger")
+    problems = live_identity_problems(role)
+    if problems:
+        raise GuardError("identity_mismatch",
+                         f"role {role_name} live identity does not match: {','.join(problems)}")
+    return role
+
+
+def identity_pins_complete(role):
+    pins = role_identity(role)
+    if not all(isinstance(pins[k], str) and pins[k].strip()
+               for k in ("agent_name", "pane_id", "kind", "cwd")):
+        return False
+    session = pins["agent_session"]
+    return bool(isinstance(session, dict) and
+                all(isinstance(session.get(k), str) and session[k].strip()
+                    for k in ("kind", "source", "value")))
+
+
+def logical_root(run):
+    """Attempt number at which the CURRENT logical root started.
+
+    Derived from real recovery evidence, not from a field any writer could
+    leave stale: an attempt created by `recover-attempt` keeps the root of the
+    authorization that targets it; every other attempt is its own root. So a
+    business revise starts a new root while a technical retry accumulates on
+    the same one, and the R1 budget never refunds.
+    """
+    for auth in reversed(run.get("recovery_authorizations", [])):
+        if auth.get("stage_index") == run["stage_index"] \
+                and auth.get("target_attempt") == run["stage_attempt"]:
+            return auth["root_attempt"]
+    return run["stage_attempt"]
+
+
+def dispatch_root(rec):
+    return rec.get("root_attempt") or rec.get("stage_attempt", 1)
+
+
+def root_members(run, stage_index=None, root=None):
+    stage_index = run["stage_index"] if stage_index is None else stage_index
+    root = logical_root(run) if root is None else root
+    return [d for d in run["dispatches"]
+            if d.get("stage_index") == stage_index and dispatch_root(d) == root]
+
+
+def member_digest_entry(rec):
+    """What a member contributes to the immutable authorization snapshot."""
+    report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
+    return [rec["id"], rec.get("role"), rec.get("status"), rec.get("stage_attempt", 1),
+            rec.get("artifact_sha256"), report.get("verdict"), report.get("status")]
+
+
+def group_digest(stage_index, root, members):
+    payload = json.dumps({"stage_index": stage_index, "root_attempt": root,
+                          "members": sorted(member_digest_entry(d) for d in members)},
+                         sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def fault_group_for(run, stage_index=None, root=None, open_only=False):
+    stage_index = run["stage_index"] if stage_index is None else stage_index
+    root = logical_root(run) if root is None else root
+    for group in run.get("fault_groups", []):
+        if (group.get("stage_index") == stage_index and group.get("root_attempt") == root
+                and (not open_only or group.get("status") == "open")):
+            return group
+    return None
+
+
+def group_triggered(members):
+    """A fault group opens on a decided fault, never on a normal in-flight submission.
+
+    Triggers: an abandoned member, a blocked member with no valid report, or an
+    uncertain member that has already been observed/collected into a technical
+    fault. A plain `submission_uncertain`/`submitted_unsettled` still awaiting
+    its first collect is in flight, not a group.
+    """
+    for d in members:
+        if d.get("status") == "abandoned":
+            return True
+        if d.get("status") == "blocked" and not has_valid_report(d):
+            return True
+        if d.get("status") == "uncertain" and (d.get("collected_at") or d.get("error")
+                                               or d.get("diagnosis")):
+            return True
+    return False
+
+
+def sync_group_members(run, group):
+    """Refresh a group's dynamic member list from the root. Caller holds the lock.
+
+    `authorized_members` is the immutable source snapshot an authorization is
+    bound to; `members` is the live membership and always includes every
+    recovery dispatch added afterwards, so a new fault can never be forgotten.
+    """
+    if not group.get("recorded", True):
+        return group
+    members = root_members(run, group["stage_index"], group["root_attempt"])
+    ids = [d["id"] for d in members]
+    fresh = [i for i in ids if i not in group.get("members", [])]
+    if fresh:
+        group.setdefault("members", []).extend(fresh)
+        group.setdefault("events", []).append(
+            {"at": now(), "type": "member_added", "dispatch_ids": fresh})
+    if "authorized_members" not in group:
+        group["authorized_members"] = list(group.get("members", []))
+    return group
+
+
+def current_group(run):
+    """The open fault group for the current logical root, without mutating.
+
+    Used by every read/precheck path so that merely looking at a Run never
+    records a group. A triggered root without a persisted group is reported as
+    a transient group; only a write path may persist it.
+    """
+    stage_index, root = run["stage_index"], logical_root(run)
+    recorded = fault_group_for(run, stage_index, root, open_only=True)
+    if recorded is not None:
+        # The dynamic view always includes later recovery dispatches. This is
+        # an in-memory refresh: only a write path persists it.
+        return sync_group_members(run, recorded)
+    members = root_members(run, stage_index, root)
+    if not group_triggered(members):
+        return None
+    return {"id": f"unrecorded-{stage_index}-{root}", "stage_index": stage_index,
+            "root_attempt": root, "status": "open", "recorded": False,
+            "members": [d["id"] for d in members],
+            "authorized_members": [d["id"] for d in members],
+            "member_snapshot_sha256": group_digest(stage_index, root, members),
+            "events": []}
+
+
+def record_group(run, group):
+    """Persist a transient fault group. Callers only call this on a write path."""
+    existing = fault_group_for(run, group["stage_index"], group["root_attempt"])
+    if existing is not None:
+        return sync_group_members(run, existing)
+    members = root_members(run, group["stage_index"], group["root_attempt"])
+    persisted = {k: v for k, v in group.items() if k != "recorded"}
+    persisted.update({"id": uuid.uuid4().hex[:12], "status": "open", "opened_at": now(),
+                      "members": [d["id"] for d in members],
+                      "authorized_members": list(group.get("authorized_members", [d["id"] for d in members])),
+                      "member_snapshot_sha256": group_digest(
+                          group["stage_index"], group["root_attempt"], members),
+                      "events": [{"at": now(), "type": "opened",
+                                  "reason": sorted({d.get("status") for d in members
+                                                    if d.get("status") in ("uncertain", "abandoned")})}]})
+    run.setdefault("fault_groups", []).append(persisted)
+    return persisted
+
+
+def group_has_abandoned(run, group):
+    by_id = {d["id"]: d for d in run["dispatches"]}
+    return any(by_id.get(i, {}).get("status") == "abandoned" for i in group.get("members", []))
+
+
+def assert_members_classified(run, group):
+    """Every live member must be a decided record before a group may be used.
+
+    Delivery-unknown records are never closed by a timeout: they must be
+    collected into a valid report or safely abandoned first.
+    """
+    by_id = {d["id"]: d for d in run["dispatches"]}
+    open_ids = [i for i in group.get("members", [])
+                if by_id.get(i, {}).get("status") not in ("settled", "abandoned")
+                and not (by_id.get(i, {}).get("status") == "blocked" and has_valid_report(by_id.get(i, {})))]
+    if open_ids:
+        raise GuardError("dispatch_unresolved",
+                         f"fault group still has unclassified members: {open_ids}")
+
+
+def required_roles(run, group):
+    """stage actor (never lead) + every role dispatched in the root + policy roles."""
+    roles = set()
+    stage = stage_info(run)
+    if stage.get("actor") and stage["actor"] != "lead":
+        roles.add(stage["actor"])
+    by_id = {d["id"]: d for d in run["dispatches"]}
+    for member in group.get("members", []):
+        rec = by_id.get(member)
+        if rec and rec.get("role"):
+            roles.add(rec["role"])
+    for role in run["settings"].get("recovery", {}).get("required_roles", []):
+        roles.add(role)
+    for role in run.get("recovery_policy_roles", []):
+        roles.add(role)
+    return sorted(roles)
+
+
+def role_budget(run, stage_index, root, role):
+    """R1: 1 + max_retries dispatches per logical root per role, never refunded.
+
+    Cumulative across every attempt of the logical root, including recovery
+    attempts, so a technical retry can never hand a role a fresh allowance.
+    """
+    limit = 1 + run["settings"]["orchestration"]["max_retries"]
+    used = sum(1 for d in run["dispatches"]
+               if d.get("stage_index") == stage_index and dispatch_root(d) == root
+               and d.get("role") == role)
+    return {"limit": limit, "used": used, "remaining": max(0, limit - used)}
+
+
+def budget_admits(run, stage_index, root, role, exclude_id=None):
+    """True when one MORE dispatch for this role still fits the R1 budget.
+
+    `exclude_id` omits the dispatch being admitted: the slot is consumed after
+    the record is appended, and that record must not count against itself.
+    """
+    limit = 1 + run["settings"]["orchestration"]["max_retries"]
+    used = sum(1 for d in run["dispatches"]
+               if d["id"] != exclude_id and d.get("stage_index") == stage_index
+               and dispatch_root(d) == root and d.get("role") == role)
+    return used < limit
+
+
+def approval_ok(approval):
+    """An independent approval record: identity, scope, receipt, timestamps."""
+    if not isinstance(approval, dict):
+        return False
+    if not all(isinstance(approval.get(k), str) and approval[k].strip()
+               for k in ("approver", "scope", "receipt", "issued_at", "expires_at")):
+        return False
+    issued, expires = parse_iso(approval["issued_at"]), parse_iso(approval["expires_at"])
+    stamp = parse_iso(now())
+    if issued is None or expires is None or stamp is None:
+        return False
+    if issued > stamp or expires <= issued or expires <= stamp:
+        return False
+    return True
+
+
+def parse_iso(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def receipt_failures(receipt, expected, receipt_id=None):
+    """Structural + binding check of a trusted control-plane receipt.
+
+    `expected` is the exact binding the receipt must match. Every field is
+    compared by value, never by "is a nonempty string": a receipt that names a
+    different Run, stage, root, group or action scope is rejected outright.
+    """
+    if not isinstance(receipt, dict):
+        return "trusted control plane returned no record"
+    for key in ("receipt_id", "issued_at", "expires_at", "idempotency_key"):
+        if not isinstance(receipt.get(key), str) or not receipt[key].strip():
+            return f"trusted receipt missing {key}"
+    if receipt_id is not None and receipt.get("receipt_id") != receipt_id:
+        return "trusted source returned another receipt"
+    for key in ("run_id", "stage_index", "root_attempt", "target_attempt", "group_id",
+                "group_sha256", "group_members_sha256", "action", "action_fingerprint",
+                "effect", "identity_pins_sha256", "idempotency_key", "message_sha256"):
+        if receipt.get(key) != expected.get(key):
+            return f"trusted receipt does not bind {key}"
+    if receipt.get("isolation") != "confirmed":
+        return "trusted isolation is not confirmed"
+    if receipt.get("side_effects") != "known":
+        return "side-effect receipts are not known"
+    if receipt.get("revoked") not in (False, None):
+        return "trusted receipt was revoked"
+    issued, expires = parse_iso(receipt.get("issued_at")), parse_iso(receipt.get("expires_at"))
+    stamp = parse_iso(now())
+    if issued is None or expires is None or stamp is None:
+        return "trusted receipt timestamps are invalid"
+    if issued > stamp:
+        return "trusted receipt is not yet valid (future issued_at)"
+    if expires <= issued or expires <= stamp:
+        return "trusted receipt is expired"
+    if not approval_ok(receipt.get("approval")):
+        return "trusted receipt lacks a valid independent approval"
+    if receipt["approval"].get("scope") != expected.get("action"):
+        return "trusted approval scope does not cover this action"
+    roles = receipt.get("required_roles")
+    if not isinstance(roles, list) or sorted(roles) != sorted(expected["required_roles"]):
+        return "trusted receipt role set mismatch"
+    budgets = receipt.get("role_budgets")
+    if not isinstance(budgets, dict) or set(budgets) != set(expected["required_roles"]):
+        return "trusted receipt role budgets mismatch"
+    for role, want in expected["role_budgets"].items():
+        got = budgets.get(role)
+        if not isinstance(got, dict) or got.get("remaining") != want["remaining"] \
+                or got.get("used") != want["used"] or got.get("limit") != want["limit"]:
+            return f"role budget drift for {role}"
+    actions = receipt.get("role_actions")
+    if not isinstance(actions, dict) or set(actions) != set(expected["required_roles"]):
+        return "trusted receipt role actions mismatch"
+    for role in expected["required_roles"]:
+        want = expected["role_actions"][role]
+        got = actions.get(role)
+        if not isinstance(got, dict) or got.get("effect") != want["effect"] \
+                or got.get("fingerprint") != want["fingerprint"] \
+                or got.get("action") != want.get("action") \
+                or got.get("action_key") != want.get("action_key"):
+            return f"role action binding mismatch for {role}"
+    return None
+
+
+def recovery_logical_message(run, role_name):
+    """The message a recovery dispatch must carry for this role.
+
+    Bound by the authorization rather than chosen at dispatch time, so an old
+    authorization can never be spent on different parameters.
+    """
+    return (f"Recovery attempt for stage {run['stages'][run['stage_index']]}: redo the required "
+            f"work for role {role_name} and write a fresh bound report.")
+
+
+def recovery_role_action(run, role_name):
+    effect = "write" if role_name == "developer" else "read"
+    message = recovery_logical_message(run, role_name)
+    role = get_role(run, role_name)
+    return {"action": "recovery-dispatch", "effect": effect, "message": message,
+            "action_key": action_key(run, role_name, "recovery-dispatch"),
+            "fingerprint": action_fingerprint("recovery-dispatch", run, role_name, effect,
+                                              role, message=message)}
+
+
+def root_action_key(run, required):
+    """One stable key for the logical recovery action of this root.
+
+    Reused by every attempt of the same root, so a downstream that de-duplicates
+    by this key sees one logical action. A different root gets a different key.
+    """
+    payload = json.dumps({"run_id": run["id"], "stage": run["stages"][run["stage_index"]],
+                          "logical_root": logical_root(run), "action": "recovery-redo",
+                          "roles": sorted(required)}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def action_key(run, role_name, action):
+    """Stable downstream idempotency key: logical action, NOT an attempt or id.
+
+    A recovered redo reuses this key so a downstream that de-duplicates sees one
+    logical action, while a different attempt does not mint a fresh identity.
+    """
+    payload = json.dumps({"run_id": run["id"], "stage": run["stages"][run["stage_index"]],
+                          "logical_root": logical_root(run), "role": role_name,
+                          "action": action}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def action_fingerprint(action, run, role_name, effect, role, message=None, task=None):
+    """Fingerprint the ACTUAL action: parameters, message, effect and identity.
+
+    Contains no stage_attempt: the same logical action keeps the same
+    fingerprint across a technical retry, so an old authorization can never be
+    reused for different parameters.
+    """
+    payload = json.dumps({"action": action, "run_id": run["id"],
+                          "stage": run["stages"][run["stage_index"]],
+                          "logical_root": logical_root(run), "role": role_name,
+                          "effect": effect, "message": message,
+                          "task": task, "identity": role_identity(role)},
+                         sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def pins_digest(pins):
+    return hashlib.sha256(json.dumps(pins, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def recovery_binding(run, group, required, action="recover-attempt", target_attempt=None,
+                     role_actions=None):
+    """The exact binding a trusted receipt must match. One source of truth."""
+    target_attempt = run["stage_attempt"] + 1 if target_attempt is None else target_attempt
+    root = logical_root(run)
+    by_id = {d["id"]: d for d in run["dispatches"]}
+    authorized = [by_id[i] for i in group.get("authorized_members", group.get("members", []))
+                  if i in by_id]
+    role_actions = role_actions or {}
+    pins = {}
+    for name in required:
+        try:
+            pins[name] = pins_digest(role_identity(get_role(run, name)))
+        except Error:
+            pins[name] = None
+    message_sha256 = (role_actions or {}).get("__message_sha256__")
+    if isinstance(role_actions, dict):
+        role_actions = {k: v for k, v in role_actions.items() if k != "__message_sha256__"}
+    return {"action": action, "run_id": run["id"], "stage_index": run["stage_index"],
+            "root_attempt": root, "target_attempt": target_attempt,
+            "group_id": group["id"], "group_sha256": group.get("member_snapshot_sha256"),
+            "group_members_sha256": group_digest(run["stage_index"], root, authorized),
+            "idempotency_key": root_action_key(run, required),
+            "message_sha256": message_sha256,
+            "required_roles": list(required),
+            "role_budgets": {r: role_budget(run, run["stage_index"], root, r) for r in required},
+            "role_actions": role_actions,
+            "effect": sorted({a.get("effect") for a in role_actions.values() if a}),
+            "identity_pins_sha256": hashlib.sha256(
+                json.dumps(pins, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()}
+
+
+def request_trusted_receipt(run, group, required, action="recover-attempt", target_attempt=None,
+                            role_actions=None):
+    """Ask the trusted control plane for one bound receipt, then verify it fully.
+
+    Local declarations, booleans and nonempty strings are never proof: the
+    returned record is checked field by field against the exact binding, and
+    any mismatch, missing field, wrong scope, future issue time, expiry or
+    revocation fails closed.
+    """
+    control = trusted_control()
+    expected = recovery_binding(run, group, required, action, target_attempt, role_actions)
+    try:
+        receipt = control(dict(expected, type="request"))
+    except GuardError:
+        raise
+    except Exception as e:  # noqa: BLE001 - any control-plane failure is a refusal
+        raise GuardError("execution_not_fenced", f"trusted control plane unavailable: {e}") from e
+    problem = receipt_failures(receipt, expected)
+    if problem:
+        code = ("approval_required" if problem.startswith("trusted receipt lacks")
+                or problem.startswith("trusted approval") else
+                "side_effects_unknown" if "side-effect" in problem else
+                "execution_not_fenced" if "isolation" in problem or "control plane" in problem else
+                "recovery_authorization_invalid")
+        raise GuardError(code, problem)
+    return receipt, expected
+
+
+def verify_receipt_still_valid(run, auth, action, role=None, effect=None, role_actions=None):
+    """Re-verify the trusted source at the moment of use, not only at issue time."""
+    receipt = auth.get("receipt")
+    if not isinstance(receipt, dict):
+        raise GuardError("recovery_authorization_invalid", "authorization has no trusted receipt")
+    expected = dict(auth.get("binding") or {})
+    if not expected:
+        raise GuardError("recovery_authorization_invalid", "authorization has no bound expectation")
+    if action != "recover-attempt":
+        # The authorized action set is fixed at issue time. A caller cannot
+        # substitute its own role_actions here.
+        if role_actions is not None and role_actions != auth.get("role_actions"):
+            raise GuardError("recovery_authorization_invalid",
+                             "role actions may not be replaced at use time")
+        expected = dict(expected, action=action,
+                        stage_attempt=run["stage_attempt"],
+                        target_attempt=run["stage_attempt"],
+                        role_actions=auth.get("role_actions"),
+                        effect=sorted({a.get("effect") for a in (auth.get("role_actions") or {}).values()}))
+        expected["role_budgets"] = {r: role_budget(run, auth["stage_index"], auth["root_attempt"], r)
+                                    for r in expected["required_roles"]}
+        if role is not None:
+            try:
+                expected["identity_pins_sha256"] = hashlib.sha256(json.dumps(
+                    {r: pins_digest(role_identity(get_role(run, r)))
+                     for r in expected["required_roles"]},
+                    sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+            except Error as e:
+                raise GuardError("identity_mismatch", str(e)) from e
+    control = trusted_control()
+    try:
+        rechecked = control(dict(expected, type="verify", receipt_id=receipt.get("receipt_id")))
+    except GuardError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise GuardError("execution_not_fenced", f"trusted control plane unavailable: {e}") from e
+    problem = receipt_failures(rechecked, expected, receipt_id=receipt.get("receipt_id"))
+    if problem:
+        code = ("approval_required" if problem.startswith("trusted receipt lacks")
+                or problem.startswith("trusted approval") else "recovery_authorization_invalid")
+        raise GuardError(code, problem)
+    if rechecked.get("receipt_id") != receipt.get("receipt_id"):
+        raise GuardError("recovery_authorization_invalid", "trusted source returned another receipt")
+    return rechecked
+
+
+def recovery_authorization_for(run, authorization_id=None, attempt=None):
+    """Return the live authorization for a stage attempt, or None."""
+    attempt = run["stage_attempt"] if attempt is None else attempt
+    for auth in run.get("recovery_authorizations", []):
+        if auth.get("run_id") == run["id"] and auth.get("stage_index") == run["stage_index"] \
+                and auth.get("target_attempt") == attempt \
+                and auth.get("status") == "active" \
+                and (authorization_id is None or auth.get("id") == authorization_id):
+            return auth
+    return None
+
+
+def validate_recovery_authorization(run, auth, role=None, dispatch_id=None):
+    """Lock-in re-check of every binding. Any mismatch fails closed."""
+    if not isinstance(auth, dict):
+        raise GuardError("recovery_authorization_invalid", "no recovery authorization")
+    if auth.get("run_id") != run["id"] or auth.get("stage_index") != run["stage_index"]:
+        raise GuardError("recovery_authorization_invalid", "authorization bound to another Run/stage")
+    if auth.get("target_attempt") != run["stage_attempt"]:
+        raise GuardError("recovery_authorization_invalid", "authorization bound to another attempt")
+    if auth.get("root_attempt") != logical_root(run):
+        raise GuardError("recovery_authorization_invalid", "authorization bound to another logical root")
+    group = fault_group_for(run, auth["stage_index"], auth["root_attempt"])
+    if group is None or group.get("id") != auth.get("group_id"):
+        raise GuardError("recovery_authorization_invalid", "fault group changed since authorization")
+    if group.get("member_snapshot_sha256") != auth.get("group_sha256"):
+        raise GuardError("recovery_authorization_invalid",
+                         "fault group members changed since authorization; re-issue recovery")
+    if set(required_roles(run, group)) != set(auth.get("required_roles", [])):
+        raise GuardError("recovery_authorization_invalid", "required role set changed")
+    expires = parse_iso(auth.get("expires_at"))
+    stamp = parse_iso(now())
+    if expires is None or stamp is None or expires <= stamp:
+        raise GuardError("recovery_authorization_invalid", "authorization expired")
+    if auth.get("revoked"):
+        raise GuardError("recovery_authorization_invalid", "authorization was revoked")
+    if role is not None:
+        slot = (auth.get("slots") or {}).get(role)
+        if not isinstance(slot, dict):
+            raise GuardError("recovery_authorization_invalid", f"no recovery slot for role {role}")
+        if slot.get("status") == "consumed" and slot.get("dispatch_id") != dispatch_id:
+            raise GuardError("recovery_authorization_invalid",
+                             f"recovery slot for {role} already consumed by another dispatch")
+    return auth
+
+
+def consume_recovery_slot(run, auth, role, dispatch_id, effect):
+    """Atomically occupy one role slot. Caller holds the lock."""
+    slot = auth["slots"][role]
+    if slot.get("status") == "consumed":
+        if slot.get("dispatch_id") == dispatch_id:
+            return slot  # idempotent re-entry of the SAME dispatch only
+        raise GuardError("recovery_authorization_invalid",
+                         f"recovery slot for {role} already consumed")
+    want_effect = (auth.get("role_actions") or {}).get(role, {}).get("effect")
+    if want_effect is None or want_effect != effect:
+        # A read slot can never be spent on a write (or the reverse).
+        raise GuardError("recovery_authorization_invalid",
+                         f"recovery slot for {role} is bound to effect {want_effect!r}, not {effect!r}")
+    if not budget_admits(run, auth["stage_index"], auth["root_attempt"], role, exclude_id=dispatch_id):
+        raise GuardError("recovery_budget_exhausted",
+                         f"role {role} has no remaining recovery budget on this logical root")
+    slot.update({"status": "consumed", "dispatch_id": dispatch_id, "consumed_at": now(),
+                 "effect": effect})
+    auth.setdefault("events", []).append(
+        {"at": now(), "type": "slot_consumed", "role": role, "dispatch_id": dispatch_id,
+         "effect": effect})
+    return slot
+
+
+def revoke_slots(auth):
+    for slot in (auth.get("slots") or {}).values():
+        if slot.get("status") == "unused":
+            slot["status"] = "revoked"
+    auth["status"] = "revoked"
+    auth.setdefault("events", []).append({"at": now(), "type": "revoked"})
+
+
+def close_fault_group(run, group, proof, auth=None):
+    """Close a group and retire EVERY authorization it ever issued.
+
+    A group may own several attempts (each T7 mints its own authorization). On
+    a T10 pass all of them must be revoked, otherwise a stale active
+    authorization blocks finish forever.
+    """
+    group["status"] = "closed"
+    group["closed_at"] = now()
+    group["closure"] = proof
+    group.setdefault("events", []).append({"at": now(), "type": "closed", "proof": proof})
+    retired = []
+    for candidate in run.get("recovery_authorizations", []):
+        if candidate.get("group_id") != group.get("id"):
+            continue
+        if candidate.get("status") == "active":
+            revoke_slots(candidate)
+        retired.append(candidate.get("id"))
+    if auth is not None and auth.get("id") not in retired:
+        revoke_slots(auth)
+        retired.append(auth.get("id"))
+    group["closed_authorization_ids"] = retired
+    group["closed_authorization_id"] = retired[-1] if retired else None
+    return group
+
+
+def closure_problems(run, group):
+    """A closure is only valid when it names real, still-matching evidence.
+
+    Checked against the ledger, not just against itself: the recorded hashes
+    must match the members' actual collected reports, the named gate event must
+    exist, and no authorized slot may still be unconsumed.
+    """
+    proof = group.get("closure")
+    if not isinstance(proof, dict):
+        return ["missing closure record"]
+    problems = []
+    for key in ("by", "decision", "group_sha256", "stage_index", "stage_attempt", "evidence",
+                "at", "member_hashes_sha256", "gate_event_index"):
+        value = proof.get(key)
+        if not isinstance(value, str if key not in ("stage_index", "stage_attempt",
+                                                    "gate_event_index") else int):
+            problems.append(f"closure missing {key}")
+    if problems:
+        return problems
+    if proof["group_sha256"] != group.get("member_snapshot_sha256"):
+        problems.append("closure does not match the authorized member snapshot")
+    by_id = {d["id"]: d for d in run["dispatches"]}
+    members = [by_id[i] for i in group.get("members", []) if i in by_id]
+    if group_digest(group["stage_index"], group["root_attempt"], members) != proof["member_hashes_sha256"]:
+        problems.append("closure does not match the members' current report hashes")
+    index = proof["gate_event_index"]
+    events = run.get("events", [])
+    if not isinstance(index, int) or index < 0 or index >= len(events):
+        problems.append("closure names no gate event")
+    else:
+        event = events[index]
+        if event.get("type") != "gate" or event.get("decision") != proof["decision"] \
+                or event.get("stage_index") != proof["stage_index"] \
+                or event.get("stage_attempt") != proof["stage_attempt"]:
+            problems.append("closure does not match the recorded gate event")
+    group_auths = [a for a in run.get("recovery_authorizations", [])
+                   if a.get("group_id") == group.get("id")]
+    for auth in group_auths:
+        if auth.get("status") == "active":
+            problems.append(f"closure left recovery authorization {auth.get('id')} active")
+        if any(slot.get("status") == "unused" for slot in (auth.get("slots") or {}).values()):
+            problems.append(f"closure left an unconsumed slot on {auth.get('id')}")
+    return problems
+
+
+def attempt_authorization_source(run, requested):
+    """Resolve an exact same-request authorization before any history refusal.
+
+    R1: a retry of the SAME request must return the same authorization, the
+    same slot and the same target attempt — it must never open a new attempt.
+    This only recognises an exact match; it never relaxes history writes.
+    """
+    for auth in reversed(run.get("recovery_authorizations", [])):
+        if auth.get("request_source") != requested:
+            continue
+        if auth.get("status") not in ("active", "revoked", "consumed"):
+            continue
+        if auth.get("stage_index") != run["stage_index"]:
+            continue
+        return auth
+    return None
+
+
+def run_recover_attempt(args):
+    """T7: retain a NEW attempt and issue per-role one-shot slots. Never prompts."""
+    request_source = [args.dispatch_id, args.evidence]
+    with locked():
+        run = require_run(args.run_id)
+        # A terminal Run is refused before anything else, including an R1 replay:
+        # no token may resurrect or act on a finished/cancelled ledger.
+        if run.get("status") in ("finished", "cancelled"):
+            raise GuardError("run_terminal")
+        # R1 idempotency is settled BEFORE the remaining state gates: a
+        # same-request retry under recovery_active must return the EXISTING
+        # authorization, not be refused or allowed to open a second chain. Only
+        # an exact (dispatch, evidence) match qualifies; history writes stay strict.
+        replay = attempt_authorization_source(run, request_source)
+        if replay is not None:
+            return _recovery_result(run, replay, replay=True)
+        check_transition(run, "recover-attempt")
+        rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
+        if rec is None:
+            raise Error("Unknown dispatch ID")
+        if not is_current(run, rec):
+            raise GuardError("history_unresolved",
+                             "historical dispatches are decided records; diagnose and escalate")
+        transient = current_group(run)
+        if transient is None:
+            raise GuardError("fault_group_open", "no fault group is open for this logical root")
+        if not group_has_abandoned(run, transient):
+            raise GuardError("recovery_authorization_invalid",
+                             "T7 requires at least one safely abandoned member; a pure business group "
+                             "must be closed by T21 and decided by an ordinary gate")
+        assert_members_classified(run, transient)
+        if run["status"] == "recovery_active":
+            raise GuardError("run_state_forbidden", "recovery_active cannot open a second recovery chain")
+        if run["status"] == "blocked_round_limit":
+            # Only a trusted STRUCTURAL technical over-limit may enter recovery.
+            # A ledger string is not proof: the trusted control plane must verify
+            # the provenance AND confirm there is no business negative.
+            technical = run.get("round_limit_provenance")
+            if not isinstance(technical, dict) or technical.get("kind") != "technical":
+                raise GuardError("run_state_forbidden",
+                                 "blocked_round_limit provenance is business or missing; "
+                                 "only a technically proven over-limit may recover")
+            verify_round_limit_provenance(run, technical, transient)
+        if not re.fullmatch(r"[A-Za-z0-9.\-]{1,80}", args.evidence):
+            raise GuardError("artifact_invalid", "invalid evidence snapshot id")
+        evidence_dir = STATE / "evidence" / run["id"] / rec["id"] / args.evidence
+        if not (evidence_dir / "manifest.json").is_file():
+            raise GuardError("artifact_invalid", f"unknown evidence snapshot {args.evidence!r}")
+        required = required_roles(run, transient)
+        if not required:
+            raise GuardError("policy_forbidden", "no required role could be derived for this group")
+        for name in required:
+            # The ledger must be complete AND the live Agent must match it.
+            require_live_identity(run, name)
+        # Only now, after every precondition passed, persist the group. A
+        # refused recovery must not leave a ledger side effect behind.
+        group = record_group(run, transient)
+        # Re-snapshot on every authorization: `authorized_members` must cover
+        # the CURRENT full membership (including earlier recovery dispatches),
+        # not the membership at the first T7.
+        members_now = root_members(run, group["stage_index"], group["root_attempt"])
+        group["authorized_members"] = [d["id"] for d in members_now]
+        group["member_snapshot_sha256"] = group_digest(group["stage_index"],
+                                                       group["root_attempt"], members_now)
+        group.setdefault("events", []).append(
+            {"at": now(), "type": "authorization_snapshot",
+             "members": list(group["authorized_members"])})
+        role_actions = {name: recovery_role_action(run, name) for name in required}
+        for name in required:
+            if role_budget(run, run["stage_index"], logical_root(run), name)["remaining"] <= 0:
+                # Any single role out of budget refuses the WHOLE group: it must
+                # not start an attempt it cannot complete.
+                raise GuardError("recovery_budget_exhausted",
+                                 f"role {name} has no remaining budget on this logical root; "
+                                 "the group cannot open a new attempt")
+        receipt, expected = request_trusted_receipt(run, group, required,
+                                                    role_actions=role_actions)
+        target_attempt = run["stage_attempt"] + 1
+        auth = {"id": uuid.uuid4().hex[:12], "run_id": run["id"], "stage_index": run["stage_index"],
+                "root_attempt": logical_root(run), "target_attempt": target_attempt,
+                "group_id": group["id"], "group_sha256": group["member_snapshot_sha256"],
+                "authorized_members": sorted(group.get("authorized_members", [])),
+                "required_roles": required, "role_actions": role_actions,
+                "binding": expected, "receipt": receipt,
+                "role_budgets": expected["role_budgets"],
+                "slots": {name: {"status": "unused", "dispatch_id": None, "consumed_at": None,
+                                 "effect": role_actions[name]["effect"]} for name in required},
+                "request_source": request_source,
+                "round_limit_provenance": (run.get("round_limit_provenance")
+                                           if run["status"] == "blocked_round_limit" else None),
+                "issued_at": now(), "expires_at": receipt["expires_at"],
+                "status": "active", "events": [{"at": now(), "type": "issued"}]}
+        run.setdefault("recovery_authorizations", []).append(auth)
+        previous_status = run["status"]
+        if previous_status == "blocked_round_limit":
+            run["status"] = "recovery_active"
+        run["stage_attempt"] = target_attempt
+        run["events"].append({"at": now(), "type": "recover_attempt", "group_id": group["id"],
+                              "previous_status": previous_status, "stage_index": run["stage_index"],
+                              "root_attempt": auth["root_attempt"], "target_attempt": target_attempt,
+                              "required_roles": required, "authorization_id": auth["id"],
+                              "receipt_id": receipt["receipt_id"], "round": run["round"]})
+        save(run_file(args.run_id), run)
+    return _recovery_result(run, auth)
+
+
+def _recovery_result(run, auth, replay=False):
+    return {"run_id": run["id"], "stage_index": auth["stage_index"],
+            "stage_attempt": auth["target_attempt"], "status": run["status"],
+            "group_id": auth["group_id"], "authorization_id": auth["id"],
+            "required_roles": auth["required_roles"],
+            "slots": {name: slot.get("status") for name, slot in auth["slots"].items()},
+            "round": run["round"], "round_unchanged": True, "replay": replay,
+            "next": ("The exact same recovery request already issued this authorization; "
+                     "no new attempt or slot was created.") if replay else
+                    ("dispatch each required role with the ordinary `run dispatch`; each dispatch consumes "
+                     "its own slot exactly once. No prompt was sent by this command.")}
+
+
+
 def run_dispatch(args):
     run, herdr_session, _own = _require_run_with_session(
         args.run_id, tier="C", target_role=args.role)
-    if run["status"] != "active": raise Error("Run is not active")
+    check_transition(run, "dispatch")
+    # A fault group freezes ordinary dispatch. Only a dispatch covered by the
+    # current recovery authorization's per-role one-shot slot may proceed.
+    group = current_group(run)
+    auth = None
+    if group is not None:
+        auth = recovery_authorization_for(run)
+        if auth is None:
+            # Issue #2 P0: the retry budget alone would let a plain dispatch
+            # bypass the evidence/isolation/authorization that abandon
+            # required. Without a valid recovery authorization this always
+            # refuses; a risk acceptance is never a recovery credential.
+            raise GuardError("recovery_authorization_invalid",
+                             "this stage attempt has an open fault group or an abandoned dispatch; "
+                             "a verified, bound recovery authorization is required. Run "
+                             "`run diagnose` and `run recover-attempt`, or escalate to the Owner")
+        validate_recovery_authorization(run, auth, role=args.role)
+        if args.remediation:
+            raise GuardError("policy_forbidden",
+                             "a recovery attempt dispatches each required role once; remediation "
+                             "subtasks are not part of a recovery authorization")
+        if not is_current(run, {"stage_index": auth["stage_index"], "stage_attempt": auth["target_attempt"]}):
+            raise GuardError("stale_snapshot", "authorization does not match the current attempt")
     stage = stage_info(run)
     expected_index = run["stage_index"]
-    if stage["actor"] != args.role and not args.remediation:
+    expected_attempt = run["stage_attempt"]
+    # A recovery attempt must redo EVERY required role of the group, so a
+    # required role that is not the stage actor is still dispatched normally.
+    # Any other non-actor role keeps requiring an explicit --remediation.
+    recovery_role = auth is not None and args.role in auth["required_roles"]
+    if stage["actor"] != args.role and not args.remediation and not recovery_role:
         raise Error(f"Current stage '{stage['stage']}' expects {stage['actor']}; use --remediation for another Worker")
     role = get_role(run, args.role)
     if args.effect not in ("read", "write", "sensitive"):
@@ -1377,14 +2676,44 @@ def run_dispatch(args):
             f"Create the report as a temporary file in the SAME directory, then atomically rename it to that path. "
             f"A terminal message alone is not a report. This JSON is a worker assertion, not independent proof. "
             f"List any unverified claims and blockers. Never falsify test results.\n\n{args.message}")
+    slot_auth = None
     with locked():
         run = require_run(args.run_id, tier="C")
-        if run["status"] != "active" or run["stage_index"] != expected_index:
+        if run["status"] not in ("active", "recovery_active") or run["stage_index"] != expected_index \
+                or run["stage_attempt"] != expected_attempt:
+            # The attempt must match too: a stale prompt prepared for attempt N
+            # must never be recorded into attempt N+1.
             raise Error("Run changed before dispatch; inspect status")
+        current_auth = None
+        if current_group(run) is not None:
+            current_auth = recovery_authorization_for(run)
+            if current_auth is None:
+                raise GuardError("recovery_authorization_invalid",
+                                 "an open fault group appeared concurrently; recovery is not authorized")
+            validate_recovery_authorization(run, current_auth, role=args.role)
+            # The receipt must cover EVERY required role, and the acting role's
+            # request must match the authorized logical action exactly: same
+            # effect, same message, same stable key. A slot authorizes one
+            # logical action, never "whatever the caller sends".
+            bound = (current_auth.get("role_actions") or {}).get(args.role) or {}
+            if args.effect != bound.get("effect"):
+                raise GuardError("recovery_authorization_invalid",
+                                 "a read slot cannot be spent on a write (or the reverse)")
+            if args.message != bound.get("message"):
+                raise GuardError("recovery_authorization_invalid",
+                                 "the dispatch message differs from the authorized recovery action")
+            if action_fingerprint("recovery-dispatch", run, args.role, args.effect, role,
+                                  message=args.message) != bound.get("fingerprint"):
+                raise GuardError("recovery_authorization_invalid",
+                                 "the dispatch parameters differ from the authorized action")
+            verify_receipt_still_valid(run, current_auth, "recovery-dispatch", role=args.role,
+                                       effect=args.effect)
+            # Re-observe the live Agent under the lock; the receipt echo is not proof.
+            require_live_identity(run, args.role)
         if any(x["role"] == args.role and x["stage_index"] == run["stage_index"]
                and x["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain") for x in run["dispatches"]):
             raise Error("Concurrent dispatch already pending for this Worker")
-        if sum(x["role"] == args.role and x["stage_index"] == run["stage_index"]
+        if current_auth is None and sum(x["role"] == args.role and x["stage_index"] == run["stage_index"]
                and x.get("stage_attempt", 1) == run["stage_attempt"] for x in run["dispatches"]) >= 1 + run["settings"]["orchestration"]["max_retries"]:
             raise Error("max_retries limit reached due to concurrent dispatch")
         if sum(x["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain")
@@ -1397,8 +2726,29 @@ def run_dispatch(args):
         item = {"id": stamp, "stage_index": run["stage_index"], "stage_attempt": run["stage_attempt"],
                 "remediation": args.remediation, "role": args.role, "effect": args.effect,
                 "status": "submission_uncertain", "created_at": now(), "prompt": text,
-                "result_file": str(artifact)}
+                "cwd": role.get("cwd"), "worktree": role.get("worktree"),
+                "result_file": str(artifact),
+                "root_attempt": logical_root(run),
+                "action_key": ((current_auth.get("role_actions") or {}).get(args.role) or {}
+                               ).get("action_key") if current_auth else action_key(
+                                   run, args.role, "dispatch"),
+                "recovery_authorization_id": current_auth["id"] if current_auth else None}
         run["dispatches"].append(item)
+        slot_auth = current_auth
+        if current_auth is not None:
+            # Occupy this role's one-shot slot in the same atomic commit that
+            # records the dispatch. A crash after this point may only resume
+            # THIS dispatch; it must never re-send the prompt.
+            consume_recovery_slot(run, current_auth, args.role, stamp, args.effect)
+            # The recovery dispatch joins the SAME group, so a later fault on it
+            # can never escape the group's classification or T7 requirements.
+            group_for_dispatch = fault_group_for(run, current_auth["stage_index"],
+                                                 current_auth["root_attempt"])
+            if group_for_dispatch is not None:
+                sync_group_members(run, group_for_dispatch)
+            run["events"].append({"at": now(), "type": "recovery_slot_consumed",
+                                  "authorization_id": current_auth["id"], "role": args.role,
+                                  "dispatch_id": stamp, "stage_attempt": run["stage_attempt"]})
         if approvals:
             fresh = [x for x in run["approval_tokens"] if x["role"] == args.role and x["effect"] == args.effect
                      and x["stage_index"] == run["stage_index"]]
@@ -1414,38 +2764,61 @@ def run_dispatch(args):
     cmd = ["agent", "prompt", role["agent_name"], text]
     if not args.no_wait:
         cmd += ["--wait", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", str(timeout_ms)]
+    def finalize(update_of):
+        """Async finalize: re-read under the lock and never touch a terminal Run.
+
+        Applies the same guard the write entry points use (`run_terminal`),
+        plus the expected attempt, the bound recovery authorization and the
+        slot CAS. A terminal Run gets NO write at all — not even a refusal
+        event — so an async return can never mutate a finished ledger.
+        """
+        try:
+            with locked():
+                current = require_run(args.run_id, tier="C")
+                rec = next((x for x in current["dispatches"] if x["id"] == stamp), None)
+                if rec is None:
+                    return None
+                if current["status"] in ("finished", "cancelled"):
+                    return None
+                if rec["status"] in ("settled", "abandoned") or (
+                        rec["status"] == "blocked" and has_valid_report(rec)):
+                    return None
+                if current["stage_index"] != expected_index or \
+                        current["stage_attempt"] != expected_attempt or not is_current(current, rec):
+                    return None
+                if slot_auth is not None:
+                    live_auth = recovery_authorization_for(current)
+                    if live_auth is None or live_auth.get("id") != slot_auth["id"]:
+                        return None
+                    slot = (live_auth.get("slots") or {}).get(args.role) or {}
+                    if slot.get("dispatch_id") != stamp or slot.get("status") != "consumed":
+                        return None
+                rec.update(update_of(current, rec))
+                save(run_file(args.run_id), current)
+                return rec
+        except Error:
+            return None
+
     try:
         result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0), session=herdr_session)
         if args.no_wait:
-            with locked():
-                run = require_run(args.run_id, tier="C")
-                rec = next(x for x in run["dispatches"] if x["id"] == stamp)
-                rec["status"] = "submitted_unsettled"
-                save(run_file(args.run_id), run)
+            if finalize(lambda _run, _rec: {"status": "submitted_unsettled"}) is None:
+                return {"dispatch_id": stamp, "status": "terminal",
+                        "next": "the dispatch was decided while the submission was in flight; inspect it"}
             return {"dispatch_id": stamp, "status": "submitted_unsettled",
                     "next": "run collect --run-id ... --dispatch-id ... before retry or passing the stage"}
         # A successful wait is only a lifecycle observation. Report identity is
         # independently verified before settling.
         st = agent_status_of(result)
-        with locked():
-            run = require_run(args.run_id, tier="C")
-            rec = next(x for x in run["dispatches"] if x["id"] == stamp)
-            rec.update(reconcile_result(run, rec, st))
-            save(run_file(args.run_id), run)
+        rec = finalize(lambda run_, rec_: reconcile_result(run_, rec_, st))
+        if rec is None:
+            return {"dispatch_id": stamp, "status": "terminal",
+                    "note": "a late wait return cannot overwrite a decided dispatch"}
         return {"dispatch_id": stamp, "status": rec["status"], "agent_state": st,
                 "report": rec.get("report"), "error": rec.get("error"),
                 "warning": "Worker JSON is not independent verification; Lead must check evidence and tests"}
     except Error as e:
-        # The delivery outcome is unknown, so the "might have been sent" warning must
-        # survive even if re-reading the ledger fails (e.g. an unstable identity probe).
-        try:
-            with locked():
-                run = require_run(args.run_id, tier="C")
-                rec = next(x for x in run["dispatches"] if x["id"] == stamp)
-                rec["error"] = str(e); save(run_file(args.run_id), run)
-        except Error as recovery:
-            raise Error(f"Dispatch {stamp} uncertain; input might have been sent. Run collect before retry. "
-                        f"Original: {e}. State recheck also failed: {recovery}") from e
+        finalize(lambda _run, _rec, message=str(e): {"error": message})
         raise Error(f"Dispatch {stamp} uncertain; input might have been sent. Run collect before retry. {e}") from e
 
 
@@ -1455,6 +2828,26 @@ def herdr_read(name):
                    timeout=30, raw=True)[-50000:]
 
 
+def late_artifact_notice(run, rec):
+    """Historical uncertain/abandoned + late report: retain evidence, change nothing.
+
+    A report that arrives after the dispatch became history is evidence only.
+    It never rewrites the record, never sets report/hash/status and never
+    becomes gate evidence for any attempt.
+    """
+    snapshot = result_snapshot(run, rec)
+    if not snapshot.get("valid"):
+        raise GuardError("stale_snapshot",
+                         f"dispatch {rec['id']} is historical ({rec['status']}); "
+                         "decided records are not re-collected")
+    presence = agent_presence(get_role(run, rec["role"]))
+    evidence = collect_evidence(run, rec, presence, snapshot, "late_artifact_rejected", git_evidence(rec))
+    raise GuardError("history_unresolved",
+                     f"late artifact for historical {rec['status']} dispatch retained as evidence "
+                     f"{evidence['snapshot_id']}; it cannot change status/report/hash or gate evidence. "
+                     "Escalate to the Owner")
+
+
 def run_collect(args):
     run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
     rec = next((x for x in reversed(run["dispatches"]) if x["id"] == args.dispatch_id), None)
@@ -1462,6 +2855,95 @@ def run_collect(args):
     # The dispatch is what identifies the Worker here, so the target check has to
     # happen after resolving it rather than at ledger-load time.
     require_target_role(run, herdr_session, rec["role"], run_file(args.run_id))
+    if not is_current(run, rec):
+        # T18: an abandoned dispatch is terminal; a historical uncertain one may
+        # only retain a late artifact. Neither is ever re-collected.
+        if rec["status"] in ("abandoned", "uncertain"):
+            with locked():
+                run = require_run(args.run_id)
+                rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
+                if is_current(run, rec):
+                    raise GuardError("stale_snapshot", "dispatch became current again; re-run collect")
+                late_artifact_notice(run, rec)
+        if rec["status"] == "blocked" and not has_valid_report(rec):
+            # Historical legacy blocked: T5 recheck only (adopt a valid report
+            # as blocked(valid), otherwise diagnose). Not a current collect.
+            snapshot = result_snapshot(run, rec)
+            if not snapshot.get("valid"):
+                out = diagnose_dispatch(args.run_id, args.dispatch_id)
+                out["t5"] = "legacy_blocked_requires_recheck"
+                return out
+            with locked():
+                run = require_run(args.run_id)
+                rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
+                if is_current(run, rec) or rec["status"] != "blocked" or has_valid_report(rec):
+                    raise GuardError("stale_snapshot", "dispatch changed while rechecking")
+                report, digest = read_result(run, rec)
+                if digest != snapshot["sha256"]:
+                    raise GuardError("artifact_invalid",
+                                     "report changed between the recheck and the lock")
+                rec.update({"status": "blocked", "report": report, "artifact_sha256": digest,
+                            "result_file": str(result_path(run["id"], rec["id"])), "error": None})
+                run["events"].append({"at": now(), "type": "legacy_blocked_adopted",
+                                      "dispatch_id": rec["id"], "artifact_sha256": digest})
+                save(run_file(args.run_id), run)
+            return {"dispatch_id": args.dispatch_id, "status": "blocked",
+                    "artifact_sha256": digest, "t5": "legacy_blocked_report_adopted",
+                    "note": "Historical legacy blocked adopted a valid bound report; it stays a "
+                            "business blocked decision and never becomes settled"}
+        raise GuardError("stale_snapshot",
+                         f"dispatch {rec['id']} is historical ({rec['status']}); decided records are not re-collected")
+    check_transition(run, "collect", rec)
+    if rec["status"] in ("settled", "abandoned"):
+        # Decided records are terminal: an abandoned dispatch is never reconciled,
+        # and a late artifact must not flip it back to settled.
+        retained = None
+        if rec["status"] == "abandoned":
+            # Keep an ACTUAL snapshot of a late report, not just a note.
+            snapshot = result_snapshot(run, rec)
+            if snapshot.get("valid"):
+                presence = agent_presence(get_role(run, rec["role"]))
+                retained = collect_evidence(run, rec, presence, snapshot,
+                                            "late_artifact_current_abandoned",
+                                            git_evidence(rec))["snapshot_id"]
+        return {"dispatch_id": args.dispatch_id, "status": rec["status"], "agent_state": None,
+                "report": rec.get("report"), "error": rec.get("error"),
+                "late_evidence_snapshot": retained,
+                "note": "Terminal dispatch: no reconciliation performed; late artifacts are "
+                        "evidence only and never become current-gate evidence"}
+    if rec["status"] == "blocked" and rec.get("report") and rec.get("artifact_sha256"):
+        raise Error("Terminal blocked dispatch has a report; cannot collect again")
+    if rec["status"] == "blocked" and not has_valid_report(rec):
+        # Legacy blocked(no valid report). For a CURRENT dispatch this is a
+        # normal collect: an idle Worker with a valid complete report settles;
+        # a missing/invalid report is uncertain. A HISTORICAL one only gets the
+        # T5 recheck (adopt a valid report, otherwise diagnose).
+        snapshot = result_snapshot(run, rec)
+        if snapshot.get("valid"):
+            pass  # fall through to the normal collect below
+        else:
+            presence = agent_presence(get_role(run, rec["role"]))
+            with locked():
+                run = require_run(args.run_id)
+                rec = next((x for x in run["dispatches"] if x["id"] == args.dispatch_id), None)
+                if rec is None or not is_current(run, rec) or rec["status"] != "blocked":
+                    raise GuardError("stale_snapshot", "dispatch changed while rechecking")
+                if has_valid_report(rec):
+                    return {"dispatch_id": args.dispatch_id, "status": rec["status"],
+                            "report": rec.get("report"), "t5": "already_decided"}
+                rec.update({"status": "uncertain", "collected_at": now(), "error": None,
+                            "observed_status": presence.get("status"),
+                            "diagnosis": "legacy_blocked_without_valid_report"})
+                run["events"].append({"at": now(), "type": "legacy_blocked_uncertain",
+                                      "dispatch_id": rec["id"]})
+                save(run_file(args.run_id), run)
+            return {"dispatch_id": args.dispatch_id, "status": "uncertain", "agent_state": None,
+                    "t5": "legacy_blocked_uncertain",
+                    "note": "Legacy blocked without a valid report is unresolved, not a business "
+                            "result; it is now a technical fault requiring recovery"}
+    # A current legacy blocked record re-enters the normal collect exactly once,
+    # so a valid complete report settles it instead of staying a permanent lock.
+    legacy_collect = rec["status"] == "blocked" and not has_valid_report(rec)
     role = get_role(run, rec["role"])
     if not verify_existing(role, session=herdr_session): raise Error("Registered Agent is no longer live")
     agent = lookup_agent(role["agent_name"], session=herdr_session)
@@ -1469,26 +2951,206 @@ def run_collect(args):
     with locked():
         run = require_run(args.run_id, tier="C")
         rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
-        if rec["status"] != "settled":
-            rec.update(reconcile_result(run, rec, st))
+        check_transition(run, "collect", rec)
+        if rec["status"] in ("settled", "abandoned") or (
+                rec["status"] == "blocked" and rec.get("report") and rec.get("artifact_sha256")):
+            raise Error("Terminal dispatch cannot be collected again")
+        if rec["status"] == "blocked" and not legacy_collect:
+            raise Error("Legacy blocked dispatch requires diagnosis")
+        rec.update(reconcile_result(run, rec, st))
         save(run_file(args.run_id), run)
     return {"dispatch_id": args.dispatch_id, "status": rec["status"], "agent_state": st,
             "report": rec.get("report"), "error": rec.get("error"),
             "warning": "Structured self-report must be independently reviewed; no automatic retry"}
 
 
+def require_recovery_gate_authentication(run, decision, auth, group):
+    """Recovery gates are human gates: no independent authentication = no gate.
+
+    The record must bind decision, Run, stage, attempt, the collected report
+    hashes of the current attempt, the fault group and the authorization slots.
+    """
+    if auth is None or group is None:
+        raise GuardError("approval_required",
+                         "a recovery gate needs a bound authorization and fault group")
+    members = [d for d in run["dispatches"] if d.get("stage_index") == run["stage_index"]
+               and d.get("stage_attempt", 1) == run["stage_attempt"]
+               and d.get("artifact_sha256")]
+    control = trusted_control()
+    claim = {"action": "recovery-gate-approval", "decision": decision, "run_id": run["id"],
+             "stage_index": run["stage_index"], "stage_attempt": run["stage_attempt"],
+             "dispatch_hashes_sha256": hashlib.sha256(json.dumps(
+                 sorted([d["id"], d.get("artifact_sha256")] for d in members),
+                 sort_keys=True).encode("utf-8")).hexdigest(),
+             "group_id": group.get("id"), "authorization_id": auth.get("id"),
+             "slots": {r: (auth["slots"][r] or {}).get("dispatch_id")
+                       for r in auth.get("required_roles", [])}}
+    try:
+        approval = control(dict(claim, type="verify"))
+    except GuardError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise GuardError("approval_required", f"authentication unavailable: {e}") from e
+    if not isinstance(approval, dict) or approval.get("authenticated") is not True:
+        raise GuardError("approval_required",
+                         "no independent authentication for this recovery gate decision")
+    for key in ("decision", "run_id", "stage_index", "stage_attempt",
+                "dispatch_hashes_sha256", "group_id", "authorization_id"):
+        if approval.get(key) != claim[key]:
+            raise GuardError("approval_required", f"authentication does not bind {key}")
+    if not approval_ok({"approver": approval.get("approver"), "scope": "recovery-gate-approval",
+                        "receipt": approval.get("receipt"), "issued_at": approval.get("issued_at"),
+                        "expires_at": approval.get("expires_at")}):
+        raise GuardError("approval_required", "authentication record is invalid or expired")
+    return approval
+
+
+def is_decided_member(rec):
+    """A settled record, or a blocked record with a valid bound report.
+
+    "Decided" means the record needs no further collection. It does NOT mean
+    the stage may advance: a blocked record is a business negative even when
+    its report is valid, so gate pass/revise and finish must still refuse it.
+    Only a recorded revise turns it into a new attempt.
+    """
+    return rec.get("status") == "settled" or (rec.get("status") == "blocked" and has_valid_report(rec))
+
+
+def verify_round_limit_provenance(run, technical, group):
+    """Ask the trusted control plane to verify a technical over-limit.
+
+    The ledger's `kind` is a claim, not evidence: the control plane must confirm
+    the structured external event, this Run/stage/root, and that no business
+    negative exists. Any failure fails closed.
+    """
+    control = trusted_control()
+    claim = {"action": "round-limit-provenance", "run_id": run["id"],
+             "stage_index": run["stage_index"], "root_attempt": logical_root(run),
+             "blocked_round_limit_at": technical.get("at"),
+             "external_event_id": technical.get("event_id")}
+    try:
+        verified = control(dict(claim, type="verify"))
+    except GuardError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise GuardError("execution_not_fenced",
+                         f"trusted control plane unavailable: {e}") from e
+    if not isinstance(verified, dict) or verified.get("kind") != "technical" \
+            or verified.get("verified_by") != "external" \
+            or verified.get("run_id") != run["id"] \
+            or verified.get("stage_index") != run["stage_index"] \
+            or verified.get("root_attempt") != logical_root(run) \
+            or verified.get("external_event_id") != claim["external_event_id"] \
+            or verified.get("business_negative") not in (False, None):
+        raise GuardError("run_state_forbidden",
+                         "trusted control plane did not verify a structural technical over-limit")
+    return verified
+
+
+def recovery_business_negatives(run, auth):
+    """Roles whose latest recovery report is a BUSINESS negative.
+
+    A valid blocked report OR a settled fail/needs-work verdict both count.
+    A technical redo with no negative at all does not.
+    """
+    negatives = []
+    for role in (auth.get("required_roles") or []):
+        latest = [d for d in run["dispatches"] if d.get("stage_index") == run["stage_index"]
+                  and d.get("stage_attempt", 1) == run["stage_attempt"] and d.get("role") == role]
+        if not latest:
+            continue
+        rec = latest[-1]
+        report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
+        if rec.get("status") == "blocked" and has_valid_report(rec):
+            negatives.append(role)
+        elif rec.get("status") == "settled" and report.get("verdict") in ("fail", "needs-work"):
+            negatives.append(role)
+    return negatives
+
+
+def gate_fault_group(run, decision):
+    """Fault-group rules for a gate decision (T10/T11/T12/T13/T21).
+
+    Returns the group that this decision closes, or None. A decision that would
+    stop the whole group (blocked) never closes it.
+    """
+    group = current_group(run)
+    if group is None:
+        return None
+    assert_members_classified(run, group)
+    if decision == "blocked":
+        raise GuardError("fault_group_open",
+                         "a fault group is open; gate blocked would freeze it. Resolve every member "
+                         "first, then decide the group as a whole")
+    auth = recovery_authorization_for(run)
+    if auth is not None:
+        validate_recovery_authorization(run, auth)
+        verify_receipt_still_valid(run, auth, "recovery-gate")
+        for role in auth["required_roles"]:
+            require_live_identity(run, role)
+            slot = auth["slots"][role]
+            if slot.get("status") != "consumed":
+                raise GuardError("recovery_authorization_invalid",
+                                 f"required role {role} has no dispatched recovery attempt yet")
+            latest = [d for d in run["dispatches"] if d.get("stage_index") == run["stage_index"]
+                      and d.get("stage_attempt", 1) == run["stage_attempt"] and d.get("role") == role]
+            # A required role is done when it has a DECIDED report: a settled
+            # pass, or a valid business-blocked negative for a T13 revise.
+            if not latest or not (latest[-1].get("status") == "settled"
+                                  or (latest[-1].get("status") == "blocked"
+                                      and has_valid_report(latest[-1]))):
+                raise GuardError("dispatch_unresolved",
+                                 f"required role {role} has no decided report in the recovery attempt")
+        return group
+    if group_has_abandoned(run, group):
+        raise GuardError("recovery_authorization_invalid",
+                         "fault group contains an abandoned member; it must be recovered as a whole "
+                         "with a bound authorization, never decided by an ordinary gate")
+    # Pure reporting group: all technical faults are collected into valid
+    # reports. T21 closes it first, then the ordinary T11/T12 decision applies.
+    return group
+
+
 def run_gate(args):
     with locked():
         run = require_run(args.run_id, tier="C")
-        if run["status"] != "active": raise Error("Run is not active")
+        check_transition(run, "gate")
         stage = stage_info(run)
         actor = stage["actor"]
+        # A recovery attempt is identified by its bound authorization, not by
+        # the Run status: recovery entered from `active` keeps the Run active.
+        recovery = recovery_authorization_for(run) is not None
+        if recovery and args.decision == "revise" and run["status"] == "recovery_active":
+            # T13 is only reachable from a recovery attempt that did NOT enter
+            # recovery_active. recovery_active forbids revise entirely: the
+            # restricted state may only pass, or escalate/cancel.
+            raise GuardError("run_state_forbidden",
+                             "recovery_active may not revise; escalate or cancel instead")
+        closing_group = gate_fault_group(run, args.decision)
+        if recovery and args.decision == "revise":
+            auth = recovery_authorization_for(run)
+            if not recovery_business_negatives(run, auth):
+                # A revise without a business negative would be washing away the
+                # technical faults and refunding budget. Refuse it.
+                raise GuardError("fault_group_open",
+                                 "a recovery revise requires at least one valid business negative "
+                                 "(blocked report or fail/needs-work verdict); a technical redo "
+                                 "cannot be converted into a business revise")
+            if run["round"] + 1 > run["settings"]["orchestration"]["max_rounds"]:
+                run["pending_round_limit"] = {"kind": "business", "source": "recovery-revise"}
+        # Only the CURRENT attempt matters. Abandoned dispatches are decided
+        # records and never positive evidence; a blocked one is a business
+        # negative that `revise` (not `pass`) is meant to consume, so it stays
+        # out of this "still open?" predicate. `pass` over a blocked member is
+        # refused by the complete/pass check below, with a message that names
+        # the actual reason instead of calling it unresolved.
         if args.decision in ("pass", "revise"):
             pending = [x for x in run["dispatches"] if x["stage_index"] == run["stage_index"] and
                        x.get("stage_attempt", 1) == run["stage_attempt"] and
-                       x["status"] != "settled"]
+                       x["status"] not in ("settled", "blocked", "abandoned")]
             if pending:
                 raise Error(f"Cannot {args.decision} stage with unresolved/blocked dispatches: {[x['id'] for x in pending]}")
+        good = None
         if args.decision == "pass" and actor != "lead":
             all_recs = [x for x in run["dispatches"] if x["stage_index"] == run["stage_index"] and
                         x.get("stage_attempt", 1) == run["stage_attempt"] and x["role"] == actor]
@@ -1497,38 +3159,94 @@ def run_gate(args):
             good = all_recs[-1]  # A later failing review overrides an earlier pass.
             if good["status"] != "settled" or good.get("report", {}).get("verdict") != "pass" or not good.get("artifact_sha256"):
                 raise Error(f"Latest {actor} artifact is not an approved result")
-            for role_name in set(x["role"] for x in run["dispatches"] if x["stage_index"] == run["stage_index"] and
-                                 x.get("stage_attempt", 1) == run["stage_attempt"]):
+        if args.decision == "pass":
+            checked_roles = set(x["role"] for x in run["dispatches"] if x["stage_index"] == run["stage_index"] and
+                                x.get("stage_attempt", 1) == run["stage_attempt"])
+            if recovery:
+                # T10: every required role must produce a NEW report in the
+                # recovery attempt, with a positive verdict and a hash that
+                # still matches the collected bytes. A lead actor is no
+                # exception to checking the required roles.
+                auth = recovery_authorization_for(run)
+                checked_roles |= set(auth["required_roles"]) if auth else set()
+            for role_name in sorted(checked_roles):
                 latest_role = [x for x in run["dispatches"] if x["stage_index"] == run["stage_index"] and
-                               x.get("stage_attempt", 1) == run["stage_attempt"] and x["role"] == role_name][-1]
-                if latest_role.get("report", {}).get("verdict") != "pass":
-                    raise Error(f"Latest remediation/worker artifact for {role_name} is not pass")
-            # Pin evidence to the bytes collected. If Worker changes its report
-            # after collection, an old gate cannot silently endorse new bytes.
-            _report, digest = read_result(run, good)
-            if digest != good["artifact_sha256"]:
-                raise Error("Worker artifact changed after collection")
-            if stage["stage"] in ("self_test", "independent_test"):
+                               x.get("stage_attempt", 1) == run["stage_attempt"] and x["role"] == role_name]
+                if not latest_role:
+                    raise Error(f"Latest remediation/worker artifact for {role_name} is missing")
+                rec = latest_role[-1]
+                report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
+                if recovery and auth is not None and role_name in auth.get("required_roles", []):
+                    # T10: a recovery pass needs a COMPLETE report with a pass
+                    # verdict. A business-blocked report is a negative, not a pass.
+                    if rec.get("status") != "settled" or report.get("status") != "complete" \
+                            or report.get("verdict") != "pass":
+                        raise Error(f"Required role {role_name} has no complete/pass recovery report")
+                elif rec.get("status") != "settled" or report.get("status") != "complete" \
+                        or report.get("verdict") != "pass":
+                    # A `blocked` record carrying a pass verdict is still a
+                    # business negative: status, report status and verdict must
+                    # ALL be affirmative before it can back a stage pass.
+                    raise Error(f"Latest remediation/worker artifact for {role_name} is not a "
+                                f"settled complete/pass result")
+                _report, digest = read_result(run, rec)
+                if digest != rec.get("artifact_sha256"):
+                    raise Error(f"Worker artifact for {role_name} changed after collection")
+            if good is None:
+                own = [x for x in run["dispatches"] if x["stage_index"] == run["stage_index"]
+                       and x.get("stage_attempt", 1) == run["stage_attempt"] and x["role"] == actor]
+                good = own[-1] if own else None
+            if good is not None and stage["stage"] in ("self_test", "independent_test"):
                 tests = good["report"].get("tests", [])
                 if not tests or any(t["exit_code"] != 0 for t in tests):
                     raise Error("Test stage requires explicit passing test records with exit_code=0")
         if args.decision == "pass" and actor == "lead":
             # Lead attestation remains human/agent reasoning, not an external proof.
             pass
+        if recovery:
+            # A recovery decision needs an independent human authentication bound
+            # to the decision, Run, stage, attempt, current dispatch hashes, the
+            # group and the slot. A Lead-typed evidence string is NOT that.
+            require_recovery_gate_authentication(run, args.decision,
+                                                 recovery_authorization_for(run),
+                                                 closing_group)
         if len(args.evidence.strip()) < 12:
             raise Error("Gate requires specific evidence (at least 12 characters)")
         run["events"].append({"at": now(), "type": "gate", "stage": stage["stage"],
                               "stage_index": run["stage_index"], "stage_attempt": run["stage_attempt"],
                               "decision": args.decision, "evidence": args.evidence,
-                              "artifact_sha256": good["artifact_sha256"] if args.decision == "pass" and actor != "lead" else None})
+                              "artifact_sha256": good["artifact_sha256"] if args.decision == "pass" and good else None})
+        if closing_group is not None:
+            by_id = {d["id"]: d for d in run["dispatches"]}
+            current_members = [by_id[i] for i in closing_group.get("members", []) if i in by_id]
+            close_fault_group(run, closing_group, {
+                "by": "gate", "decision": args.decision, "stage_index": run["stage_index"],
+                "stage_attempt": run["stage_attempt"], "evidence": args.evidence, "at": now(),
+                "group_sha256": closing_group.get("member_snapshot_sha256"),
+                "member_hashes_sha256": group_digest(closing_group["stage_index"],
+                                                     closing_group["root_attempt"],
+                                                     current_members),
+                "gate_event_index": len(run["events"]) - 1},
+                auth=recovery_authorization_for(run))
+            run["events"].append({"at": now(), "type": "fault_group_closed",
+                                  "group_id": closing_group["id"], "decision": args.decision})
+        pending_limit = run.pop("pending_round_limit", None)
         if args.decision == "pass":
+            if recovery:
+                # T10: recovery succeeded. Round is untouched; the Run returns
+                # to ordinary operation and the closed group no longer limits it.
+                run["status"] = "active"
             run["stage_index"] += 1
             run["stage_attempt"] = 1
         elif args.decision == "revise":
             run["round"] += 1
             run["stage_attempt"] += 1
+            if recovery:
+                run["status"] = "active"
             if run["round"] > run["settings"]["orchestration"]["max_rounds"]:
                 run["status"] = "blocked_round_limit"
+                run["round_limit_provenance"] = (pending_limit or
+                                                 {"kind": "business", "source": "gate-revise"})
         else: run["status"] = "blocked"
         save(run_file(args.run_id), run)
     return {"decision": args.decision, "status": run["status"], **stage_info(run)}
@@ -1607,7 +3325,7 @@ def run_drive(args):
                 if events and events[-1]["type"] == "driver_started" and not args.resume:
                     reason, detail = "resume_required", "Previous drive interrupted; use --resume"
                     return result()
-                if run["status"] != "active":
+                if run["status"] not in ("active", "recovery_active"):
                     reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
                     return result()
                 for role in run["roles"]:
@@ -1625,7 +3343,7 @@ def run_drive(args):
                 # on every iteration would repeat the same Herdr round-trips. The
                 # per-iteration identity check below still guards each Worker.
                 run, herdr_session, _own = _require_run_with_session(runid, tier="A")
-                if run["status"] != "active":
+                if run["status"] not in ("active", "recovery_active"):
                     reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
                     break
                 if time.monotonic() >= deadline:
@@ -1634,7 +3352,7 @@ def run_drive(args):
                 if len(steps) >= args.max_steps:
                     reason = "max_steps"
                     break
-                pending = [d for d in run["dispatches"] if d["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain")]
+                pending = [d for d in run["dispatches"] if is_current(run, d) and d["status"] in UNRESOLVED]
                 if pending:
                     rec = pending[0]
                     try:
@@ -1654,9 +3372,14 @@ def run_drive(args):
                         reason = "worker_blocked" if collected["status"] == "blocked" else "stuck_unsettled"
                         break
                     continue
-                if any(d["status"] == "blocked" and d["stage_index"] == run["stage_index"] and
-                       d.get("stage_attempt", 1) == run["stage_attempt"] for d in run["dispatches"]):
+                if pending_dispatches(run, ("blocked",)):
                     reason = "worker_blocked"
+                    break
+                if pending_dispatches(run, ("abandoned",)) and recovery_authorization_for(run) is None:
+                    # Drive never fabricates a recovery authorization.
+                    reason, detail = "recovery_authorization_invalid", (
+                        "an abandoned dispatch exists in the current attempt; no recovery "
+                        "authorization is available. Run recover-attempt or escalate")
                     break
                 stage = stage_info(run)
                 if stage.get("actor") == "lead" or stage.get("stage") is None:
@@ -1786,11 +3509,53 @@ def run_drive(args):
 def run_finish(args):
     with locked():
         run = require_run(args.run_id, tier="C")
-        if run["status"] != "active": raise Error(f"Run status {run['status']}; cannot finish")
+        check_transition(run, "finish")
+        open_groups = [g for g in run.get("fault_groups", []) if g.get("status") == "open"]
+        if open_groups:
+            raise GuardError("fault_group_open",
+                             f"fault group {open_groups[0]['id']} is still open; close it before finishing")
+        for closed in [g for g in run.get("fault_groups", []) if g.get("status") == "closed"]:
+            problems = closure_problems(run, closed)
+            if problems:
+                raise GuardError("history_unresolved",
+                                 f"fault group {closed['id']} has no verifiable closure: {problems[0]}")
+        open_auths = [a for a in run.get("recovery_authorizations", []) if a.get("status") == "active"]
+        if open_auths:
+            raise GuardError("recovery_authorization_invalid",
+                             f"recovery authorizations still active: {[a['id'] for a in open_auths]}")
+        # Every abandoned dispatch must be covered by a closed group: an
+        # abandonment nobody recovered is an unclosed historical fault, not a
+        # decided record a finished Run may just walk past.
+        covered = {m for g in run.get("fault_groups", []) if g.get("status") == "closed"
+                   for m in g.get("members", [])}
+        orphaned = [d["id"] for d in run["dispatches"]
+                    if d.get("status") == "abandoned" and d["id"] not in covered]
+        if orphaned:
+            raise GuardError("history_unresolved",
+                             f"abandoned dispatches with no closed fault group: {orphaned}")
         if run["stage_index"] != len(run["stages"]):
             raise Error(f"Cannot finish; next required stage is {stage_info(run)['stage']}")
-        if any(x["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain", "blocked") for x in run["dispatches"]):
-            raise Error("Cannot finish while some dispatched work is unresolved or blocked")
+        # Attempt-scoped: at the finish sentinel `stage_index` is len(stages),
+        # so this predicate matches nothing and cannot be the last line of
+        # defence. Gate transitions must have refused unresolved current work.
+        # A historical `blocked` is NOT a decided record that finish may walk
+        # past: it is an unresolved business negative, so it blocks finishing
+        # just like an unresolved historical dispatch does below.
+        if pending_dispatches(run, UNRESOLVED + ("blocked",)):
+            raise GuardError("dispatch_unresolved", "current attempt still has unresolved work")
+        # Design case 32: a blocked record is consumed once its stage goes on
+        # to pass in a later attempt — then it is history and the Run finishes.
+        # A blocked record whose stage never passed afterwards is the last word
+        # on that stage: an unresolved business negative that finish must not
+        # walk past.
+        passed_stages = {e.get("stage_index") for e in run["events"]
+                         if e.get("type") == "gate" and e.get("decision") == "pass"}
+        unresolved_history = [d["id"] for d in run["dispatches"]
+                              if d["status"] in UNRESOLVED or
+                              (d["status"] == "blocked" and d.get("stage_index") not in passed_stages)]
+        if unresolved_history:
+            raise GuardError("history_unresolved",
+                             f"unresolved historical dispatches: {unresolved_history}")
         passed = {e.get("stage_index") for e in run["events"] if e.get("type") == "gate" and e.get("decision") == "pass"}
         if passed != set(range(len(run["stages"]))):
             raise Error("Some mandatory gates have no recorded pass event")
@@ -1806,6 +3571,9 @@ def run_pause(args, paused):
         run, _session, ownership = _require_run_with_session(
             args.run_id, tier="B" if paused else "C")
         if paused:
+            if run["status"] == "recovery_active":
+                raise GuardError("run_state_forbidden",
+                                 "recovery_active may not be paused; pass, escalate or cancel")
             if run["status"] != "active": raise Error("Only active run can be paused")
             run["status"] = "paused"
             event = {"at": now(), "type": "pause"}
@@ -1837,10 +3605,21 @@ def run_list():
             run = load(p)
             if run.get("context") != ctx:
                 continue
-            pending = [d["id"] for d in run.get("dispatches", []) if d["status"] not in ("settled",)]
+            pending = [d["id"] for d in run.get("dispatches", [])
+                       if is_current(run, d) and d["status"] not in DECIDED]
+            historical = [{"id": d["id"], "status": d["status"], "stage_index": d.get("stage_index"),
+                           "stage_attempt": d.get("stage_attempt", 1)}
+                          for d in run.get("dispatches", [])
+                          if not is_current(run, d) and d["status"] not in ("settled",)]
+            abandoned = [d["id"] for d in run.get("dispatches", []) if d.get("status") == "abandoned"]
             result.append({"run_id": run["id"], "status": run["status"],
                            "stage": stage_info(run)["stage"], "pending_dispatches": pending,
-                           "ledger_session": ledger_ownership(run, current, p)})
+                           "ledger_session": ledger_ownership(run, current, p),
+                           "historical_decided": historical, "abandoned_dispatches": abandoned,
+                           "open_fault_groups": [{"id": g["id"], "stage_index": g["stage_index"],
+                                                  "root_attempt": g["root_attempt"]}
+                                                 for g in run.get("fault_groups", [])
+                                                 if g.get("status") == "open"]})
     return {"runs": result, "unfinished": [x for x in result if x["status"] not in ("finished", "cancelled")]}
 
 
@@ -1848,37 +3627,132 @@ def run_recover(args):
     """Read-only reconciliation hint. Never resend uncertain prompts."""
     with locked():
         run = require_run(args.run_id, tier="A")
-        pending = [d for d in run.get("dispatches", []) if d["status"] not in ("settled",)]
+        pending = [d for d in run.get("dispatches", []) if is_current(run, d) and d["status"] not in DECIDED]
+        historical = [d for d in run.get("dispatches", []) if not is_current(run, d) and d["status"] != "settled"]
+        abandoned = [d for d in run.get("dispatches", []) if d.get("status") == "abandoned"]
+        group = sync_group_members(run, fault_group_for(run)) if fault_group_for(run) else None
+        if group is None:
+            group = current_group(run)
+        auth = recovery_authorization_for(run, attempt=run["stage_attempt"])
         return {"run_id": run["id"], "run_status": run["status"], "current_stage": stage_info(run),
+                "fault_group": None if group is None else {
+                    "id": group["id"], "members": group["members"],
+                    "has_abandoned": group_has_abandoned(run, group),
+                    "required_roles": required_roles(run, group),
+                    "next": "run recover-attempt" if group_has_abandoned(run, group)
+                            else "close the group with an ordinary gate after every member is decided"},
+                "recovery_authorization": None if auth is None else {
+                    "id": auth["id"], "required_roles": auth["required_roles"],
+                    "slots": {r: s.get("status") for r, s in auth["slots"].items()},
+                    "role_budgets": auth.get("role_budgets")},
                 "pending_dispatches": [{"id": d["id"], "role": d["role"],
                                        "status": d["status"], "report_path": d.get("result_file"),
-                                       "next": f"run collect --run-id {run['id']} --dispatch-id {d['id']}"}
-                                      for d in pending],
-                "next": "Inspect bound artifacts and run collect for every unsettled dispatch; NEVER blindly resend. Then resume an explicitly paused Run."}
+                                       "next": _next_hint(run, d)} for d in pending],
+                "historical_decided": [{"id": d["id"], "role": d["role"], "status": d["status"],
+                                        "stage_index": d.get("stage_index"),
+                                        "stage_attempt": d.get("stage_attempt", 1),
+                                        "note": "decided record of an earlier attempt; not pending"}
+                                       for d in historical],
+                "abandoned_dispatches": [{"id": d["id"], "role": d["role"],
+                                          "evidence": d.get("abandon_evidence"),
+                                          "risk_accepted": d.get("abandon_risk_accepted")} for d in abandoned],
+                "next": "Collect every unresolved CURRENT dispatch; historical and abandoned records are "
+                        "decided and must not be re-collected. NEVER blindly resend."}
+
+
+def _next_hint(run, rec):
+    if rec.get("status") == "blocked":
+        return (f"run collect --run-id {run['id']} --dispatch-id {rec['id']} "
+                f"(legacy blocked: re-check binding, business revise only with a valid report)")
+    return f"run collect --run-id {run['id']} --dispatch-id {rec['id']}"
 
 
 def run_cancel(args):
     """Explicitly mark a Run abandoned; never claim completion or delete workers."""
     with locked():
         run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
-        if run["status"] in ("finished", "cancelled"):
-            raise Error("Run is already terminal")
+        check_transition(run, "cancel")
         if args.confirm_run_id != args.run_id or len(args.reason.strip()) < 12:
             raise Error("Cancellation requires --confirm-run-id matching --run-id and specific --reason")
-        pending = [d["id"] for d in run["dispatches"] if d["status"] not in ("settled", "blocked")]
+        pending = [d["id"] for d in run["dispatches"] if d["status"] not in ("settled", "blocked", "abandoned")]
         if pending:
             raise Error(f"Cannot cancel while dispatches are unresolved: {pending}. Inspect and reconcile safely")
-        for role in run["roles"]:
-            if not verify_existing(role, session=herdr_session):
-                raise Error("Worker disappeared. Do not release its reservation before manual reconciliation")
-            info = lookup_agent(role["agent_name"], session=herdr_session)
-            status = agent_status_of(info)
-            if status not in ("idle", "done", "blocked"):
-                raise Error(f"Worker {role['agent_name']} is {status}; cannot safely release reservation")
+        # T17 is graded by whether this Run ever dispatched a prompt, not by
+        # its state or by whether a fault group exists.
+        #
+        # SAFETY PREMISE: run_dispatch saves the dispatch into the ledger
+        # (scripts/htm.py:2513) BEFORE it actually sends the prompt at :2556
+        # (:2517 only builds the `agent prompt` command). So an
+        # empty `dispatches` list reliably proves no prompt was ever sent by
+        # this Run, and therefore there is no executor to stop or isolate.
+        # That is an absent obligation, not a lowered bar: no executor exists,
+        # so no isolation proof can be required. Neither an idle/done
+        # observation nor a caller's risk declaration is ever accepted as proof
+        # for a Run that HAS dispatched.
+        clean_run = (not run.get("dispatches")
+                     and not run.get("fault_groups")
+                     and not run.get("recovery_authorizations"))
+        if clean_run:
+            # Class A: nothing was ever dispatched. Re-checked under the lock,
+            # so a concurrent dispatch that landed first is caught here.
+            cancel_scope = "no_execution_history"
+            run["status"] = "cancelled"
+            run["events"].append({"at": now(), "type": "cancel", "reason": args.reason,
+                                  "cancel_scope": cancel_scope})
+            save(run_file(args.run_id), run)
+            return {"run_id": args.run_id, "status": "cancelled", "finished": False,
+                    "cancel_scope": cancel_scope}
+        # Class B: this Run has execution history, so every actor it may have
+        # started must be proven stopped/isolated with known side effects before
+        # the reservation is released. A fault-group context is included as
+        # evidence (a real abandon leaves a TRANSIENT group before
+        # recover-attempt persists it).
+        recovery_group = current_group(run)
+        abort_groups = [g for g in run.get("fault_groups", []) if g.get("status") == "open"]
+        fault_group_ids = ([recovery_group["id"]] if recovery_group is not None else [])
+        for group in abort_groups:
+            if group["id"] not in fault_group_ids:
+                fault_group_ids.append(group["id"])
+        control = trusted_control()
+        try:
+            verdict = control({"type": "verify", "action": "cancel", "run_id": run["id"],
+                               "stage_index": run["stage_index"],
+                               "stage_attempt": run["stage_attempt"],
+                               "fault_group_ids": fault_group_ids,
+                               "abandoned_dispatch_ids": [d["id"] for d in
+                                                          abandoned_predecessors(run)],
+                               "roles": [dict(role_identity(r), role=r["role"])
+                                         for r in run["roles"]]})
+        except GuardError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise GuardError("execution_not_fenced",
+                             f"trusted control plane unavailable: {e}") from e
+        if not isinstance(verdict, dict) or verdict.get("isolation") != "confirmed" \
+                or verdict.get("side_effects") != "known" or verdict.get("revoked") not in (False, None):
+            raise GuardError("execution_not_fenced",
+                             "cancel needs verified isolation, identity and side-effect "
+                             "safety for every actor; an observation is not proof")
+        if sorted(verdict.get("verified_roles") or []) != sorted(r["role"] for r in run["roles"]):
+            raise GuardError("identity_mismatch",
+                             "cancel must verify every actor identity")
         run["status"] = "cancelled"
-        run["events"].append({"at": now(), "type": "cancel", "reason": args.reason})
+        for group in run.get("fault_groups", []):
+            if group.get("status") == "open":
+                # A cancelled Run is terminal: the group is closed by T17, not
+                # by a recovery proof, so it keeps no closure evidence.
+                group["status"] = "cancelled"
+                group["closed_at"] = now()
+                group.setdefault("events", []).append({"at": now(), "type": "closed_by_cancel",
+                                                       "reason": args.reason})
+        for auth in run.get("recovery_authorizations", []):
+            if auth.get("status") == "active":
+                revoke_slots(auth)
+        run["events"].append({"at": now(), "type": "cancel", "reason": args.reason,
+                              "cancel_scope": "execution_history"})
         save(run_file(args.run_id), run)
-    return {"run_id": args.run_id, "status": "cancelled", "finished": False}
+    return {"run_id": args.run_id, "status": "cancelled", "finished": False,
+            "cancel_scope": "execution_history"}
 
 
 def emit(obj):
@@ -1923,7 +3797,8 @@ def main():
             raise argparse.ArgumentTypeError("--wait-timeout-seconds must be >= 1")
         return parsed
 
-    for cmd in ("status", "stage", "finish", "pause", "resume", "approve", "dispatch", "collect", "gate", "recover", "cancel", "drive"):
+    for cmd in ("status", "stage", "finish", "pause", "resume", "approve", "dispatch", "collect", "gate",
+                "recover", "cancel", "drive", "diagnose", "abandon", "recover-attempt"):
         sub = rsp.add_parser(cmd)
         sub.add_argument("--run-id", required=True)
         if cmd == "cancel":
@@ -1944,6 +3819,18 @@ def main():
             sub.add_argument("--no-wait", action="store_true", help="submit without waiting; explicit run collect required")
             sub.add_argument("--wait-timeout-seconds", type=_positive_timeout)
         if cmd == "collect": sub.add_argument("--dispatch-id", required=True)
+        if cmd == "diagnose": sub.add_argument("--dispatch-id", required=True)
+        if cmd == "recover-attempt":
+            sub.add_argument("--dispatch-id", required=True)
+            sub.add_argument("--evidence", required=True, help="snapshot id from `run diagnose`")
+        if cmd == "abandon":
+            sub.add_argument("--dispatch-id", required=True)
+            sub.add_argument("--reason", required=True)
+            sub.add_argument("--evidence", required=True, help="snapshot id from `run diagnose`")
+            sub.add_argument("--confirm-untracked", action="store_true",
+                             help="record explicit risk acceptance when absence is unproven")
+            sub.add_argument("--quarantine-invalid", action="store_true",
+                             help="retain the raw bytes of an invalid artifact before abandoning")
         if cmd == "gate":
             sub.add_argument("--decision", required=True, choices=("pass", "revise", "blocked")); sub.add_argument("--evidence", required=True)
     args = p.parse_args()
@@ -1978,7 +3865,8 @@ def main():
             action = {"approve": run_approve, "dispatch": run_dispatch, "collect": run_collect, "gate": run_gate,
                       "finish": run_finish, "pause": lambda a: run_pause(a,True),
                       "resume": lambda a: run_pause(a,False), "recover": run_recover,
-                      "cancel": run_cancel, "drive": run_drive}[args.run_cmd]
+                      "cancel": run_cancel, "drive": run_drive, "diagnose": _run_diagnose,
+                      "abandon": run_abandon, "recover-attempt": run_recover_attempt}[args.run_cmd]
             emit(action(args)); return 0
     except (Error, TypeError, KeyError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

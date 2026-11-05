@@ -20,6 +20,20 @@ import test_htm
 from test_htm import h, opts, isolate_git_env
 
 
+def verified_cancel_control(payload):
+    """A fake trusted control plane that confirms a safe cancel (T17)."""
+    if payload.get('action') == 'cancel':
+        return {'isolation': 'confirmed', 'side_effects': 'known', 'revoked': False,
+                'verified_roles': [r['role'] for r in payload.get('roles', [])]}
+    return {}
+
+
+@contextlib.contextmanager
+def verified_cancel_plane():
+    with patch.object(h, 'TRUSTED_CONTROL', verified_cancel_control):
+        yield
+
+
 def ns(**kwargs):
     return types.SimpleNamespace(**kwargs)
 
@@ -880,6 +894,9 @@ class AdversarialTests(unittest.TestCase):
     def test_uncertain_warning_survives_ledger_recheck_failure(self):
         # A dispatch failure must never be reported as a clean failure: the input may
         # have been sent. This holds even if the follow-up ledger read also fails.
+        # The recheck itself now goes through finalize(), which swallows its own
+        # read errors and simply records nothing -- so the warning has to come
+        # from the dispatch path alone.
         rid = self.start()
         state = {'prompt_failed': False}
         original_require_run = h.require_run
@@ -894,8 +911,9 @@ class AdversarialTests(unittest.TestCase):
             return original_require_run(runid, **kwargs)
         with patch.object(h, 'herdr', side_effect=broken), \
                 patch.object(h, 'require_run', side_effect=require_run):
-            with self.assertRaisesRegex(h.Error, 'uncertain.*might have been sent.*State recheck also failed'):
+            with self.assertRaisesRegex(h.Error, 'uncertain.*might have been sent'):
                 self.dispatch(rid)
+        self.assertTrue(state['prompt_failed'])
 
     def test_unknown_agent_state_does_not_settle_even_with_report(self):
         rid = self.start()
@@ -928,7 +946,8 @@ class AdversarialTests(unittest.TestCase):
         self.start()
         # Release the first run so both child processes race for the same Team.
         rid=h.run_list()['unfinished'][0]['run_id']
-        h.run_cancel(ns(run_id=rid,confirm_run_id=rid,reason='Cancel before concurrent stress test'))
+        with verified_cancel_plane():
+            h.run_cancel(ns(run_id=rid,confirm_run_id=rid,reason='Cancel before concurrent stress test'))
         ctx=multiprocessing.get_context('fork')
         q=ctx.Queue(); barrier=ctx.Barrier(2)
         workers=[ctx.Process(target=start_in_child,args=(q,barrier)) for _ in range(2)]
@@ -1106,7 +1125,8 @@ class AdversarialTests(unittest.TestCase):
         with self.assertRaisesRegex(h.Error,'unresolved'):
             h.run_cancel(ns(run_id=rid,confirm_run_id=rid,reason='Owner explicitly cancels test run'))
         h.run_collect(ns(run_id=rid,dispatch_id=d['dispatch_id']))
-        result=h.run_cancel(ns(run_id=rid,confirm_run_id=rid,reason='Owner explicitly cancels test run'))
+        with verified_cancel_plane():
+            result=h.run_cancel(ns(run_id=rid,confirm_run_id=rid,reason='Owner explicitly cancels test run'))
         self.assertEqual(result['status'],'cancelled')
         self.assertFalse(result['finished'])
         h.run_start(self.cfg, ns(goal='New run after explicit cancellation'))
