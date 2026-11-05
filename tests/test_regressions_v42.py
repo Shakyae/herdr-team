@@ -392,6 +392,31 @@ class DerivedPaneContextTests(unittest.TestCase):
             h.herdr('pane', 'list', session='default')
             process.assert_called_once_with(['herdr', '--session', 'default', 'pane', 'list'], timeout=40)
 
+    def test_derived_branch_cross_checks_an_inherited_session(self):
+        # Happier's claude keeps HERDR_SESSION / HERDR_SOCKET_PATH. The derived
+        # branch used to ignore them entirely, so it applied a weaker rule than
+        # the native branch to exactly the values an attacker can inherit or
+        # forge. Disagreement with the kernel evidence must reject.
+        identity = {'session': 'inner', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {'HERDR_SESSION': 'outer'}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity):
+            with self.assertRaisesRegex(h.Error, '进程归属 session 与环境不一致'):
+                h.lead_identity()
+
+    def test_derived_branch_accepts_a_matching_inherited_session(self):
+        identity = {'session': 'inner', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {'HERDR_SESSION': 'inner'}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity):
+            self.assertEqual(h.lead_identity()['session'], 'inner')
+
+    def test_derived_branch_rejects_a_foreign_socket(self):
+        identity = {'session': 'inner', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {'HERDR_SOCKET_PATH': '/tmp/outer.sock'}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity), \
+                patch.object(h, 'socket_session', return_value='outer'):
+            with self.assertRaisesRegex(h.Error, 'Herdr socket 与进程归属不一致'):
+                h.lead_identity()
+
     def test_context_double_probe_and_no_environment_write(self):
         identity = {'session': 'default', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
         with patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', return_value=identity) as probe:
@@ -1922,6 +1947,113 @@ class LedgerIdentityTests(unittest.TestCase):
         for name in list(self.live):
             self.live[name] = None
         self.assertEqual(h.require_run(self.rid, tier='C-')['id'], self.rid)
+
+    def test_dispatch_survives_a_worker_that_exits_after_answering(self):
+        # P0 regression, end to end. A one-shot Worker (`claude -p`, which is
+        # what Happier starts) writes its report and then exits. `finalize`
+        # re-reads the ledger under a lock to write that result back; with a
+        # live-anchor requirement it refuses the Worker's OWN legitimate
+        # report, and the dispatch is left in submission_uncertain forever --
+        # uncollectable and uncancellable, i.e. the Issue #2 lock-up again.
+        live = self.live
+        # Align the live UUIDs with what the ledger recorded, so the only thing
+        # under test is the Worker exiting between answer and write-back.
+        for role in h.require_run(self.rid)['roles']:
+            live[role['agent_name']] = dict(live[role['agent_name']],
+                                            agent_session=role['agent_session'])
+        orig = h.herdr
+
+        def one_shot(*argv, **kw):
+            if argv[:2] == ('agent', 'prompt'):
+                pending = [d for d in h.require_run(self.rid)['dispatches']
+                           if d['status'] not in ('settled',)]
+                rec = pending[-1]
+                path = h.result_path(self.rid, rec['id'])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    'run_id': self.rid, 'dispatch_id': rec['id'], 'role': rec['role'],
+                    'stage': rec['stage'] if 'stage' in rec else
+                             h.stage_info(h.require_run(self.rid))['stage'],
+                    'stage_attempt': 1, 'status': 'complete',
+                    'verdict': 'pass', 'summary': 'the one-shot worker finished its task',
+                    'evidence': ['worker wrote this report before exiting'],
+                    'tests': [{'command': 'true', 'exit_code': 0}]}))
+                for name in list(live):        # the Worker has now exited
+                    live[name] = None
+                return {'agent': {'name': 'dev-w1p2', 'agent_status': 'idle'}}
+            return orig(*argv, **kw)
+
+        with patch.object(h, 'herdr', side_effect=one_shot):
+            actor = h.stage_info(h.require_run(self.rid))['actor']
+            out = h.run_dispatch(ns(run_id=self.rid, role=actor, message='do the task',
+                                    effect='read', remediation=False, no_wait=False))
+        self.assertEqual(out['status'], 'settled', out)
+        rec = json.loads(h.run_file(self.rid).read_text())['dispatches'][-1]
+        self.assertEqual(rec['status'], 'settled')
+        self.assertIsNotNone(rec.get('report'))
+
+    def test_gate_and_finish_do_not_demand_a_live_worker(self):
+        # Same root cause as above, different victim: a Run whose Workers are
+        # gone must still be closable. A gate writes ledger state only.
+        self.ledger_with_uuids()
+        for name in list(self.live):
+            self.live[name] = None
+        self.assertEqual(h.require_run(self.rid, tier='C-')['id'], self.rid)
+        with self.assertRaises(h.Error):
+            h.require_run(self.rid, tier='C')
+
+    def test_ledger_without_any_worker_identity_is_rejected_at_every_tier(self):
+        # "No identity recorded" is not the same as "the Workers died"; it
+        # cannot be attributed to anyone, so C- must reject it too.
+        data = self.ledger_with_uuids()
+        for role in data['roles']:
+            role.pop('agent_session', None)
+        h.run_file(self.rid).write_text(json.dumps(data))
+        for tier in ('C-', 'C'):
+            with self.subTest(tier=tier):
+                with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+                    h.require_run(self.rid, tier=tier)
+
+    def test_herdr_failure_is_reported_as_unobservable_not_absent(self):
+        # `lookup_agent` used to swallow every Error, so a herdr timeout and a
+        # genuinely absent agent both arrived as None. At tier C- (no anchor
+        # required) that turned "could not look" into "no contradiction" and
+        # waved the ledger through. The two must stay distinguishable.
+        role = h.require_run(self.rid)['roles'][0]
+        data = {'version': 3, 'roles': [role]}
+
+        # The class setUp already patches lookup_agent, so drive the inner
+        # herdr call the way a real failure would arrive.
+        def boom(*a, **kw):
+            raise h.HerdrError('herdr timed out', code='timeout')
+
+        def gone(*a, **kw):
+            raise h.HerdrError('not found', code='agent_not_found')
+
+        def failing_lookup(name, session=None, on_error=None):
+            try:
+                raise boom()
+            except h.Error as e:
+                if on_error is not None:
+                    on_error(e)
+                return None
+
+        def absent_lookup(name, session=None, on_error=None):
+            try:
+                raise gone()
+            except h.HerdrError as e:
+                if e.code == 'agent_not_found':
+                    return None
+                raise
+
+        with patch.object(h, 'lookup_agent', side_effect=failing_lookup):
+            _v, _t, conflicts, unavailable = h._inspect_roles(data, 'default')
+        self.assertEqual(conflicts, [])
+        self.assertTrue(unavailable, 'a herdr failure must be recorded as unobservable')
+
+        with patch.object(h, 'lookup_agent', side_effect=absent_lookup):
+            _v, _t, conflicts, unavailable = h._inspect_roles(data, 'default')
+        self.assertEqual((conflicts, unavailable), ([], []))
 
     def test_presence_probe_carries_the_bound_session(self):
         # Regression: `role` has no session key -- the session lives on the Run.

@@ -264,7 +264,19 @@ def lead_identity(require=True):
         first = pane_of_current_process()
         if first != pane_of_current_process():
             raise Error("Herdr pane 身份不唯一，拒绝猜测（两次探测不一致）")
-        return {"context": {"workspace": first["workspace"], "lead_pane": first["pane"], "lead_tab": first["tab"]}, "session": first["session"]}
+        session = first["session"]
+        # The same rule the native branch applies: an inherited HERDR_* value is
+        # weak evidence, but a CONTRADICTION between it and the kernel evidence
+        # is meaningful. Happier's claude keeps both variables, so discarding
+        # them here throws away the only cross-check available. Absent or blank
+        # values are fine -- only disagreement rejects.
+        env_session = os.environ.get("HERDR_SESSION", "")
+        if env_session and env_session != session:
+            raise Error(f"Herdr 进程归属 session 与环境不一致: {env_session!r} != {session!r}")
+        socket = os.environ.get("HERDR_SOCKET_PATH", "")
+        if socket and socket_session(socket) != session:
+            raise Error(f"Herdr socket 与进程归属不一致: {socket!r} != {session!r}")
+        return {"context": {"workspace": first["workspace"], "lead_pane": first["pane"], "lead_tab": first["tab"]}, "session": session}
     if require and os.environ.get("HERDR_ENV") != "1":
         raise Error("Must run inside Herdr: HERDR_ENV=1")
     ws = os.environ.get("HERDR_WORKSPACE_ID", "")
@@ -429,10 +441,13 @@ def require_roles_owned(data, session, path, require_anchor=True):
     verified, total, conflicts, unavailable = _inspect_roles(data, session)
     if conflicts:
         raise LedgerIdentityError(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
+    if total == 0:
+        # Applies at every tier, including C-: a ledger with no Worker identity
+        # at all cannot be attributed to anyone, and "no identity recorded" is
+        # not the same situation as "the Workers died".
+        raise LedgerIdentityError(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
     if not require_anchor:
         return verified, unavailable
-    if total == 0:
-        raise LedgerIdentityError(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
     if verified == 0:
         detail = ("；不可观察：" + "；".join(unavailable)) if unavailable else ""
         raise LedgerIdentityError(f"账本 {path} 的 Worker 均无法在当前 session 内验证身份；无法证明该账本属于当前 session。"
@@ -689,10 +704,25 @@ def agent_status_of(obj):
     return status if isinstance(status, str) and status else "unknown"
 
 
-def lookup_agent(name, session=None):
+def lookup_agent(name, session=None, on_error=None):
+    """Return the agent mapping, or None when it is absent.
+
+    A herdr failure other than `agent_not_found` is an OBSERVABILITY failure,
+    not evidence that the Worker is gone. Callers that treat absence and
+    unobservability differently (the identity checks do) pass `on_error` to see
+    the exception; everything else keeps the plain None contract.
+    """
     try:
         return agent_data(herdr("agent", "get", name, session=session))
-    except Error:
+    except HerdrError as e:
+        if e.code == "agent_not_found":
+            return None
+        if on_error is not None:
+            on_error(e)
+        return None
+    except Error as e:
+        if on_error is not None:
+            on_error(e)
         return None
 
 
@@ -737,10 +767,9 @@ def verify_existing(team_role, session=None):
     # agent and a genuinely absent one arrive here identically as a falsy value.
     # Ownership checks must not treat "could not look" as "does not match"; the
     # caller in _inspect_roles separates the two by exception type.
-    try:
-        found = lookup_agent(team_role["agent_name"], session=session)
-    except Error as e:
+    def unobservable(e):
         raise AgentUnobservable(str(e)) from e
+    found = lookup_agent(team_role["agent_name"], session=session, on_error=unobservable)
     if not found or not isinstance(found, dict):
         return False
     pane = found.get("pane")
@@ -1299,9 +1328,6 @@ def name_lead(args):
             "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
 
 
-IDENTITY_TIERS = ("A", "B", "C-", "C")
-
-
 def _require_run_with_session(runid, tier="C", target_role=None):
     """Load a Run and enforce ledger ownership for the caller's tier.
 
@@ -1775,7 +1801,14 @@ def run_abandon(args):
         # Tier C-: abandon is irreversible and consumes a diagnose snapshot. It
         # must work when the Worker is gone, so it rejects contradictions but
         # does not demand a live UUID.
-        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C-")
+        run, herdr_session, ownership = _require_run_with_session(args.run_id, tier="C-")
+        # ACCEPTED RISK, recorded here because it is irreversible: on a legacy
+        # ledger (no session tag) another session with the same workspace/pane
+        # IDs could reach this. Demanding a live anchor would close that hole
+        # but would also make abandon impossible exactly when it is needed --
+        # the Worker is gone -- which is the Issue #2 lock-up, and stricter
+        # than main (whose require_run performs no ownership check at all).
+        # The trace is made visible instead: see abandon_ledger_session below.
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
@@ -2881,7 +2914,15 @@ def run_dispatch(args):
         """
         try:
             with locked():
-                current = require_run(args.run_id, tier="C")
+                # Tier C-, not C: this is a pure write-back of an already
+                # recorded dispatch, and the Worker that is writing back has
+                # very often exited already (a one-shot `claude -p` Worker does
+                # exactly that). Demanding a live UUID anchor here would make
+                # `finalize` refuse the Worker's own legitimate report and
+                # leave the dispatch stuck in submission_uncertain forever --
+                # the lock-up Issue #2 exists to remove. Contradictions are
+                # still rejected by C-.
+                current = require_run(args.run_id, tier="C-")
                 rec = next((x for x in current["dispatches"] if x["id"] == stamp), None)
                 if rec is None:
                     return None
@@ -3220,7 +3261,11 @@ def gate_fault_group(run, decision, session=None):
 
 def run_gate(args):
     with locked():
-        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
+        # Tier C-: a gate writes this ledger's own state and never touches a
+        # Worker. A one-shot Worker is normally GONE by the time its stage is
+        # gated, so requiring a live anchor here would make every such Run
+        # unclosable. Contradictions are still rejected.
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C-")
         check_transition(run, "gate")
         stage = stage_info(run)
         actor = stage["actor"]
@@ -3624,7 +3669,9 @@ def run_drive(args):
 
 def run_finish(args):
     with locked():
-        run = require_run(args.run_id, tier="C")
+        # Tier C-: same reasoning as gate -- finish records a decision about
+        # this ledger and touches no Worker.
+        run = require_run(args.run_id, tier="C-")
         check_transition(run, "finish")
         open_groups = [g for g in run.get("fault_groups", []) if g.get("status") == "open"]
         if open_groups:
