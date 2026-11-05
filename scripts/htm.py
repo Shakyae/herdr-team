@@ -429,10 +429,13 @@ def require_roles_owned(data, session, path, require_anchor=True):
     verified, total, conflicts, unavailable = _inspect_roles(data, session)
     if conflicts:
         raise LedgerIdentityError(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
+    if total == 0:
+        # Applies at every tier, including C-: a ledger with no Worker identity
+        # at all cannot be attributed to anyone, and "no identity recorded" is
+        # not the same situation as "the Workers died".
+        raise LedgerIdentityError(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
     if not require_anchor:
         return verified, unavailable
-    if total == 0:
-        raise LedgerIdentityError(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
     if verified == 0:
         detail = ("；不可观察：" + "；".join(unavailable)) if unavailable else ""
         raise LedgerIdentityError(f"账本 {path} 的 Worker 均无法在当前 session 内验证身份；无法证明该账本属于当前 session。"
@@ -1775,7 +1778,14 @@ def run_abandon(args):
         # Tier C-: abandon is irreversible and consumes a diagnose snapshot. It
         # must work when the Worker is gone, so it rejects contradictions but
         # does not demand a live UUID.
-        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C-")
+        run, herdr_session, ownership = _require_run_with_session(args.run_id, tier="C-")
+        # ACCEPTED RISK, recorded here because it is irreversible: on a legacy
+        # ledger (no session tag) another session with the same workspace/pane
+        # IDs could reach this. Demanding a live anchor would close that hole
+        # but would also make abandon impossible exactly when it is needed --
+        # the Worker is gone -- which is the Issue #2 lock-up, and stricter
+        # than main (whose require_run performs no ownership check at all).
+        # The trace is made visible instead: see abandon_ledger_session below.
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
@@ -2881,7 +2891,15 @@ def run_dispatch(args):
         """
         try:
             with locked():
-                current = require_run(args.run_id, tier="C")
+                # Tier C-, not C: this is a pure write-back of an already
+                # recorded dispatch, and the Worker that is writing back has
+                # very often exited already (a one-shot `claude -p` Worker does
+                # exactly that). Demanding a live UUID anchor here would make
+                # `finalize` refuse the Worker's own legitimate report and
+                # leave the dispatch stuck in submission_uncertain forever --
+                # the lock-up Issue #2 exists to remove. Contradictions are
+                # still rejected by C-.
+                current = require_run(args.run_id, tier="C-")
                 rec = next((x for x in current["dispatches"] if x["id"] == stamp), None)
                 if rec is None:
                     return None
@@ -3220,7 +3238,11 @@ def gate_fault_group(run, decision, session=None):
 
 def run_gate(args):
     with locked():
-        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
+        # Tier C-: a gate writes this ledger's own state and never touches a
+        # Worker. A one-shot Worker is normally GONE by the time its stage is
+        # gated, so requiring a live anchor here would make every such Run
+        # unclosable. Contradictions are still rejected.
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C-")
         check_transition(run, "gate")
         stage = stage_info(run)
         actor = stage["actor"]
@@ -3624,7 +3646,9 @@ def run_drive(args):
 
 def run_finish(args):
     with locked():
-        run = require_run(args.run_id, tier="C")
+        # Tier C-: same reasoning as gate -- finish records a decision about
+        # this ledger and touches no Worker.
+        run = require_run(args.run_id, tier="C-")
         check_transition(run, "finish")
         open_groups = [g for g in run.get("fault_groups", []) if g.get("status") == "open"]
         if open_groups:

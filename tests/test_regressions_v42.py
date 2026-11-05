@@ -1923,6 +1923,72 @@ class LedgerIdentityTests(unittest.TestCase):
             self.live[name] = None
         self.assertEqual(h.require_run(self.rid, tier='C-')['id'], self.rid)
 
+    def test_dispatch_survives_a_worker_that_exits_after_answering(self):
+        # P0 regression, end to end. A one-shot Worker (`claude -p`, which is
+        # what Happier starts) writes its report and then exits. `finalize`
+        # re-reads the ledger under a lock to write that result back; with a
+        # live-anchor requirement it refuses the Worker's OWN legitimate
+        # report, and the dispatch is left in submission_uncertain forever --
+        # uncollectable and uncancellable, i.e. the Issue #2 lock-up again.
+        live = self.live
+        # Align the live UUIDs with what the ledger recorded, so the only thing
+        # under test is the Worker exiting between answer and write-back.
+        for role in h.require_run(self.rid)['roles']:
+            live[role['agent_name']] = dict(live[role['agent_name']],
+                                            agent_session=role['agent_session'])
+        orig = h.herdr
+
+        def one_shot(*argv, **kw):
+            if argv[:2] == ('agent', 'prompt'):
+                pending = [d for d in h.require_run(self.rid)['dispatches']
+                           if d['status'] not in ('settled',)]
+                rec = pending[-1]
+                path = h.result_path(self.rid, rec['id'])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    'run_id': self.rid, 'dispatch_id': rec['id'], 'role': rec['role'],
+                    'stage': rec['stage'] if 'stage' in rec else
+                             h.stage_info(h.require_run(self.rid))['stage'],
+                    'stage_attempt': 1, 'status': 'complete',
+                    'verdict': 'pass', 'summary': 'the one-shot worker finished its task',
+                    'evidence': ['worker wrote this report before exiting'],
+                    'tests': [{'command': 'true', 'exit_code': 0}]}))
+                for name in list(live):        # the Worker has now exited
+                    live[name] = None
+                return {'agent': {'name': 'dev-w1p2', 'agent_status': 'idle'}}
+            return orig(*argv, **kw)
+
+        with patch.object(h, 'herdr', side_effect=one_shot):
+            actor = h.stage_info(h.require_run(self.rid))['actor']
+            out = h.run_dispatch(ns(run_id=self.rid, role=actor, message='do the task',
+                                    effect='read', remediation=False, no_wait=False))
+        self.assertEqual(out['status'], 'settled', out)
+        rec = json.loads(h.run_file(self.rid).read_text())['dispatches'][-1]
+        self.assertEqual(rec['status'], 'settled')
+        self.assertIsNotNone(rec.get('report'))
+
+    def test_gate_and_finish_do_not_demand_a_live_worker(self):
+        # Same root cause as above, different victim: a Run whose Workers are
+        # gone must still be closable. A gate writes ledger state only.
+        self.ledger_with_uuids()
+        for name in list(self.live):
+            self.live[name] = None
+        self.assertEqual(h.require_run(self.rid, tier='C-')['id'], self.rid)
+        with self.assertRaises(h.Error):
+            h.require_run(self.rid, tier='C')
+
+    def test_ledger_without_any_worker_identity_is_rejected_at_every_tier(self):
+        # "No identity recorded" is not the same as "the Workers died"; it
+        # cannot be attributed to anyone, so C- must reject it too.
+        data = self.ledger_with_uuids()
+        for role in data['roles']:
+            role.pop('agent_session', None)
+        h.run_file(self.rid).write_text(json.dumps(data))
+        for tier in ('C-', 'C'):
+            with self.subTest(tier=tier):
+                with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+                    h.require_run(self.rid, tier=tier)
+
     def test_presence_probe_carries_the_bound_session(self):
         # Regression: `role` has no session key -- the session lives on the Run.
         # Passing role.get('session') silently sent session=None, so a named
