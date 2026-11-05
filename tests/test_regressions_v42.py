@@ -85,6 +85,12 @@ class WorktreeDetectionRegressionTests(unittest.TestCase):
         self.assertFalse((self.base / 'managed').exists())
 
 
+@pytest.fixture(autouse=True)
+def isolate_herdr_socket(monkeypatch):
+    monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
+    monkeypatch.delenv('HERDR_SESSION', raising=False)
+
+
 @pytest.fixture
 def worktree_repos(tmp_path, monkeypatch):
     repos = [tmp_path / name for name in ('a', 'b')]
@@ -246,6 +252,17 @@ class WorktreeApplyRegressionTests(unittest.TestCase):
 
 
 class PublicIdContextTests(unittest.TestCase):
+    def setUp(self):
+        # These tests cover ID validation, not discovery. Statically satisfy the
+        # native-branch process-ownership probe at its boundary so no Herdr call is made.
+        def identity(*args, **kwargs):
+            return {'session': os.environ.get('HERDR_SESSION') or 'default',
+                    'workspace': os.environ.get('HERDR_WORKSPACE_ID', ''),
+                    'tab': os.environ.get('HERDR_TAB_ID', ''),
+                    'pane': os.environ.get('HERDR_PANE_ID', '')}
+        mock = patch.object(h, 'pane_of_current_process', side_effect=identity)
+        mock.start(); self.addCleanup(mock.stop)
+
     def test_valid_workspace_ids(self):
         for ws in ('w1', 'w2', 'wA', 'wB', 'wZ', 'w12', 'wABC'):
             with self.subTest(ws=ws):
@@ -287,7 +304,7 @@ class PublicIdContextTests(unittest.TestCase):
             with self.subTest(key=key), patch.dict(os.environ, {**env, key: ''}, clear=True):
                 with self.assertRaisesRegex(h.Error, '^Missing Herdr pane/workspace/tab environment$'):
                     h.context()
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {'HERDR_ENV': '0'}, clear=True):
             with self.assertRaisesRegex(h.Error, '^Must run inside Herdr: HERDR_ENV=1$'):
                 h.context()
 
@@ -306,6 +323,317 @@ class PublicIdContextTests(unittest.TestCase):
             self.assertEqual(h.context(require=False), {'workspace': '', 'lead_tab': '', 'lead_pane': ''})
         with patch.dict(os.environ, {'HERDR_WORKSPACE_ID': 'invalid'}, clear=True):
             self.assertEqual(h.context(require=False), {'workspace': 'invalid', 'lead_tab': '', 'lead_pane': ''})
+
+
+class DerivedPaneContextTests(unittest.TestCase):
+    def setUp(self):
+        self.panes = [{'workspace_id': 'w1', 'tab_id': 'w1:t1', 'pane_id': 'w1:p1'}]
+        self.infos = {'w1:p1': {'shell_pid': 55, 'foreground_processes': [{'pid': 42}]}}
+        self.calls = []
+
+    def fake_herdr(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if args == ('session', 'list', '--json'):
+            return {'sessions': [{'name': 'default', 'running': True},
+                                 {'name': 'stopped', 'running': False}]}
+        if args == ('pane', 'list'):
+            return {'panes': self.panes}
+        if args[:2] == ('pane', 'process-info'):
+            return {'process_info': self.infos[args[3]]}
+        raise AssertionError(args)
+
+    def probe(self):
+        with patch.object(h, 'herdr', side_effect=self.fake_herdr), \
+             patch.object(h.os, 'getpid', return_value=42), \
+             patch.object(h, 'process', return_value='1\n'):
+            return h.pane_of_current_process()
+
+    def test_unique_match_and_session(self):
+        self.assertEqual(self.probe(), {'session': 'default', 'workspace': 'w1',
+                                        'tab': 'w1:t1', 'pane': 'w1:p1'})
+        self.assertEqual(self.calls[1], (('pane', 'list'), {'session': 'default'}))
+        self.assertEqual(self.calls[2][1], {'session': 'default'})
+
+    def test_zero_and_multiple_matches(self):
+        self.infos['w1:p1']['foreground_processes'] = []
+        with self.assertRaisesRegex(h.Error, '无法定位'):
+            self.probe()
+        self.infos['w1:p1']['shell_pid'] = 42
+        self.panes.append({'workspace_id': 'w1', 'tab_id': 'w1:t1', 'pane_id': 'w1:p2'})
+        self.infos['w1:p2'] = {'shell_pid': 42, 'foreground_processes': []}
+        with self.assertRaisesRegex(h.Error, '身份不唯一，拒绝猜测'):
+            self.probe()
+
+    def test_invalid_ids_and_prefixes(self):
+        for key, value in [('workspace_id', 'wI'), ('tab_id', 'bad'), ('pane_id', 'w1:p!'),
+                           ('tab_id', 'w2:t1'), ('pane_id', 'w2:p1')]:
+            with self.subTest(key=key, value=value):
+                pane = {'workspace_id': 'w1', 'tab_id': 'w1:t1', 'pane_id': 'w1:p1', key: value}
+                self.panes = [pane]
+                self.infos[value if key == 'pane_id' else 'w1:p1'] = {
+                    'shell_pid': 42, 'foreground_processes': []}
+                with self.assertRaisesRegex(h.Error, '无法定位'):
+                    self.probe()
+
+    def test_query_failure(self):
+        with patch.object(h, 'herdr', side_effect=h.Error('failed')):
+            with self.assertRaisesRegex(h.Error, '无法定位'):
+                h.pane_of_current_process()
+
+    def test_ancestor_chain_and_herdr_session_argument(self):
+        self.infos['w1:p1'] = {'shell_pid': 30, 'foreground_processes': []}
+        with patch.object(h, 'herdr', side_effect=self.fake_herdr), \
+             patch.object(h.os, 'getpid', return_value=42), \
+             patch.object(h, 'process', side_effect=['30\n', '1\n']) as ps:
+            self.assertEqual(h.pane_of_current_process()['pane'], 'w1:p1')
+            self.assertEqual(ps.call_args_list[0].args[0], ['/bin/ps', '-o', 'ppid=', '-p', '42'])
+            self.assertEqual(ps.call_args_list[1].args[0], ['/bin/ps', '-o', 'ppid=', '-p', '30'])
+        with patch.object(h, 'process', return_value={}) as process:
+            h.herdr('pane', 'list', session='default')
+            process.assert_called_once_with(['herdr', '--session', 'default', 'pane', 'list'], timeout=40)
+
+    def test_context_double_probe_and_no_environment_write(self):
+        identity = {'session': 'default', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', return_value=identity) as probe:
+            self.assertEqual(h.context(), {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+            self.assertEqual(probe.call_count, 2)
+            self.assertEqual(dict(os.environ), {})
+        with patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', side_effect=[identity, {**identity, 'session': 'other'}]):
+            with self.assertRaisesRegex(h.Error, '身份不唯一，拒绝猜测'):
+                h.context()
+
+    def test_session_explicit_no_global_leak(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity), \
+                patch.object(h, 'process', return_value={}) as process:
+            lead = h.lead_identity()
+            self.assertEqual(lead['context'], {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+            h.herdr('pane', 'get', 'w1:p1', session=lead['session'])
+            h.herdr('pane', 'get', 'w1:p1')
+            self.assertEqual(process.call_args_list[0].args[0], ['herdr', '--session', 'alpha', 'pane', 'get', 'w1:p1'])
+            self.assertEqual(process.call_args_list[1].args[0], ['herdr', 'pane', 'get', 'w1:p1'])
+            self.assertFalse(hasattr(h, '_DISCOVERED_SESSION'))
+            self.assertNotIn('HERDR_ENV', os.environ)
+
+    def test_inconsistent_probes_do_not_leak_session(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(h, 'pane_of_current_process', side_effect=[identity, {**identity, 'session': 'beta'}]), \
+                patch.object(h, 'process', return_value={}) as process:
+            with self.assertRaisesRegex(h.Error, '身份不唯一，拒绝猜测（两次探测不一致）'):
+                h.context()
+            h.herdr('pane', 'get', 'w1:p1')
+            process.assert_called_once_with(['herdr', 'pane', 'get', 'w1:p1'], timeout=40)
+
+    def test_cross_session_duplicate_pane_and_tab_rejected(self):
+        for field in ('pane_id', 'tab_id'):
+            with self.subTest(field=field):
+                other = {'workspace_id': 'w1', 'tab_id': 'w1:t2', 'pane_id': 'w1:p2'}
+                other[field] = self.panes[0][field]
+                def fake(*args, **kw):
+                    if args == ('session', 'list', '--json'):
+                        return {'sessions': [{'name': 'one', 'running': True}, {'name': 'two', 'running': True}]}
+                    if args == ('pane', 'list'):
+                        return {'panes': self.panes if kw['session'] == 'one' else [other]}
+                    return {'process_info': {'shell_pid': 42 if kw['session'] == 'one' else 99, 'foreground_processes': []}}
+                with patch.object(h, 'herdr', side_effect=fake), patch.object(h.os, 'getpid', return_value=42), \
+                        patch.object(h, 'process', return_value='1'):
+                    with self.assertRaisesRegex(h.Error, '跨 session .* ID 冲突'):
+                        h.pane_of_current_process()
+
+    def test_context_ledger_comparison_and_key_unchanged(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        legacy = {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(h, 'STATE', Path(tmp)), \
+                patch.dict(os.environ, {}, clear=True), patch.object(h, 'pane_of_current_process', return_value=identity):
+            h.save(h.run_file('abcdef123456'), {'version': 3, 'context': legacy})
+            self.assertEqual(h.context(), legacy)
+            self.assertEqual(h.state_file(h.context()), h.state_file(legacy))
+            self.assertEqual(h.require_run('abcdef123456')['context'], legacy)
+
+    def test_native_default_session_confirmed_by_probe_and_socket(self):
+        env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1',
+               'HERDR_PANE_ID': 'w1:p1', 'HERDR_SOCKET_PATH': '/tmp/socket'}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(h, 'pane_of_current_process', side_effect=native_probe('default')), \
+                patch.object(h, 'process', return_value={
+                    'sessions': [{'name': 'default', 'socket_path': '/tmp/socket'}]}) as process:
+            identity = h.lead_identity()
+            self.assertEqual(identity['session'], 'default')
+            h.context(False)
+        process.assert_called_once_with(['herdr', 'session', 'list', '--json'], timeout=40)
+
+    def test_running_session_with_incomplete_name_fails_closed(self):
+        for session in ({'running': True}, {'running': True, 'name': ''},
+                        {'running': True, 'name': '  '}, {'running': True, 'name': 123}):
+            with self.subTest(session=session):
+                def fake(*args, **kwargs):
+                    if args == ('session', 'list', '--json'):
+                        return {'sessions': [{'name': 'default', 'running': True}, session]}
+                    return self.fake_herdr(*args, **kwargs)
+                with patch.object(h, 'herdr', side_effect=fake), \
+                        patch.object(h.os, 'getpid', return_value=42), \
+                        patch.object(h, 'process', return_value='1'):
+                    with self.assertRaisesRegex(h.Error, 'session 信息不完整，无法确认身份唯一性'):
+                        h.pane_of_current_process()
+
+    def test_stopped_session_with_empty_name_is_ignored(self):
+        def fake(*args, **kwargs):
+            if args == ('session', 'list', '--json'):
+                return {'sessions': [{'name': 'default', 'running': True}, {'name': '', 'running': False}]}
+            return self.fake_herdr(*args, **kwargs)
+        with patch.object(h, 'herdr', side_effect=fake), \
+                patch.object(h.os, 'getpid', return_value=42), \
+                patch.object(h, 'process', return_value='1'):
+            self.assertEqual(h.pane_of_current_process()['session'], 'default')
+
+    def test_native_missing_ids_fail_before_probe(self):
+        env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1'}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(h, 'pane_of_current_process', side_effect=native_probe('default')) as probe:
+            self.assertEqual(h.context(), {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+            self.assertEqual(probe.call_count, 2)
+            del os.environ['HERDR_PANE_ID']
+            with self.assertRaisesRegex(h.Error, '^Missing Herdr pane/workspace/tab environment$'):
+                h.context()
+            self.assertEqual(h.context(False), {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': ''})
+            self.assertEqual(probe.call_count, 2)
+
+
+NATIVE_SESSION_ENV = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1',
+                      'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1'}
+
+
+def native_probe(session):
+    return lambda *a, **k: {'session': session, 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+
+
+@pytest.mark.parametrize('name', ['default', 'alpha'])
+def test_native_probe_confirms_identity_and_session(name):
+    # A native environment is only trusted after the real process-ownership probe
+    # agrees with it on all four components.
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SESSION': name}, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe(name)) as probe:
+        identity = h.lead_identity()
+    assert identity == {'context': {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'},
+                        'session': name}
+    assert probe.call_count == 2
+
+
+def test_native_probe_mismatch_fails_closed():
+    with patch.dict(os.environ, NATIVE_SESSION_ENV, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe('alpha')):
+        # Probe reports w1:p1 but a forged environment claims another pane.
+        os.environ['HERDR_PANE_ID'] = 'w1:p9'
+        with pytest.raises(h.Error, match='进程归属与 HERDR_\\* 身份不一致'):
+            h.lead_identity()
+
+
+def test_native_unstable_probe_fails_closed():
+    with patch.dict(os.environ, NATIVE_SESSION_ENV, clear=True), \
+            patch.object(h, 'pane_of_current_process',
+                         side_effect=[native_probe('default')(), native_probe('alpha')()]):
+        with pytest.raises(h.Error, match='两次探测不一致'):
+            h.lead_identity()
+
+
+def test_native_session_env_conflict_fails_closed():
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SESSION': 'beta'}, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe('alpha')):
+        with pytest.raises(h.Error, match="进程归属 session 与环境不一致"):
+            h.lead_identity()
+
+
+@pytest.mark.parametrize('name', ['default', 'alpha'])
+def test_native_socket_resolution_matches_probe(name):
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SOCKET_PATH': '/socket'}, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe(name)), \
+            patch.object(h, 'process', return_value={
+                'sessions': [{'name': name, 'socket_path': '/socket'}]}) as process:
+        assert h.lead_identity()['session'] == name
+    process.assert_called_once_with(['herdr', 'session', 'list', '--json'], timeout=40)
+
+
+def test_native_socket_resolution_conflict_fails_closed():
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SOCKET_PATH': '/socket'}, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe('alpha')), \
+            patch.object(h, 'process', return_value={
+                'sessions': [{'name': 'beta', 'socket_path': '/socket'}]}):
+        with pytest.raises(h.Error, match='Herdr socket 与进程归属不一致'):
+            h.lead_identity()
+
+
+@pytest.mark.parametrize('sessions,message', [
+    ([], 'exactly one session'),
+    ([{'name': 'a', 'socket_path': '/socket'}, {'name': 'b', 'socket_path': '/socket'}],
+     'exactly one session'),
+    ([{'name': '', 'socket_path': '/socket'}], 'exactly one named session'),
+    ([{'name': 'a', 'socket_path': '/other'}], 'exactly one session')])
+def test_native_socket_ambiguous_or_empty_fails(sessions, message):
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SOCKET_PATH': '/socket'}, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe('a')), \
+            patch.object(h, 'process', return_value={'sessions': sessions}):
+        with pytest.raises(h.Error, match=message):
+            h.lead_identity()
+
+
+@pytest.mark.parametrize('failure', [h.Error('command failed'), h.Error('timeout'), h.Error('non JSON')])
+def test_native_session_lookup_failure_blocks_init(failure):
+    cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SOCKET_PATH': '/socket'}, clear=True), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe('default')), \
+            patch.object(h, 'process', side_effect=failure):
+        with pytest.raises(h.Error):
+            h.init(cfg, opts('dev-review', dry_run=False))
+
+
+def test_native_session_routed_through_real_herdr_argv(tmp_path):
+    # The confirmed session must reach the management CLI boundary, not just the
+    # identity dict, and --session must be placed before the subcommand.
+    with patch.dict(os.environ, {**NATIVE_SESSION_ENV, 'HERDR_SESSION': 'alpha'}, clear=True), \
+            patch.object(h, 'STATE', tmp_path), \
+            patch.object(h, 'pane_of_current_process', side_effect=native_probe('alpha')), \
+            patch.object(h, 'process', side_effect=h.HerdrError('not found', code='agent_not_found')) as process:
+        identity = h.lead_identity()
+        h.require_name_available('developer-w1p2', tmp_path / 'team.json', session=identity['session'])
+    process.assert_called_with(['herdr', '--session', 'alpha', 'agent', 'get', 'developer-w1p2'], timeout=40)
+
+
+def test_native_second_probe_mismatch_leaves_no_side_effects(tmp_path):
+    # A failed cross-check must abort before any ledger write, worktree, or Herdr call.
+    cfg, _ = h.read_cfg(h.DEFAULT_CONFIG)
+    args = opts('dev-lite', dry_run=False, cwd=str(tmp_path))
+    with patch.dict(os.environ, NATIVE_SESSION_ENV, clear=True), \
+            patch.object(h, 'STATE', tmp_path / 'state'), \
+            patch.object(h, 'pane_of_current_process',
+                         side_effect=[native_probe('default')(), native_probe('alpha')()]), \
+            patch.object(h, 'herdr') as herdr_call:
+        with pytest.raises(h.Error, match='两次探测不一致'):
+            h.init(cfg, args)
+    herdr_call.assert_not_called()
+    assert not (tmp_path / 'state').exists()
+
+
+def test_native_require_false_does_not_probe():
+    env = {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1',
+           'HERDR_PANE_ID': 'w1:p1'}
+    with patch.dict(os.environ, env, clear=True), patch.object(h, 'pane_of_current_process') as probe:
+        assert h.lead_identity(False) == {'context': {'workspace': 'w1', 'lead_tab': 'w1:t1',
+                                                      'lead_pane': 'w1:p1'}, 'session': ''}
+        assert h.context(False) == {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'}
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize('name', ['default', 'alpha'])
+def test_derived_identity_uses_probed_session_without_extra_calls(name):
+    found = {'session': name, 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+    with patch.dict(os.environ, {}, clear=True), \
+            patch.object(h, 'pane_of_current_process', return_value=found), \
+            patch.object(h, 'process') as process:
+        identity = h.lead_identity()
+    assert identity['session'] == name
+    process.assert_not_called()
 
 
 class AdoptTests(unittest.TestCase):
@@ -332,10 +660,18 @@ class AdoptTests(unittest.TestCase):
                     raise h.Error('not found')
                 return {'agent': copy.deepcopy(self.agents[args[2]])}
             if args[:2] == ('pane', 'get'):
-                return {'pane': {'workspace_id': 'w1'}}
+                return {'pane': {'pane_id': args[2], 'workspace_id': args[2].split(':')[0], 'tab_id': 'w1:t1'}}
             raise AssertionError(f'unexpected Herdr call: {args}')
         mock = patch.object(h, 'herdr', side_effect=fake)
         mock.start(); self.addCleanup(mock.stop)
+        # Native identity now probes real process ownership; these adopt tests are not
+        # about discovery, so satisfy that boundary from the environment.
+        probe = patch.object(h, 'pane_of_current_process', side_effect=lambda *a, **k: {
+            'session': os.environ.get('HERDR_SESSION') or 'default',
+            'workspace': os.environ.get('HERDR_WORKSPACE_ID', ''),
+            'tab': os.environ.get('HERDR_TAB_ID', ''),
+            'pane': os.environ.get('HERDR_PANE_ID', '')})
+        probe.start(); self.addCleanup(probe.stop)
         self.args = ns(template='dev-lite', role=['developer=dev', 'reviewer=review'],
                        set=[], cwd=str(self.cwd), dry_run=False)
 
@@ -391,7 +727,8 @@ class AdoptTests(unittest.TestCase):
     def test_adopt_rejects_lead_pane(self):
         self.agents['dev']['pane_id'] = 'w1:p1'
         with self.assertRaisesRegex(h.Error, 'Lead pane'): self.adopt()
-        self.assertNotIn(('pane', 'get', 'w1:p1'), self.calls)
+        # The Lead identity probe is faked at its boundary, so no pane read happens.
+        self.assertFalse(any(c[:2] == ('pane', 'get') for c in self.calls), self.calls)
 
     def test_cwd_mismatch(self):
         other = Path(self.tmp.name) / 'other'; other.mkdir()
@@ -498,7 +835,7 @@ class AdversarialTests(unittest.TestCase):
         start_calls = []
         def busy_twice(*args, **kwargs):
             if args[:2] == ('pane', 'get'):
-                return {'pane': {'workspace_id': h.context()['workspace']}}
+                return {'pane': {'pane_id': args[2], 'workspace_id': 'w1', 'tab_id': 'w1:t1'}}
             if args[:2] == ('pane', 'process-info'):
                 return {'process_info': {'shell_pid': 123, 'foreground_process_group_id': 123, 'foreground_processes': [
                     {'pid': 123, 'argv0': 'zsh'}]}}
@@ -553,6 +890,30 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(out['status'], 'uncertain')
         self.assertNotIn('output', h.require_run(rid)['dispatches'][-1])
         with self.assertRaises(h.Error): self.gate(rid)
+
+    def test_uncertain_warning_survives_ledger_recheck_failure(self):
+        # A dispatch failure must never be reported as a clean failure: the input may
+        # have been sent. This holds even if the follow-up ledger read also fails.
+        # The recheck itself now goes through finalize(), which swallows its own
+        # read errors and simply records nothing -- so the warning has to come
+        # from the dispatch path alone.
+        rid = self.start()
+        state = {'prompt_failed': False}
+        original_require_run = h.require_run
+        def broken(*argv, **kwargs):
+            if argv[:2] == ('agent', 'prompt'):
+                state['prompt_failed'] = True
+                raise h.Error('timeout')
+            raise h.Error('identity probe unstable')
+        def require_run(runid, **kwargs):
+            if state['prompt_failed']:
+                raise h.Error('identity probe unstable')
+            return original_require_run(runid, **kwargs)
+        with patch.object(h, 'herdr', side_effect=broken), \
+                patch.object(h, 'require_run', side_effect=require_run):
+            with self.assertRaisesRegex(h.Error, 'uncertain.*might have been sent'):
+                self.dispatch(rid)
+        self.assertTrue(state['prompt_failed'])
 
     def test_unknown_agent_state_does_not_settle_even_with_report(self):
         rid = self.start()
@@ -918,7 +1279,7 @@ class PaneShellReadinessTests(unittest.TestCase):
     def test_stats_shell_polls_only(self):
         calls, fake = self.fake()
         ready = iter([False, False, True])
-        def poll(pane_id):
+        def poll(pane_id, **kw):
             value = next(ready)
             if not value:
                 self.assertFalse(any(c[:2] == ('agent', 'start') for c in calls))
@@ -1066,7 +1427,8 @@ class PaneNamingTests(unittest.TestCase):
         calls = []
         def fake(*args, **kwargs):
             calls.append(args)
-            if args == ('pane', 'get', 'w1:p1'): return {'pane': pane}
+            if args == ('pane', 'get', 'w1:p1'):
+                return {'pane': {**pane, 'tab_id': 'w1:t1'}}
             if args == ('agent', 'get', 'w1:p1'): return {'agent': copy.deepcopy(agent)}
             if args == ('agent', 'get', 'lead-w1p1'): raise h.HerdrError('not found', code='agent_not_found')
             if args[:2] == ('agent', 'rename'): return {}
@@ -1186,10 +1548,11 @@ class PaneNamingTests(unittest.TestCase):
         roles = cfg['templates']['dev-lite']['roles']
         roles['a' * 27] = roles.pop('developer')
         args = opts('dev-lite', dry_run=False, cwd=self.tmp.name)
+        before = len(self.actions)
         with patch.object(h, 'save', wraps=h.save) as save:
             with self.assertRaisesRegex(h.Error, 'role 名过长'): h.init(cfg, args)
         save.assert_not_called()
-        self.assertFalse(self.actions)
+        self.assertEqual(len(self.actions), before)
         self.assertFalse(list((h.STATE / 'teams').glob('*.json')))
         roles['a' * 26] = roles.pop('a' * 27)
         team = h.init(cfg, args)['team']
@@ -1229,7 +1592,7 @@ class PaneNamingTests(unittest.TestCase):
                     self.panes += 1
                     return {'pane': {'pane_id': f'wA:p{self.panes}'}}
                 if args[:2] == ('pane', 'get'):
-                    return {'pane': {'workspace_id': 'wA'}}
+                    return {'pane': {'pane_id': args[2], 'workspace_id': 'wA', 'tab_id': 'wA:t1'}}
                 return original(*args, **kwargs)
             fake.side_effect = upper
             with patch.dict(os.environ, {'HERDR_WORKSPACE_ID':'wA', 'HERDR_PANE_ID':'wA:p1', 'HERDR_TAB_ID':'wA:t1'}):
@@ -1264,9 +1627,12 @@ class PaneNamingTests(unittest.TestCase):
             h.require_name_available('developer-w1p2', path)
 
     def test_name_availability_unknown_fails_closed(self):
-        with patch.object(h, 'herdr', side_effect=h.Error('server unavailable')):
+        path = h.state_file(h.context())
+        def unavailable(*args, **kwargs):
+            raise h.Error('server unavailable')
+        with patch.object(h, 'herdr', side_effect=unavailable):
             with self.assertRaisesRegex(h.Error, 'Cannot verify'):
-                h.require_name_available('developer-w1p2', h.state_file(h.context()))
+                h.require_name_available('developer-w1p2', path)
 
     def test_plan_is_pending_without_changing_persisted_plan(self):
         args = opts('dev-lite', dry_run=True, cwd=self.tmp.name)
@@ -1316,7 +1682,7 @@ class PaneNamingTests(unittest.TestCase):
         team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
         def fake(*args, **kwargs):
             if args[:2] == ('pane','get'):
-                return {'pane': {'pane_id':'w1:p1', 'workspace_id':'w1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
+                return {'pane': {'pane_id':'w1:p1', 'workspace_id':'w1', 'tab_id':'w1:t1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
             if args[:2] == ('agent','get') and args[2] == 'w1:p1':
                 return {'agent': {'name':'old-lead', 'pane_id':'w1:p1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
             if args[:2] == ('agent','get'):
@@ -1343,7 +1709,7 @@ class PaneNamingTests(unittest.TestCase):
         unavailable = False
         def fake(*args, **kwargs):
             if args[:2] == ('pane', 'get'):
-                return {'pane': {'pane_id':'w1:p1', 'workspace_id':'w1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
+                return {'pane': {'pane_id':'w1:p1', 'workspace_id':'w1', 'tab_id':'w1:t1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
             if args == ('agent', 'get', 'w1:p1'):
                 if unavailable: raise h.Error('pane lookup unavailable')
                 return {'agent': {'name':None, 'pane_id':'w1:p1', 'agent':'claude', 'agent_session':{'kind':'claude', 'source':'test', 'value':'original-session'}}}
@@ -1383,7 +1749,324 @@ class AdoptNamingTests(AdoptTests):
         with self.assertRaisesRegex(h.Error, 'Invalid agent name'): self.adopt()
         self.args.role = []
         with self.assertRaisesRegex(h.Error, 'missing'): self.adopt()
+        # Rejected during validation; no Herdr read or write is attempted at all.
         self.assertFalse(self.calls)
+
+
+class LedgerIdentityTests(unittest.TestCase):
+    """Cross-session ledger ownership: session names are a weak signal only.
+
+    A Herdr session can be stopped and recreated under the same name with the
+    same workspace/pane IDs but entirely different agents, so ownership of a
+    legacy ledger must be proven through Worker agent_session UUIDs.
+    """
+
+    def setUp(self):
+        test_htm.RuntimeTests.setUp(self)
+        h.init(self.cfg, opts('research', dry_run=False, cwd=self.tmp.name))
+        self.rid = h.run_start(self.cfg, ns(goal='Ledger ownership regression'))['run_id']
+        # The fake Herdr does not report agent_session; supply the live UUIDs so
+        # verify_existing can exercise the real comparison logic.
+        self.live = {role['agent_name']: {'pane_id': role['pane_id'], 'kind': role['kind'],
+                                          'cwd': role['cwd'], 'status': 'idle',
+                                          'agent_session': {'agent': role['kind'], 'kind': 'id',
+                                                            'source': 'herdr:claude',
+                                                            'value': 'live-uuid-' + role['pane_id']}}
+                     for role in h.require_run(self.rid)['roles']}
+        live = self.live
+        lookup = patch.object(h, 'lookup_agent', side_effect=lambda n, **kw: live.get(n))
+        lookup.start(); self.addCleanup(lookup.stop)
+
+    def ledger(self, rid=None, **changes):
+        path = h.run_file(rid or self.rid)
+        data = json.loads(path.read_text())
+        data.update(changes)
+        path.write_text(json.dumps(data))
+        return path
+
+    def ledger_with_uuids(self, uuid_for=None):
+        """Rewrite the Run as a pre-fix (session-less) ledger with explicit Worker UUIDs.
+
+        The fake Herdr records each started agent without an agent_session, so the
+        ledger roles are seeded here: that is exactly the legacy shape under test.
+        """
+        path = h.run_file(self.rid)
+        data = json.loads(path.read_text())
+        data.pop('session', None)
+        for role in data['roles']:
+            role['agent_session'] = {'agent': role['kind'], 'kind': 'id', 'source': 'herdr:claude',
+                                     'value': (uuid_for or {}).get(role['role'], 'live-uuid-' + role['pane_id'])}
+        path.write_text(json.dumps(data))
+        return data
+
+    def test_new_ledger_records_session(self):
+        self.assertEqual(h.require_run(self.rid)['session'], 'default')
+        team = json.loads(h.state_file(h.context()).read_text())
+        self.assertEqual(team['session'], 'default')
+
+    def test_new_ledger_session_mismatch_rejects_every_tier(self):
+        self.ledger(session='other-session')
+        for tier in ('A', 'B', 'C'):
+            with self.subTest(tier=tier):
+                with self.assertRaisesRegex(h.Error, '属于 session'):
+                    h.require_run(self.rid, tier=tier)
+
+    def test_legacy_ledger_readonly_tier_allowed(self):
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_legacy_ledger_writable_when_uuid_matches(self):
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='C')['id'], self.rid)
+
+    def test_legacy_ledger_rejects_after_session_reuse(self):
+        # The original session is gone; a new single-session context reuses the
+        # same IDs but presents different Worker UUIDs. Counting running
+        # sessions would not catch this -- only UUID comparison does.
+        role = h.require_run(self.rid)['roles'][0]['role']
+        self.ledger_with_uuids({role: '00000000-dead-beef-0000-000000000000'})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+        # Read-only diagnostics still work.
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_same_name_session_recreated_different_uuid_rejected(self):
+        # Session name matches ('default') but the Workers are different agents.
+        # The session name alone must never be treated as proof of identity.
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '11111111-dead-beef-0000-000000000000' for r in data['roles']})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_verified_ledger_also_checks_worker_uuids(self):
+        # A ledger that records a matching session must still prove its Workers:
+        # the session could have been recreated under the same name.
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.assertEqual(data['session'], 'default')
+        for role in data['roles']:
+            role['agent_session'] = {'agent': role['kind'], 'kind': 'id', 'source': 'herdr:claude',
+                                     'value': '99999999-dead-beef-0000-000000000000'}
+        path = h.run_file(self.rid); path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+        # Read-only stays available.
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_verified_ledger_with_unbound_role_is_not_permissive(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        for role in data['roles']:
+            role.pop('agent_session', None)
+        path = h.run_file(self.rid); path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+            h.require_run(self.rid, tier='C')
+
+    def test_unobservable_worker_is_not_reported_as_conflict(self):
+        # A live-but-unreadable Worker is an observability gap, not a claim that
+        # the ledger belongs to someone else; tier C still has an anchor here.
+        role = h.require_run(self.rid)['roles'][0]
+        self.live[role['agent_name']] = {k: v for k, v in self.live[role['agent_name']].items()
+                                         if k != 'pane_id'}
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='C')['id'], self.rid)
+
+    def test_role_conflict_rejects_even_when_other_role_matches(self):
+        role = h.require_run(self.rid)['roles'][0]['role']
+        self.ledger_with_uuids({role: '22222222-dead-beef-0000-000000000000'})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_cancel_of_cost_only_run_does_not_need_a_live_anchor(self):
+        # T17 class A must stay reachable even when every Worker is gone: the
+        # Run dispatched nothing, so there is no executor to own. Requiring a
+        # live UUID here reintroduced exactly the lock-up Issue #2 removes.
+        data = self.ledger_with_uuids()
+        data['dispatches'] = []
+        data.pop('fault_groups', None)
+        data.pop('recovery_authorizations', None)
+        h.run_file(self.rid).write_text(json.dumps(data))
+        for name in list(self.live):
+            self.live[name] = None
+        out = h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
+                              reason='Release a Run that never dispatched anything'))
+        self.assertEqual(out['status'], 'cancelled')
+        self.assertEqual(out['cancel_scope'], 'no_execution_history')
+
+    def test_cancel_of_dispatched_run_still_requires_an_anchor(self):
+        # Class B is the opposite obligation: the ledger describes real
+        # executors, so ownership must be proven before touching it.
+        data = self.ledger_with_uuids()
+        # Any dispatch record is enough to make this class B: the ledger now
+        # describes an executor that may exist elsewhere.
+        data['dispatches'] = [{'id': 'cccccccccc', 'stage_index': 0, 'stage_attempt': 1,
+                               'role': data['roles'][0]['role'], 'effect': 'write',
+                               'remediation': False, 'status': 'settled', 'created_at': h.now()}]
+        h.run_file(self.rid).write_text(json.dumps(data))
+        for name in list(self.live):
+            self.live[name] = None
+        with self.assertRaisesRegex(h.Error, '无法证明|身份冲突'):
+            h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
+                            reason='Attempt to cancel a foreign dispatched Run'))
+
+    def test_tier_c_minus_rejects_contradictions_without_an_anchor(self):
+        # C- exists so abandon/diagnose work when Workers died. It must still
+        # refuse a ledger whose live agents contradict it.
+        data = self.ledger_with_uuids()
+        name = data['roles'][0]['agent_name']
+        self.live[name] = dict(self.live[name], cwd='/some/other/checkout')
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C-')
+
+    def test_tier_c_minus_allows_a_ledger_with_no_live_worker(self):
+        # The opposite half: no survivor is not itself a contradiction.
+        self.ledger_with_uuids()
+        for name in list(self.live):
+            self.live[name] = None
+        self.assertEqual(h.require_run(self.rid, tier='C-')['id'], self.rid)
+
+    def test_presence_probe_carries_the_bound_session(self):
+        # Regression: `role` has no session key -- the session lives on the Run.
+        # Passing role.get('session') silently sent session=None, so a named
+        # session's probe hit the default server and could report a live Worker
+        # as confirmed_absent (the evidence the abandon fence trusts).
+        role = h.require_run(self.rid)['roles'][0]
+        calls = []
+
+        def fake(*argv, **kw):
+            calls.append((argv, kw.get('session')))
+            if argv[:2] == ('agent', 'get'):
+                return {'agent': {'name': role['agent_name'], 'pane_id': role['pane_id'],
+                                  'agent': role['kind'], 'agent_status': 'idle',
+                                  'cwd': role['cwd'],
+                                  'agent_session': role['agent_session']}}
+            return {'pane': {'pane_id': role['pane_id']}}
+
+        with patch.object(h, 'herdr', side_effect=fake):
+            h.agent_presence(role, session='alpha')
+        self.assertTrue(calls)
+        self.assertTrue(all(s == 'alpha' for _argv, s in calls),
+                        f'session was dropped: {calls}')
+
+    def test_cancel_cost_only_still_rejects_a_foreign_ledger(self):
+        # Class A must not become a blanket bypass: a ledger that records a
+        # different session is still refused by ledger_ownership.
+        data = self.ledger_with_uuids()
+        data['dispatches'] = []
+        data['session'] = 'another-session'
+        h.run_file(self.rid).write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '属于 session|跨 session'):
+            h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
+                            reason='Attempt to cancel a foreign session ledger'))
+
+    def test_cwd_mismatch_is_a_conflict_not_unobservable(self):
+        # Regression: contradiction detection used to be a message-substring
+        # whitelist, so a same-UUID agent living in a different checkout fell
+        # through to "unobservable" and a foreign ledger passed ownership.
+        data = self.ledger_with_uuids()
+        name = data['roles'][0]['agent_name']
+        self.live[name] = dict(self.live[name], cwd='/some/other/checkout')
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_name_mismatch_is_a_conflict_not_unobservable(self):
+        # Same hole, different message: an observed agent whose name changed is
+        # a contradiction, never an observability gap.
+        data = self.ledger_with_uuids()
+        name = data['roles'][0]['agent_name']
+        self.live[name] = dict(self.live[name], name='someone-else')
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_pause_allowed_without_identity_but_records_unverified(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '33333333-dead-beef-0000-000000000000' for r in data['roles']})
+        out = h.run_pause(ns(run_id=self.rid, extend_rounds=0), True)
+        self.assertEqual(out['status'], 'paused')
+        events = json.loads(h.run_file(self.rid).read_text())['events']
+        self.assertEqual(events[-1].get('identity'), 'unverified')
+
+    def test_resume_requires_identity(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '44444444-dead-beef-0000-000000000000' for r in data['roles']})
+        h.run_pause(ns(run_id=self.rid, extend_rounds=0), True)
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.run_pause(ns(run_id=self.rid, extend_rounds=0), False)
+
+    def test_finish_requires_identity(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '55555555-dead-beef-0000-000000000000' for r in data['roles']})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.run_finish(ns(run_id=self.rid))
+
+    def test_legacy_ledger_without_any_worker_identity_rejected(self):
+        path = h.run_file(self.rid)
+        data = json.loads(path.read_text())
+        data.pop('session', None)
+        for role in data['roles']:
+            role.pop('agent_session', None)
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+            h.require_run(self.rid, tier='C')
+
+    def test_rejection_leaves_ledger_untouched(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '66666666-dead-beef-0000-000000000000' for r in data['roles']})
+        path = h.run_file(self.rid)
+        before = path.read_text()
+        with self.assertRaises(h.Error):
+            h.require_run(self.rid, tier='C')
+        self.assertEqual(path.read_text(), before)
+
+    def test_pause_does_not_derive_other_actions(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '77777777-dead-beef-0000-000000000000' for r in data['roles']})
+        before = len(self.actions)
+        h.run_pause(ns(run_id=self.rid, extend_rounds=0), True)
+        derived = [a for a in self.actions[before:] if a[:2] in (('agent','prompt'), ('agent','start'))]
+        self.assertFalse(derived)
+
+    def test_partial_roles_verified_allows_ops(self):
+        # One Worker is gone (unobservable), the other still anchors ownership.
+        roles = h.require_run(self.rid)['roles']
+        gone = roles[0]['agent_name']
+        del self.live[gone]
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='C')['id'], self.rid)
+
+    def test_all_roles_dead_blocks_side_effects(self):
+        self.live.clear()
+        self.ledger_with_uuids()
+        with self.assertRaisesRegex(h.Error, '均无法在当前 session 内验证身份'):
+            h.require_run(self.rid, tier='C')
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_dispatch_verifies_target_worker_not_just_any_role(self):
+        # One role keeps a matching UUID; the dispatch target does not. Ledger-level
+        # anchoring would pass, so the per-target check has to reject on its own.
+        roles = h.require_run(self.rid)['roles']
+        target = roles[0]['role']
+        self.ledger_with_uuids({target: '88888888-dead-beef-0000-000000000000'})
+        with self.assertRaisesRegex(h.Error, 'identity changed'):
+            h.run_dispatch(ns(run_id=self.rid, role=target, message='Never delivered',
+                              effect='read', no_wait=False, remediation=False,
+                              wait_timeout_seconds=None))
+
+
+class LedgerProbeTests(unittest.TestCase):
+    """The ownership probe itself, exercised without the boundary stub."""
+
+    def test_session_list_failure_fails_closed(self):
+        # A failing `herdr session list` must surface as an error, never as
+        # "no session found so skip the check".
+        def boom(*args, **kwargs):
+            raise h.Error('session list unavailable')
+        with patch.object(h, 'herdr', side_effect=boom):
+            with self.assertRaisesRegex(h.Error, '无法定位 Herdr pane'):
+                h.pane_of_current_process()
+
+    def test_zero_running_sessions_fails_closed(self):
+        with patch.object(h, 'herdr', return_value={'sessions': []}):
+            with self.assertRaisesRegex(h.Error, '无法定位 Herdr pane'):
+                h.pane_of_current_process()
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

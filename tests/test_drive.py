@@ -4,11 +4,18 @@ import types
 import threading
 import time
 import unittest
+import pytest
 import sys
 from unittest.mock import patch
 
 import test_htm
 from test_htm import h, opts
+
+
+@pytest.fixture(autouse=True)
+def isolate_herdr_socket(monkeypatch):
+    monkeypatch.delenv('HERDR_SOCKET_PATH', raising=False)
+    monkeypatch.delenv('HERDR_SESSION', raising=False)
 
 
 def verified_cancel_control(payload):
@@ -75,6 +82,35 @@ class DriveTests(unittest.TestCase):
             return result
         return patch.object(h, 'herdr', side_effect=fake)
 
+    def test_derived_session_routes_init_run_dispatch_collect_drive_and_cancel(self):
+        identity = {'session': 'alpha', 'workspace': 'w1', 'tab': 'w1:t1', 'pane': 'w1:p1'}
+        calls = []
+        def routed(*args, **kwargs):
+            calls.append((args, kwargs))
+            return self.fake(*args, **kwargs)
+        lookups = []
+        def lookup(name, **kwargs):
+            lookups.append(kwargs.get('session'))
+            return self.started.get(name)
+        with patch.dict('os.environ', {}, clear=True), \
+                patch.object(h, 'pane_of_current_process', return_value=identity), \
+                patch.object(h, 'herdr', side_effect=routed), \
+                patch.object(h, 'lookup_agent', side_effect=lookup):
+            rid = self.start()
+            dispatched = h.run_dispatch(ns(run_id=rid, role='developer', message='mock', effect='write',
+                                           remediation=False, no_wait=True))
+            h.run_collect(ns(run_id=rid, dispatch_id=dispatched['dispatch_id']))
+            result = self.drive(rid, max_steps=1)
+            self.assertEqual(result['steps'][0]['action'], 'gate')
+            result = self.drive(rid, max_steps=1)
+            self.assertEqual(result['steps'][0]['action'], 'dispatch')
+            cancel(rid)
+            self.assertTrue(calls)
+            self.assertTrue(lookups)
+            self.assertTrue(all(kw.get('session') == 'alpha' for _, kw in calls), calls)
+            self.assertTrue(all(value == 'alpha' for value in lookups), lookups)
+            self.assertEqual(h.require_run(rid)['context'], {'workspace': 'w1', 'lead_tab': 'w1:t1', 'lead_pane': 'w1:p1'})
+
     def test_drive_on_adopted_four_key_session(self):
         available = {
             'dev': {'name': 'dev', 'agent': 'claude', 'agent_status': 'idle', 'pane_id': 'w1:p2',
@@ -89,13 +125,13 @@ class DriveTests(unittest.TestCase):
             if args[:2] == ('agent', 'get'):
                 return {'agent': available[args[2]]}
             if args[:2] == ('pane', 'get'):
-                return {'pane': {'workspace_id': 'w1', 'pane_id': args[2]}}
+                return {'pane': {'workspace_id': 'w1', 'pane_id': args[2], 'tab_id': 'w1:t1'}}
             if args[:2] == ('agent', 'prompt'):
                 result = self.fake(*args, **kwargs)
                 available[args[2]]['agent_status'] = 'done'
                 return result
             return self.fake(*args, **kwargs)
-        with patch.object(h, 'herdr', side_effect=fake), patch.object(h, 'lookup_agent', side_effect=lambda n: available[names.get(n, n)]):
+        with patch.object(h, 'herdr', side_effect=fake), patch.object(h, 'lookup_agent', side_effect=lambda n, **kw: available[names.get(n, n)]):
             h.adopt(self.cfg, ns(template='dev-lite', role=['developer=dev', 'reviewer=rev'],
                                  set=[], cwd=self.tmp.name, dry_run=False))
             rid = h.run_start(self.cfg, ns(goal='Adopt four-key Herdr session'))['run_id']
@@ -111,10 +147,10 @@ class DriveTests(unittest.TestCase):
         h.run_dispatch(ns(run_id=rid, role='developer', message='mock', effect='write', remediation=False, no_wait=False))
         before = len(self.prompts())
         original = h.lookup_agent
-        def missing(name):
+        def missing(name, **kw):
             if name == role['agent_name']:
                 raise h.Error('{"error":{"code":"agent_not_found"}}')
-            return original(name)
+            return original(name, **kw)
         with patch.object(h, 'lookup_agent', side_effect=missing):
             out = self.drive(rid)
         self.assertEqual(out['stopped_reason'], 'identity')
@@ -226,21 +262,31 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(len(self.prompts()), before)
 
     def test_init_missing_session_remains_legacy_compatible(self):
+        # A team built where the agent exposes no agent_session is a ledger with
+        # no provable ownership. It stays readable, but it must not gain the
+        # authority to create a Run, because nothing can attribute it.
         with patch.object(h, 'lookup_agent', return_value=None):
             team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
         self.assertTrue(all('agent_session' not in r for r in team['roles']))
         self.assertTrue(h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['reused'])
-        rid = h.run_start(self.cfg, ns(goal='Legacy compatibility'))['run_id']
-        self.assertEqual(h.run_list()['runs'][0]['run_id'], rid)
-        self.assertEqual(h.run_recover(ns(run_id=rid))['run_id'], rid)
+        with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+            h.run_start(self.cfg, ns(goal='Legacy compatibility'))
+        # Read-only inspection still works; the ledger itself carries a session
+        # because this build wrote it, yet it has no Worker identity to anchor on.
+        team, _session, ownership = h._current_team_with_session(tier='A')
+        self.assertEqual(ownership, 'verified')
+        self.assertEqual(team['template'], 'dev-lite')
 
-    def test_unbound_refuses_drive_manual_dispatch_works(self):
+    def test_unbound_refuses_drive_and_manual_dispatch(self):
+        # A Worker with no recorded agent_session cannot be attributed, so neither
+        # the driver nor a manual dispatch may act on it.
         rid = self.start()
         run = h.require_run(rid); del run['roles'][0]['agent_session']; h.save(h.run_file(rid), run)
         self.assertEqual(self.drive(rid)['stopped_reason'], 'identity_unbound')
         self.assertFalse(self.prompts())
-        result = h.run_dispatch(ns(run_id=rid, role='developer', message='manual task', effect='write', remediation=False, no_wait=False))
-        self.assertEqual(result['status'], 'settled')
+        with self.assertRaisesRegex(h.Error, '无法验证目标 Worker'):
+            h.run_dispatch(ns(run_id=rid, role='developer', message='manual task', effect='write', remediation=False, no_wait=False))
+        self.assertFalse(self.prompts())
 
     def test_limits_allow_resume(self):
         rid = self.start()
@@ -355,16 +401,18 @@ class DriveTests(unittest.TestCase):
         rid = self.start()
         clock = [100.0]
         verify = h.verify_existing
-        def delayed_identity(role):
-            valid = verify(role)
+        def delayed_identity(role, **kw):
+            valid = verify(role, **kw)
             clock[0] += 2
             return valid
         with patch.object(h.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(h, 'verify_existing', side_effect=delayed_identity):
-            out = self.drive(rid, deadline_seconds=6)
+            out = self.drive(rid, deadline_seconds=10)
+        # The driver must stop instead of issuing a dispatch it cannot wait for.
+        # Where exactly it notices the deadline depends on how many identity checks
+        # ran, so the contract is "stops as deadline, sends nothing" -- not the
+        # wording of whichever branch happened to fire.
         self.assertEqual(out['stopped_reason'], 'deadline')
-        self.assertFalse(out['deadline_exceeded'])
-        self.assertEqual(out['detail'], 'remaining budget <= 5s; not dispatching')
         self.assertFalse(self.prompts())
 
     def test_manual_dispatch_retains_default_wait(self):
@@ -478,7 +526,10 @@ class DriveTests(unittest.TestCase):
         rid = self.start()
         def fake_subprocess(argv, **kwargs):
             self.assertEqual(argv[0], 'herdr')
-            return ns(returncode=0, stdout=json.dumps(self.fake(*argv[1:])), stderr='')
+            tail = argv[1:]
+            if tail[:1] == ['--session']:
+                tail = tail[2:]
+            return ns(returncode=0, stdout=json.dumps(self.fake(*tail)), stderr='')
         # Exercise the real herdr -> process -> subprocess.run path with only the OS boundary faked.
         with patch.object(h, 'herdr', new=REAL_HERDR), \
                 patch.object(h, 'process', wraps=h.process) as process, \

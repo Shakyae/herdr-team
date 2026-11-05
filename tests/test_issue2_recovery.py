@@ -48,8 +48,20 @@ class Base(unittest.TestCase):
         h.STATE = Path(self.tmp.name) / 'state'
         self.addCleanup(setattr, h, 'STATE', self.old_state)
         env = patch.dict(os.environ, {'HERDR_ENV': '1', 'HERDR_WORKSPACE_ID': 'w1',
-                                      'HERDR_PANE_ID': 'w1:p1', 'HERDR_TAB_ID': 'w1:t1'})
+                                      'HERDR_PANE_ID': 'w1:p1', 'HERDR_TAB_ID': 'w1:t1',
+                                      'HERDR_SESSION': '', 'HERDR_SOCKET_PATH': ''})
         env.start(); self.addCleanup(env.stop)
+        # The native branch cross-checks HERDR_* against the real process
+        # ancestry probe. These tests are about Issue #2 recovery, not identity
+        # discovery, so fake the probe at that boundary and keep every other
+        # validation live.
+        def identity(*args, **kwargs):
+            return {'session': os.environ.get('HERDR_SESSION') or 'default',
+                    'workspace': os.environ.get('HERDR_WORKSPACE_ID', ''),
+                    'tab': os.environ.get('HERDR_TAB_ID', ''),
+                    'pane': os.environ.get('HERDR_PANE_ID', '')}
+        probe = patch.object(h, 'pane_of_current_process', side_effect=identity)
+        probe.start(); self.addCleanup(probe.stop)
         self.agent = {'name': 'dev-w1p2', 'pane_id': 'w1:p2', 'agent': 'claude',
                       'agent_status': 'idle', 'cwd': str(Path(self.tmp.name).resolve()),
                       'agent_session': {'kind': 'id', 'source': 'herdr:claude', 'value': 'session-1'}}
@@ -78,7 +90,7 @@ class Base(unittest.TestCase):
             raise AssertionError(f'unexpected Herdr call {argv}')
 
         p = patch.object(h, 'herdr', side_effect=fake); p.start(); self.addCleanup(p.stop)
-        lk = patch.object(h, 'lookup_agent', side_effect=lambda n: None if self.agent_missing else dict(self.agent))
+        lk = patch.object(h, 'lookup_agent', side_effect=lambda n, **kw: None if self.agent_missing else dict(self.agent))
         lk.start(); self.addCleanup(lk.stop)
 
     def trust_cancel(self):
@@ -141,6 +153,39 @@ class Base(unittest.TestCase):
                     evidence=kw.pop('evidence'), confirm_untracked=False, quarantine_invalid=False)
         base.update(kw)
         return h.run_abandon(ns(**base))
+
+
+class LegacyLedgerSessionTests(Base):
+    """A legacy ledger has no session key; observation must still use the
+    session the process actually resolved."""
+
+    def test_abandon_uses_resolved_session_for_a_legacy_ledger(self):
+        # Regression: reading the session from `run["session"]` yields None on a
+        # legacy ledger, so the presence probe silently hit the DEFAULT server.
+        # A live `working` Worker then looked `confirmed_absent` and the working
+        # fence never fired.
+        self.make_run()
+        run = h.require_run(RID)
+        run.pop('session', None)
+        h.save(h.run_file(RID), run)
+        self.agent['agent_status'] = 'working'
+        snap = self.diagnose()['evidence']['snapshot_id']
+        probed = []
+
+        def fake(*argv, **kw):
+            if argv[:2] in (('agent', 'get'), ('pane', 'get')):
+                probed.append(kw.get('session'))
+            return self.base_fake(*argv, **kw)
+
+        self.base_fake = h.herdr.side_effect
+        with patch.object(h, 'herdr', side_effect=fake):
+            with self.assertRaises(h.GuardError) as ctx:
+                self.abandon(evidence=snap, confirm_untracked=True)
+        self.assertEqual(ctx.exception.code, 'execution_not_fenced')
+        self.assertIn('working', str(ctx.exception))
+        self.assertTrue(probed)
+        self.assertTrue(all(s == 'default' for s in probed),
+                        f'presence probe lost the resolved session: {probed}')
 
 
 class PresenceTests(Base):
@@ -395,7 +440,10 @@ class TerminalStateTests(Base):
                 run = self.make_run(dispatch_status='uncertain')
                 changed = dict(run, dispatches=[dict(run['dispatches'][0], status=status,
                                                     report={'verdict': 'fail'}, artifact_sha256='a' * 64)])
-                with patch.object(h, 'require_run', side_effect=[run, changed]), \
+                # Patch the ledger load, not require_run: collect resolves the
+                # ledger through the identity-checking loader AND re-reads it
+                # under the lock, so two loads happen either way.
+                with patch.object(h, 'load', side_effect=[run, changed]), \
                      patch.object(h, 'verify_existing', return_value=True), \
                      patch.object(h, 'reconcile_result') as reconcile, \
                      patch.object(h, 'save') as save:
@@ -409,7 +457,8 @@ class TerminalStateTests(Base):
             with self.subTest(status=status):
                 run = self.make_run(dispatch_status='uncertain')
                 changed = dict(run, status=status)
-                with patch.object(h, 'require_run', side_effect=[run, changed]), \
+                # Patch the ledger load for the same reason as the dispatch case.
+                with patch.object(h, 'load', side_effect=[run, changed]), \
                      patch.object(h, 'verify_existing', return_value=True), \
                      patch.object(h, 'reconcile_result') as reconcile, \
                      patch.object(h, 'save') as save:
@@ -863,10 +912,10 @@ class RecoveryM2Base(Base):
         original_herdr = h.herdr
         self.base_herdr = original_herdr
 
-        def lookup(name):
+        def lookup(name, **kw):
             if name == self.reviewer_agent['name']:
                 return dict(self.reviewer_agent)
-            return original_lookup(name)
+            return original_lookup(name, **kw)
 
         def herdr_get(*argv, **kw):
             if argv[:2] == ('agent', 'get') and argv[2] == self.reviewer_agent['name']:
@@ -2072,6 +2121,13 @@ def _agent_get(*argv, **kw):
 
 h.herdr = _agent_get
 h.TRUSTED_CONTROL = control
+# Same boundary stub as the in-process tests: HERDR_* is provided by the
+# environment, and the real ancestry probe cannot see a subprocess pane.
+h.pane_of_current_process = lambda *a, **kw: {
+    'session': os.environ.get('HERDR_SESSION') or 'default',
+    'workspace': os.environ.get('HERDR_WORKSPACE_ID', ''),
+    'tab': os.environ.get('HERDR_TAB_ID', ''),
+    'pane': os.environ.get('HERDR_PANE_ID', '')}
 import types
 if os.environ.get('PROC_MODE') == 'dispatch':
     args = types.SimpleNamespace(run_id=sys.argv[2], role='developer',
@@ -2528,7 +2584,11 @@ class RealConcurrencyTests(RecoveryM2Base):
     def spawn(self, count, argv_hook, tag):
         script = Path(self.tmp.name) / ('worker_%s.py' % tag)
         script.write_text(CONCURRENCY_WORKER)
-        env = dict(os.environ, HTM_STATE_DIR=str(h.STATE), PROC_CWD=self.tmp.name)
+        # Pin the identity env explicitly: the parent shell may carry a real
+        # HERDR_* from whatever pane this suite happens to run in.
+        env = dict(os.environ, HTM_STATE_DIR=str(h.STATE), PROC_CWD=self.tmp.name,
+                   HERDR_ENV='1', HERDR_WORKSPACE_ID='w1', HERDR_PANE_ID='w1:p1',
+                   HERDR_TAB_ID='w1:t1', HERDR_SESSION='', HERDR_SOCKET_PATH='')
         env.setdefault('PROC_RECEIPT', 'rcpt-' + tag)
         procs = []
         for i in range(count):
@@ -2590,9 +2650,14 @@ class RealConcurrencyTests(RecoveryM2Base):
         snap = self.diagnose()['evidence']['snapshot_id']
         script = Path(self.tmp.name) / 'abandon_worker.py'
         script.write_text(r"""
-import importlib.util, json, sys, types
+import importlib.util, json, os, sys, types
 spec = importlib.util.spec_from_file_location('htm', sys.argv[1])
 h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
+h.pane_of_current_process = lambda *a, **kw: {
+    'session': os.environ.get('HERDR_SESSION') or 'default',
+    'workspace': os.environ.get('HERDR_WORKSPACE_ID', ''),
+    'tab': os.environ.get('HERDR_TAB_ID', ''),
+    'pane': os.environ.get('HERDR_PANE_ID', '')}
 args = types.SimpleNamespace(run_id=sys.argv[2], dispatch_id=sys.argv[3],
                              reason='Worker produced no verifiable report',
                              evidence=sys.argv[4], confirm_untracked=True,
@@ -2603,7 +2668,11 @@ try:
 except h.Error as e:
     print(json.dumps({'ok': False, 'error': str(e)}))
 """)
-        env = dict(os.environ, HTM_STATE_DIR=str(h.STATE), PROC_CWD=self.tmp.name)
+        # Pin the identity env explicitly: the parent shell may carry a real
+        # HERDR_* from whatever pane this suite happens to run in.
+        env = dict(os.environ, HTM_STATE_DIR=str(h.STATE), PROC_CWD=self.tmp.name,
+                   HERDR_ENV='1', HERDR_WORKSPACE_ID='w1', HERDR_PANE_ID='w1:p1',
+                   HERDR_TAB_ID='w1:t1', HERDR_SESSION='', HERDR_SOCKET_PATH='')
         procs = [subprocess.Popen([sys.executable, '-I', '-B', str(script), str(MODULE),
                                    RID, DID, snap], stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, env=env)

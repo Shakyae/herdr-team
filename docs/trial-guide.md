@@ -107,13 +107,13 @@ python3 /path/to/herdr-team/scripts/htm.py run finish --run-id <RUN_ID>
 
 ## c. 限制（试用前必读）
 
-**Happier 兼容是硬限制。** 经 Happier 包装启动的 Claude Code 不上报 `agent_session`，由此：
+**Happier 的支持范围与限制。** Happier 包装的 Lead 上 `init` / `status` / `run start` / `run list` 的 Lead 侧 Pane 上下文定位已可用：方案 B 用父进程链和 `process-info` 自证，不依赖 `HERDR_ENV`。
 
-- `name-lead` 会拒绝执行（无法验证 session 身份）；
-- `adopt` 无法绑定被接管的 Worker（无法验证 `agent_session`）；
-- `run drive` 自动模式要求所有 Worker 都有可验证 `agent_session`，否则返回 `identity_unbound`。
+**仍不可用**：Happier 包装的 Claude Code 不上报 `agent_session`，因此 `name-lead` 拒绝执行，`adopt` 无法绑定身份不可核验的 Worker。`run drive` 自动模式要求全部 Worker 绑定 `agent_session`——需先读 team 文件确认：Worker 由 Herdr 原生启动时有绑定，预检会通过；Worker 也无绑定时才返回 `identity_unbound`，此时改用 Lead 手动命令（`run dispatch` / `run collect` / `run gate`）。**不要预设一定返回 `identity_unbound`。** 不要伪造身份绕过。
 
-结论：**Happier 身份兼容未实现，本次试用请让 Lead 与 Worker 都运行在原生 Herdr 环境。** 具体地：`name-lead` 在 Happier 包装的 Lead 上不可用；`adopt` 无法接管 `agent_session` 不可核验的 Worker；`run drive` 的身份校验只覆盖 Worker（`run["roles"]`）的 `agent_session`，不校验 Lead，未绑定的 Worker 会让它返回 `identity_unbound` 并改用 Lead 手动命令（`run dispatch` / `run collect` / `run gate`）。这也是为什么本次真实联调全部在原生 Herdr 的 `wF` 中完成。这是环境限制，不是缺陷；不要伪造身份绕过。
+**已真实验收**：2026-11-05 在非默认 Herdr session `i6-accept` 中用 Happier 0.2.20 完成 dev-lite 五阶段完整 Run（`e1f66ce5dfab`，`finished`），含真实产物、Reviewer 独立核验、零错误路由。证据见 `docs/design/happier-init-compat.md` §6.1。原生 Herdr 路径的身份与负例回归同时通过，但**原生侧完整 Run 本轮未重跑**，不得把 Happier 验收等同于所有启动方式全通过。
+
+**多 Session 注意**：Team 账本键不含 session 维度，两个 session 的 Workspace/Pane ID 相同时会命中同一账本文件。多 session 场景请务必用独立的 `HTM_STATE_DIR`。详见 `docs/issues/p1-cross-session-team-ledger-key.md`。
 
 **已有 Worker 接管（`adopt`）条件很严。** 它只注册**全新** team——该 Lead Pane 已有注册文件就直接拒绝（`path.exists()`）；必须传全部角色的 `role=agent-name`；每个 Worker 要在 `idle`/`done`、kind 可验证、同 workspace、非 Lead pane、cwd 一致、`agent_session` 可验证绑定；任何一条不满足即拒绝。Worker 被未结束 Run 预约、或已被其他 team 注册时也拒绝。
 

@@ -244,7 +244,27 @@ def resolve(cfg, name, options=None):
     return item, config
 
 
-def context(require=True):
+def socket_session(socket):
+    """Return the unique named session whose current socket_path is exactly `socket`."""
+    result = herdr("session", "list", "--json")
+    sessions = result.get("sessions") if isinstance(result, dict) else None
+    if not isinstance(sessions, list):
+        raise Error("Invalid Herdr session list")
+    matches = [item for item in sessions if isinstance(item, dict) and item.get("socket_path") == socket]
+    if len(matches) != 1:
+        raise Error("Herdr socket does not identify exactly one session")
+    name = matches[0].get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise Error("Herdr socket does not identify exactly one named session")
+    return name
+
+
+def lead_identity(require=True):
+    if require and "HERDR_ENV" not in os.environ:
+        first = pane_of_current_process()
+        if first != pane_of_current_process():
+            raise Error("Herdr pane 身份不唯一，拒绝猜测（两次探测不一致）")
+        return {"context": {"workspace": first["workspace"], "lead_pane": first["pane"], "lead_tab": first["tab"]}, "session": first["session"]}
     if require and os.environ.get("HERDR_ENV") != "1":
         raise Error("Must run inside Herdr: HERDR_ENV=1")
     ws = os.environ.get("HERDR_WORKSPACE_ID", "")
@@ -252,6 +272,7 @@ def context(require=True):
     tab = os.environ.get("HERDR_TAB_ID", "")
     if require and not (ws and pane and tab):
         raise Error("Missing Herdr pane/workspace/tab environment")
+    session = ""
     if require:
         for label, value, pattern in (("workspace", ws, WORKSPACE_ID_RE),
                                       ("tab", tab, TAB_ID_RE), ("pane", pane, PANE_ID_RE)):
@@ -259,7 +280,28 @@ def context(require=True):
                 raise Error(f"Invalid Herdr {label} id: {value!r}")
         if tab.split(":")[0] != ws or pane.split(":")[0] != ws:
             raise Error(f"Tab/Pane does not belong to workspace {ws}: tab={tab!r} pane={pane!r}")
-    return {"workspace": ws, "lead_pane": pane, "lead_tab": tab}
+        # An inherited HERDR_* environment is not proof of ownership: it can be forged or
+        # stale. Prove the calling process actually lives in the pane before trusting it.
+        first = pane_of_current_process()
+        if first != pane_of_current_process():
+            raise Error("Herdr pane 身份不唯一，拒绝猜测（两次探测不一致）")
+        if any(first[key] != value for key, value in (("workspace", ws), ("tab", tab), ("pane", pane))):
+            raise Error(f"Herdr 进程归属与 HERDR_* 身份不一致: probe={first!r}")
+        session = first["session"]
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+            raise Error(f"Invalid Herdr session name: {session!r}")
+        env_session = os.environ.get("HERDR_SESSION", "")
+        if env_session and env_session != session:
+            raise Error(f"Herdr 进程归属 session 与环境不一致: {env_session!r} != {session!r}")
+        socket = os.environ.get("HERDR_SOCKET_PATH", "")
+        if socket and socket_session(socket) != session:
+            raise Error(f"Herdr socket 与进程归属不一致: {socket!r} != {session!r}")
+    ctx = {"workspace": ws, "lead_pane": pane, "lead_tab": tab}
+    return {"context": ctx, "session": session}
+
+
+def context(require=True):
+    return lead_identity(require)["context"]
 
 
 def now():
@@ -275,6 +317,146 @@ def run_file(runid):
     if not re.fullmatch(r"[a-f0-9]{12}", runid):
         raise Error("Invalid Run ID")
     return STATE / "runs" / (runid + ".json")
+
+
+def ledger_ownership(data, session, path):
+    """Classify ledger ownership: 'verified' | 'legacy'; raise when it belongs elsewhere.
+
+    The recorded session name is a weak signal -- a session can be stopped and
+    recreated under the same name with the same IDs but different agents. It is
+    therefore only used to reject ledgers that clearly belong to another session.
+    """
+    recorded = data.get("session")
+    if recorded is None:
+        return "legacy"
+    if recorded != session:
+        raise Error(f"账本 {path} 属于 session {recorded!r}，当前 session 为 {session!r}；"
+                    f"拒绝跨 session 操作。多 session 场景请为每个 session 设置独立的 HTM_STATE_DIR")
+    return "verified"
+
+
+# `verify_existing` raises for two very different reasons, and the difference
+# decides whether a ledger is rejected or merely tolerated:
+#
+#   AgentUnobservable -- the agent could not be looked at at all. Workers
+#                        legitimately die, so this is tolerable.
+#   Error             -- the agent WAS observed and contradicts the ledger
+#                        (identity, pane, kind, name, cwd). Never tolerable.
+#
+# A message-substring whitelist cannot make this call: every contradiction that
+# is not on the list (a name mismatch, a cwd mismatch) silently degrades into
+# "unobservable" and lets a foreign ledger through. The distinction is therefore
+# carried by the exception type raised at the observation site.
+class AgentUnobservable(Error):
+    """The agent could not be observed. Not evidence of anything."""
+
+
+def _ownership_label(data, session):
+    """How ownership of this ledger can currently be evidenced.
+
+    Diagnostic only -- never an access decision. `upgrade` marks a ledger with no
+    session tag, which is the shape that can be reached from another session.
+    """
+    try:
+        ownership = ledger_ownership(data, session or "", None)
+    except Error:
+        return "foreign"
+    if ownership == "legacy":
+        return "legacy"
+    verified, _total, conflicts, _unavailable = _inspect_roles(data, session or "")
+    if conflicts:
+        return "conflict"
+    return "verified" if verified else "unverified"
+
+
+class LedgerIdentityError(Error):
+    """The ledger itself was refused on ownership grounds.
+
+    A distinct type so `run drive` can label the stop reason precisely instead
+    of pattern-matching Chinese error text -- a message rewrite must never
+    silently reclassify a refusal as a generic error.
+    """
+
+
+def _inspect_roles(data, session):
+    """Classify each recorded Worker identity against the live Herdr state.
+
+    Returns (verified, total, conflicts, unavailable):
+      verified    -- UUID matched live
+      total       -- roles that recorded an agent_session at all
+      conflicts   -- identity contradictions (never tolerated)
+      unavailable -- role could not be observed (tolerable, workers die)
+    """
+    verified = total = 0
+    conflicts, unavailable = [], []
+    for role in data.get("roles", []):
+        if not (role.get("agent_session") or {}).get("value"):
+            continue
+        total += 1
+        try:
+            if verify_existing(role, session=session):
+                verified += 1
+        except AgentUnobservable as e:
+            unavailable.append(f"Agent {role.get('agent_name')}: {e}")
+        except Error as e:
+            # Fail closed: anything else verify_existing raises means it looked
+            # at the agent and found a contradiction.
+            conflicts.append(f"Agent {role.get('agent_name')}: {e}")
+    return verified, total, conflicts, unavailable
+
+
+def require_roles_owned(data, session, path, require_anchor=True):
+    """Prove ledger ownership through Worker agent_session UUIDs.
+
+    A session name alone is weak evidence: a session can be stopped and recreated
+    under the same name with the same IDs but different agents. Callers therefore
+    invoke this for tier C regardless of whether the ledger recorded a session.
+
+    Two separate obligations, deliberately not collapsed:
+
+      contradictions -- an observed Worker that contradicts the ledger. This
+                        means the ledger is demonstrably *not* these agents, so
+                        it rejects unconditionally. `require_anchor` never
+                        relaxes it.
+      anchor         -- positive proof that the ledger is ours (>=1 live UUID).
+                        Workers legitimately die; the operations that must work
+                        *because* they died (diagnose, abandon, recover-attempt)
+                        cannot demand a survivor or they would reintroduce the
+                        Issue #2 lock-up. Those pass require_anchor=False and
+                        rely on the session tag, the pane context and the
+                        contradiction check instead.
+    """
+    verified, total, conflicts, unavailable = _inspect_roles(data, session)
+    if conflicts:
+        raise LedgerIdentityError(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
+    if not require_anchor:
+        return verified, unavailable
+    if total == 0:
+        raise LedgerIdentityError(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
+    if verified == 0:
+        detail = ("；不可观察：" + "；".join(unavailable)) if unavailable else ""
+        raise LedgerIdentityError(f"账本 {path} 的 Worker 均无法在当前 session 内验证身份；无法证明该账本属于当前 session。"
+                    f"如确认应归属当前 session，请检查 Worker 是否仍在运行{detail}")
+    return verified, unavailable
+
+
+def require_target_role(data, session, role_name, path):
+    """Verify the specific Worker a dispatch/collect is about to act on.
+
+    Ledger-level anchoring is not enough: another role matching says nothing
+    about whether *this* Worker is the one the ledger named.
+    """
+    role = next((r for r in data.get("roles", []) if r.get("role") == role_name), None)
+    if role is None:
+        # An unknown role is a caller error with its own established message
+        # (get_role). Identity checking has nothing to add: a role that is not
+        # in the ledger cannot be dispatched anyway.
+        return None
+    if not (role.get("agent_session") or {}).get("value"):
+        raise LedgerIdentityError(f"账本 {path} 的角色 {role_name} 未记录 Worker 身份；无法验证目标 Worker，拒绝执行")
+    if not verify_existing(role, session=session):
+        raise LedgerIdentityError(f"目标 Worker {role.get('agent_name')} 不在当前 session 内，拒绝针对它的操作")
+    return role
 
 
 def save(path, data):
@@ -339,13 +521,85 @@ def process(argv, timeout=40, raw=False, env=None):
     return out.get("result", out)
 
 
-def herdr(*args, timeout=40):
-    return process(["herdr", *args], timeout=timeout)
+def herdr(*args, timeout=40, session=None):
+    if session is not None:
+        if not isinstance(session, str):
+            raise Error("Invalid Herdr session name")
+        if not session.strip():
+            session = None
+        elif not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+            raise Error("Invalid Herdr session name")
+    return process(["herdr", *(["--session", session] if session else []), *args], timeout=timeout)
 
 
-def pane_shell_ready(pane_id):
+def pane_of_current_process():
     try:
-        result = herdr("pane", "process-info", "--pane", pane_id)
+        sessions = herdr("session", "list", "--json")["sessions"]
+        if not isinstance(sessions, list):
+            raise ValueError("invalid sessions")
+        ancestors = set()
+        pid = os.getpid()
+        for _ in range(64):
+            if pid in ancestors:
+                raise ValueError("process ancestry cycle")
+            ancestors.add(pid)
+            pid = int(process(["/bin/ps", "-o", "ppid=", "-p", str(pid)], raw=True).strip())
+            if pid <= 1:
+                break
+        matches = []
+        seen_panes, seen_tabs = {}, {}
+        for session in sessions:
+            if not isinstance(session, dict):
+                raise ValueError("invalid session")
+            if session.get("running") is not True:
+                continue
+            name = session.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise Error("session 信息不完整，无法确认身份唯一性")
+            panes = herdr("pane", "list", session=name)["panes"]
+            if not isinstance(panes, list):
+                raise ValueError("invalid panes")
+            for pane in panes:
+                pane_id = pane["pane_id"]
+                workspace, tab_id = pane["workspace_id"], pane["tab_id"]
+                for seen, key, label in ((seen_panes, (workspace, pane_id), "Pane"),
+                                         (seen_tabs, (workspace, tab_id), "Tab")):
+                    if key in seen and seen[key] != name:
+                        raise Error(f"跨 session {label} ID 冲突: {key}")
+                    seen[key] = name
+                info = herdr("pane", "process-info", "--pane", pane_id, session=name)["process_info"]
+                shell_pid = info["shell_pid"]
+                foreground = info["foreground_processes"]
+                if type(shell_pid) is not int or not isinstance(foreground, list):
+                    raise ValueError("invalid process info")
+                pids = {shell_pid}
+                for item in foreground:
+                    if type(item["pid"]) is not int:
+                        raise ValueError("invalid process pid")
+                    pids.add(item["pid"])
+                if ancestors & pids:
+                    matches.append({"session": name, "workspace": pane["workspace_id"],
+                                    "tab": pane["tab_id"], "pane": pane_id})
+        if len(matches) > 1:
+            raise Error("Herdr pane 身份不唯一，拒绝猜测")
+        if not matches:
+            raise ValueError("no matching pane")
+        match = matches[0]
+        for label, pattern in (("workspace", WORKSPACE_ID_RE), ("tab", TAB_ID_RE), ("pane", PANE_ID_RE)):
+            if not isinstance(match[label], str) or not pattern.fullmatch(match[label]):
+                raise ValueError(f"invalid {label} id")
+        if match["tab"].split(":")[0] != match["workspace"] or match["pane"].split(":")[0] != match["workspace"]:
+            raise ValueError("pane/tab workspace mismatch")
+        return match
+    except (Error, KeyError, TypeError, ValueError, AttributeError) as e:
+        if isinstance(e, Error) and "身份不唯一，拒绝猜测" in str(e):
+            raise
+        raise Error(f"无法定位 Herdr pane: {e}") from e
+
+
+def pane_shell_ready(pane_id, session=None):
+    try:
+        result = herdr("pane", "process-info", "--pane", pane_id, session=session)
     except Error:
         return False
     info = result.get("process_info") if isinstance(result, dict) else None
@@ -371,20 +625,20 @@ def pane_shell_ready(pane_id):
 
 
 def start_agent_when_ready(name, kind, pane_id, workspace, created_panes,
-                           launch_args=(), attempts=8, interval=0.5):
+                           launch_args=(), attempts=8, interval=0.5, herdr_session=None):
     stats = {"shell_polls": 0, "busy_retries": 0, "attempts": 0}
     for attempt in range(1, attempts + 1):
         stats["attempts"] = attempt
         if pane_id not in created_panes:
             raise Error(f"Pane {pane_id} was not created by this init; refusing agent start")
-        result = herdr("pane", "get", pane_id)
+        result = herdr("pane", "get", pane_id, session=herdr_session)
         pane = result.get("pane") if isinstance(result, dict) else None
         if not isinstance(pane, dict) or pane.get("workspace_id") != workspace:
             raise Error(f"Pane {pane_id} is missing or belongs to a different workspace")
-        if pane_shell_ready(pane_id):
+        if pane_shell_ready(pane_id, session=herdr_session):
             try:
                 result = herdr("agent", "start", name, "--kind", kind, "--pane", pane_id,
-                               *launch_args, timeout=60)
+                               *launch_args, timeout=60, session=herdr_session)
                 return result, stats
             except Error as e:
                 if "agent_pane_busy" not in str(e):
@@ -435,9 +689,9 @@ def agent_status_of(obj):
     return status if isinstance(status, str) and status else "unknown"
 
 
-def lookup_agent(name):
+def lookup_agent(name, session=None):
     try:
-        return agent_data(herdr("agent", "get", name))
+        return agent_data(herdr("agent", "get", name, session=session))
     except Error:
         return None
 
@@ -451,7 +705,7 @@ def agent_name_for(role, pane_id):
     return name
 
 
-def require_name_available(name, team_path, roles=()):
+def require_name_available(name, team_path, roles=(), session=None):
     if any(r.get("agent_name") == name for r in roles):
         raise Error(f"Agent name already registered in this team: {name}")
     for other_path in (STATE / "teams").glob("*.json"):
@@ -461,7 +715,7 @@ def require_name_available(name, team_path, roles=()):
         if any(r.get("agent_name") == name for r in other.get("roles", [])):
             raise Error(f"Agent name {name} already registered by team {other_path}")
     try:
-        found = herdr("agent", "get", name)
+        found = herdr("agent", "get", name, session=session)
     except Error as e:
         if isinstance(e, HerdrError) and e.code == "agent_not_found":
             return
@@ -478,19 +732,28 @@ def pending_plan(plan):
     return result
 
 
-def verify_existing(team_role):
-    found = lookup_agent(team_role["agent_name"])
+def verify_existing(team_role, session=None):
+    # `lookup_agent` swallows every Error and returns None, so an unobservable
+    # agent and a genuinely absent one arrive here identically as a falsy value.
+    # Ownership checks must not treat "could not look" as "does not match"; the
+    # caller in _inspect_roles separates the two by exception type.
+    try:
+        found = lookup_agent(team_role["agent_name"], session=session)
+    except Error as e:
+        raise AgentUnobservable(str(e)) from e
     if not found or not isinstance(found, dict):
         return False
     pane = found.get("pane")
     observed_pane = found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)
+    # Incomplete observations say nothing about WHO the agent is; a live agent
+    # contradicting the ledger does. Only the latter rejects an ownership claim.
     if not observed_pane:
-        raise Error(f"Agent {team_role['agent_name']} has no verifiable pane ID; refusing reuse")
+        raise AgentUnobservable(f"Agent {team_role['agent_name']} has no verifiable pane ID")
     if observed_pane != team_role["pane_id"]:
         raise Error(f"Agent {team_role['agent_name']} is live in unexpected pane {observed_pane}; refusing reuse")
     kind = agent_kind_of(found)
     if not kind:
-        raise Error(f"Agent {team_role['agent_name']} has no verifiable kind")
+        raise AgentUnobservable(f"Agent {team_role['agent_name']} has no verifiable kind")
     if kind != team_role["kind"]:
         raise Error(f"Agent {team_role['agent_name']} has unexpected kind {kind}")
     if "agent_session" in team_role:
@@ -508,7 +771,7 @@ def verify_existing(team_role):
     return True
 
 
-def agent_presence(role):
+def agent_presence(role, session=None):
     """Three-state observation of a bound Worker. Never proof that it stopped.
 
     Rules (design §3): confirmed_absent requires BOTH `agent get` returning
@@ -518,7 +781,11 @@ def agent_presence(role):
     """
     code = None
     try:
-        found = herdr("agent", "get", role["agent_name"])
+        # The Worker binding must be read from ITS session. Without this, a
+        # named session's call would query the default server, and a live
+        # Worker could produce agent_not_found + pane_not_found there -- i.e.
+        # `confirmed_absent` -- which is exactly what the abandon fence trusts.
+        found = herdr("agent", "get", role["agent_name"], session=session)
     except HerdrError as e:
         code = e.code
         if code != "agent_not_found":
@@ -556,7 +823,7 @@ def agent_presence(role):
         return {"state": "present", "code": None, "status": agent_status_of(found)}
     # agent_not_found: only a matching pane_not_found proves absence.
     try:
-        herdr("pane", "get", role["pane_id"])
+        herdr("pane", "get", role["pane_id"], session=session)
     except HerdrError as e:
         if e.code == "pane_not_found":
             return {"state": "confirmed_absent", "code": "agent_not_found"}
@@ -720,7 +987,8 @@ def init(cfg, args):
         wt = worktree_details(plan, args, False, cwd=cwd)
         return {"dry_run": True, "no_mutations": True, "cwd": str(cwd), "worktree": wt,
                 "plan": pending_plan(plan), "requires_herdr": True}
-    ctx = context()
+    identity = lead_identity()
+    ctx, herdr_session = identity["context"], identity["session"]
     for role in plan["roles"]:
         if role["kind"] == "hermes":
             profile_check(role["profile"])
@@ -731,6 +999,10 @@ def init(cfg, args):
             old = load(path)
             if old.get("version") != 3:
                 raise Error("Legacy v4.1 team state cannot be automatically adopted; inspect/close existing sessions and migrate manually")
+            # Reusing a team is a state-changing action: a ledger that belongs to
+            # another session must never be adopted silently, even if its config
+            # happens to match.
+            ledger_ownership(old, herdr_session, path)
             if (old.get("template") != args.template or
                     json.dumps(old.get("plan"), sort_keys=True) != json.dumps(plan, sort_keys=True) or
                     old.get("cwd") != str(cwd) or old.get("worktree") != requested_wt):
@@ -738,7 +1010,7 @@ def init(cfg, args):
             if old.get("status") == "partial":
                 raise Error("Previous init is partial. Inspect team state and orphan panes before retrying; no automatic duplicate creation.")
             for role in old["roles"]:
-                if not verify_existing(role):
+                if not verify_existing(role, session=herdr_session):
                     raise Error(f"Registered Agent {role['agent_name']} not live. Do not silently replace; investigate or create a new team.")
             return {"reused": True, "team": old}
         for role in plan["roles"]:
@@ -760,7 +1032,8 @@ def init(cfg, args):
         wt = requested_wt
         work_cwd = str(wt["path"]) if wt else str(cwd)
         roles = []
-        team = {"version": 3, "template": args.template, "context": ctx, "created_at": now(),
+        team = {"version": 3, "template": args.template, "context": ctx, "session": herdr_session,
+                "created_at": now(),
                 "status": "partial", "roles": roles, "plan": plan, "cwd": str(cwd), "worktree": wt,
                 "resources": [], "pending_operation": None}
         save(path, team)
@@ -778,21 +1051,21 @@ def init(cfg, args):
             if plan["settings"]["layout"]["mode"] == "tab":
                 r = operate("tab_create", {"cwd": work_cwd},
                             lambda: herdr("tab", "create", "--workspace", ctx["workspace"], "--cwd", work_cwd,
-                                          "--label", "htm-"+args.template, "--no-focus"))
+                                          "--label", "htm-"+args.template, "--no-focus", session=herdr_session))
                 root_pane = r["root_pane"]["pane_id"]
             else:
                 r = operate("pane_split", {"source": ctx["lead_pane"], "cwd": work_cwd},
-                            lambda: herdr("pane", "split", ctx["lead_pane"], "--direction", "right", "--cwd", work_cwd, "--no-focus"))
+                            lambda: herdr("pane", "split", ctx["lead_pane"], "--direction", "right", "--cwd", work_cwd, "--no-focus", session=herdr_session))
                 root_pane = r["pane"]["pane_id"]
             pane_ids = [root_pane] + [None]*(len(plan["roles"])-1)
             for src, direction, target in plan["layout_steps"]:
                 r = operate("pane_split", {"source": pane_ids[src], "direction": direction, "cwd": work_cwd},
-                            lambda: herdr("pane", "split", pane_ids[src], "--direction", direction, "--cwd", work_cwd, "--no-focus"))
+                            lambda: herdr("pane", "split", pane_ids[src], "--direction", direction, "--cwd", work_cwd, "--no-focus", session=herdr_session))
                 pane_ids[target] = r["pane"]["pane_id"]
             for idx, role in enumerate(plan["roles"]):
                 try:
                     name = agent_name_for(role["role"], pane_ids[idx])
-                    require_name_available(name, path, roles)
+                    require_name_available(name, path, roles, session=herdr_session)
                 except Error as e:
                     raise Error(f"Pane {pane_ids[idx]} already created; agent not named or started: {e}") from e
                 info = {**role, "pane_id": pane_ids[idx], "agent_name": name, "cwd": work_cwd}
@@ -803,13 +1076,13 @@ def init(cfg, args):
                 def start():
                     launch_args = ["--", *role["launch_args"]] if role["launch_args"] else []
                     result, stats = start_agent_when_ready(
-                        name, role["kind"], pane_ids[idx], ctx["workspace"], pane_ids, launch_args)
+                        name, role["kind"], pane_ids[idx], ctx["workspace"], pane_ids, launch_args, herdr_session=herdr_session)
                     detail["readiness_attempts"] = stats["attempts"]
                     detail["readiness_shell_polls"] = stats["shell_polls"]
                     detail["readiness_busy_retries"] = stats["busy_retries"]
                     return result
                 operate("agent_start", detail, start)
-                found = lookup_agent(name)
+                found = lookup_agent(name, session=herdr_session)
                 session = found.get("agent_session") if isinstance(found, dict) else None
                 if (isinstance(session, dict) and
                         all(isinstance(session.get(k), str) and session[k].strip() for k in ("kind", "source", "value")) and
@@ -826,7 +1099,8 @@ def init(cfg, args):
 
 
 def adopt(cfg, args):
-    ctx = context()
+    identity = lead_identity()
+    ctx, herdr_session = identity["context"], identity["session"]
     path = state_file(ctx)
     def check_fresh():
         if path.exists() or path.is_symlink():
@@ -880,7 +1154,7 @@ def adopt(cfg, args):
     requested_cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else None
     for role in plan["roles"]:
         name = assignments[role["role"]]
-        found = lookup_agent(name)
+        found = lookup_agent(name, session=herdr_session)
         if not isinstance(found, dict) or not found:
             raise Error(f"Agent {name} is not live; cannot adopt")
         kind = agent_kind_of(found)
@@ -901,7 +1175,7 @@ def adopt(cfg, args):
             raise Error(f"Agent {name} pane belongs to a different workspace")
         if any(r["pane_id"] == pane_id for r in roles):
             raise Error(f"Pane {pane_id} assigned to multiple roles")
-        result = herdr("pane", "get", pane_id)
+        result = herdr("pane", "get", pane_id, session=herdr_session)
         actual_pane = result.get("pane") if isinstance(result, dict) else None
         if not isinstance(actual_pane, dict) or actual_pane.get("workspace_id") != ctx["workspace"]:
             raise Error(f"Pane {pane_id} is missing or belongs to a different workspace")
@@ -924,7 +1198,8 @@ def adopt(cfg, args):
                 raise Error("Hermes profile mismatch")
             profile_check(role["profile"])
         roles.append(info)
-    team = {"version": 3, "template": args.template, "context": ctx, "created_at": now(),
+    team = {"version": 3, "template": args.template, "context": ctx, "session": herdr_session,
+            "created_at": now(),
             "status": "ready", "roles": roles, "plan": plan, "cwd": roles[0]["cwd"],
             "worktree": None, "resources": [], "pending_operation": None, "adopted": True}
     if args.dry_run:
@@ -933,7 +1208,7 @@ def adopt(cfg, args):
         check_fresh()
         check_reservations(roles)
         for role in roles:
-            found = lookup_agent(role["agent_name"])
+            found = lookup_agent(role["agent_name"], session=herdr_session)
             pane = found.get("pane") if isinstance(found, dict) else None
             pane_id = (found.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)) if isinstance(found, dict) else None
             session = found.get("agent_session") if isinstance(found, dict) else None
@@ -944,30 +1219,40 @@ def adopt(cfg, args):
     return {"adopted": True, "team": team}
 
 
-def current_team():
-    ctx = context()
+def _current_team_with_session(tier="C"):
+    identity = lead_identity()
+    ctx = identity["context"]
     path = state_file(ctx)
     if not path.exists():
         raise Error("No registered team for this Lead pane; use init first")
-    return load(path)
+    team = load(path)
+    ownership = ledger_ownership(team, identity["session"], path)
+    if tier == "C":
+        require_roles_owned(team, identity["session"], path)
+    return team, identity["session"], ownership
+
+
+def current_team(tier="C"):
+    return _current_team_with_session(tier=tier)[0]
 
 
 def name_lead(args):
     expected = getattr(args, "expect_session", None)
     if args.apply and (not isinstance(expected, str) or not expected.strip()):
         raise Error("先跑一次预览，把输出里的 agent_session.value 传回 --expect-session")
-    ctx = context()
+    identity = lead_identity()
+    ctx, herdr_session = identity["context"], identity["session"]
     path = state_file(ctx)
     team = load(path) if path.exists() else None
     if team is not None and (team.get("context") != ctx or team.get("status") != "ready"):
         raise Error("Team context mismatch or team is not ready")
     pane_id = ctx["lead_pane"]
     name = agent_name_for("lead", pane_id)
-    pane_result = herdr("pane", "get", pane_id)
+    pane_result = herdr("pane", "get", pane_id, session=herdr_session)
     pane = pane_result.get("pane") if isinstance(pane_result, dict) else None
     if not isinstance(pane, dict) or pane.get("pane_id") != pane_id or pane.get("workspace_id") != ctx["workspace"] or not pane.get("agent"):
         raise Error("Lead pane has no verifiable agent")
-    found = agent_data(herdr("agent", "get", pane_id))
+    found = agent_data(herdr("agent", "get", pane_id, session=herdr_session))
     if not isinstance(found, dict) or found.get("pane_id") != pane_id:
         raise Error("Lead agent identity or pane cannot be verified")
     kind = agent_kind_of(pane)
@@ -987,10 +1272,10 @@ def name_lead(args):
         raise Error("Specified current agent does not match lead pane")
     if current == name:
         raise Error("Lead agent already has the derived name")
-    require_name_available(name, path, team.get("roles", []) if team is not None else ())
+    require_name_available(name, path, team.get("roles", []) if team is not None else (), session=herdr_session)
     if args.apply:
         def same_identity():
-            actual = agent_data(herdr("agent", "get", pane_id))
+            actual = agent_data(herdr("agent", "get", pane_id, session=herdr_session))
             actual_session = actual.get("agent_session") if isinstance(actual, dict) else None
             return (isinstance(actual, dict) and actual.get("pane_id") == pane_id and
                     agent_kind_of(actual) == kind and isinstance(actual_session, dict) and
@@ -1002,7 +1287,7 @@ def name_lead(args):
                 raise Error("Team context mismatch or team is not ready")
             if not same_identity():
                 raise Error("Lead agent identity changed before rename")
-            herdr("agent", "rename", pane_id, name)
+            herdr("agent", "rename", pane_id, name, session=herdr_session)
             try:
                 verified_after = same_identity()
             except Error as e:
@@ -1014,22 +1299,66 @@ def name_lead(args):
             "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
 
 
-def require_run(runid):
-    data = load(run_file(runid))
+IDENTITY_TIERS = ("A", "B", "C-", "C")
+
+
+def _require_run_with_session(runid, tier="C", target_role=None):
+    """Load a Run and enforce ledger ownership for the caller's tier.
+
+    Tiers, by what the caller is about to do:
+
+      'A'  read-only, no state written. No ownership check.
+      'B'  fail-safe stop (pause). Tolerates an unprovable ledger.
+      'C-' writes that exist *because* Workers died (diagnose, abandon,
+           recover-attempt). Rejects any identity contradiction, but does not
+           require a live UUID anchor -- demanding a survivor here would make
+           recovery impossible exactly when it is needed.
+      'C'  state-changing operations whose execution depends on the Workers
+           being who the ledger says (dispatch, collect, gate, finish, cancel
+           of a Run with execution history, resume). Requires a live UUID
+           anchor as well as no contradiction.
+
+    A matching session name is never sufficient on its own at any tier, since
+    the session may have been recreated under the same name.
+    """
+    path = run_file(runid)
+    data = load(path)
     if data.get("version") != 3:
         raise Error("Legacy Run state is not compatible with v4.2 result protocol; do not resend tasks automatically")
-    ctx = context()
+    identity = lead_identity()
+    ctx = identity["context"]
     if data.get("context") != ctx:
         raise Error("Run belongs to a different Lead pane/session")
-    return data
+    ownership = ledger_ownership(data, identity["session"], path)
+    if tier in ("C", "C-"):
+        require_roles_owned(data, identity["session"], path,
+                            require_anchor=(tier == "C"))
+        if target_role is not None:
+            require_target_role(data, identity["session"], target_role, path)
+    return data, identity["session"], ownership
+
+
+def require_run(runid, tier="A", target_role=None):
+    """Load a Run without exposing its Herdr session.
+
+    Defaults to read-only tier so that purely informational paths never gain
+    state-changing authority by accident.
+
+    Callers that must OBSERVE a Worker (agent_presence, live_identity_problems)
+    need the session the process actually resolved, not `run["session"]`: a
+    legacy ledger has no session key at all, so reading it from the record
+    yields None and silently probes the default server. Use
+    `_require_run_with_session` for those.
+    """
+    return _require_run_with_session(runid, tier=tier, target_role=target_role)[0]
 
 
 def run_start(cfg, args):
     with locked():
-        team = current_team()
+        team, herdr_session, _own = _current_team_with_session(tier="C")
         if team["status"] != "ready": raise Error("Team is not ready")
         for role in team["roles"]:
-            if not verify_existing(role): raise Error(f"Agent {role['agent_name']} not available")
+            if not verify_existing(role, session=herdr_session): raise Error(f"Agent {role['agent_name']} not available")
         names = {(team["context"]["workspace"], r["pane_id"]) for r in team["roles"]}
         for existing_path in (STATE / "runs").glob("*.json"):
             if existing_path.name.endswith(".driver.json"):
@@ -1041,7 +1370,8 @@ def run_start(cfg, args):
             if names & used:
                 raise Error(f"Worker(s) reserved by unfinished Run {other.get('id')}; inspect/resume it, do not start a conflicting Run")
         runid = uuid.uuid4().hex[:12]
-        run = {"version": 3, "id": runid, "team": team["template"], "context": team["context"], "goal": args.goal,
+        run = {"version": 3, "id": runid, "team": team["template"], "context": team["context"],
+               "session": herdr_session, "goal": args.goal,
                "status": "active", "created_at": now(), "stage_index": 0, "stage_attempt": 1, "round": 1,
                "stages": team["plan"]["workflow"], "stage_definitions": team["plan"]["stages"],
                "roles": team["roles"], "settings": copy.deepcopy(team["plan"]["settings"]),
@@ -1382,20 +1712,31 @@ def git_evidence(rec):
 
 
 def diagnose_dispatch(run_id, dispatch_id):
-    """Read-only: classify one unresolved dispatch and record evidence."""
+    """Read-only: classify one unresolved dispatch and record evidence.
+
+    Tier A on purpose. Diagnose is the tool you reach for precisely when an agent
+    has been replaced or is unreachable, so refusing it on an identity
+    contradiction would remove the only way to inspect such a ledger. It cannot
+    change Run state, and the snapshot it writes is not self-authorising:
+    `abandon` re-validates the target under tier C- before consuming it.
+    """
     with locked():
-        run = require_run(run_id)
+        run, herdr_session, _own = _require_run_with_session(run_id, tier="A")
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
         check_transition(run, "diagnose", rec, allow_history=True)
         role = get_role(run, rec["role"])
-        presence = agent_presence(role)
+        presence = agent_presence(role, session=herdr_session)
         snapshot = result_snapshot(run, rec)
         classification = classify_diagnosis(presence, snapshot)
         git = git_evidence(rec)
         evidence = collect_evidence(run, rec, presence, snapshot, "diagnose", git)
-        return {"dispatch_id": dispatch_id, "status": rec["status"], "stage_index": rec.get("stage_index"),
+        # Tier C- does not demand a live UUID anchor, so the caller must be able
+        # to see how much proof of ownership this ledger actually carries.
+        return {"dispatch_id": dispatch_id, "status": rec["status"],
+                "ledger_session": _ownership_label(run, herdr_session),
+                "stage_index": rec.get("stage_index"),
                 "stage_attempt": rec.get("stage_attempt", 1), "is_current": is_current(run, rec),
                 "presence": presence, "artifact": snapshot, "diagnosis": classification,
                 "evidence": evidence,
@@ -1431,7 +1772,10 @@ def run_abandon(args):
     valid report exists. Does not dispatch, approve or claim success.
     """
     with locked():
-        run = require_run(args.run_id)
+        # Tier C-: abandon is irreversible and consumes a diagnose snapshot. It
+        # must work when the Worker is gone, so it rejects contradictions but
+        # does not demand a live UUID.
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C-")
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
@@ -1439,7 +1783,7 @@ def run_abandon(args):
         if len(args.reason.strip()) < 12:
             raise GuardError("policy_forbidden", "abandon requires a specific --reason (12+ chars)")
         role = get_role(run, rec["role"])
-        presence = agent_presence(role)
+        presence = agent_presence(role, session=herdr_session)
         snapshot = validate_abandon_target(run, rec, args.quarantine_invalid)
         evidence_dir = STATE / "evidence" / run["id"] / rec["id"] / args.evidence
         if not (evidence_dir / "manifest.json").is_file():
@@ -1455,6 +1799,10 @@ def run_abandon(args):
         before = {k: rec.get(k) for k in ("status", "observed_status", "error", "diagnosis")}
         rec.update({"status": "abandoned", "abandoned_at": now(), "abandon_reason": args.reason,
                     "abandon_evidence": evidence["dir"], "abandon_manifest_sha256": evidence["manifest_sha256"],
+                    # Abandon runs at tier C-, which trades a live UUID anchor for
+                    # reachability. Record what ownership evidence existed so a
+                    # `legacy`-ledger abandonment stays visible in the audit trail.
+                    "abandon_ledger_session": _ownership_label(run, herdr_session),
                     "abandon_presence": presence, "abandon_fence_verified": False,
                     "abandon_owner_authorized": False,
                     "abandon_risk_accepted": bool(args.confirm_untracked)})
@@ -1541,7 +1889,7 @@ def role_identity(role):
     return pins
 
 
-def live_identity_problems(role):
+def live_identity_problems(role, session=None):
     """Strict observation of the LIVE Agent. The ledger echo is never proof.
 
     Recovery authorization and slot use must verify the actual Agent: a
@@ -1549,7 +1897,7 @@ def live_identity_problems(role):
     (for Hermes) a matching profile. Missing or drifted fields fail closed.
     """
     try:
-        found = agent_data(herdr("agent", "get", role["agent_name"]))
+        found = agent_data(herdr("agent", "get", role["agent_name"], session=session))
     except HerdrError as e:
         return [f"agent get failed: {e.code or 'error'}"]
     except Error as e:
@@ -1588,13 +1936,13 @@ def live_identity_problems(role):
     return problems
 
 
-def require_live_identity(run, role_name):
+def require_live_identity(run, role_name, session=None):
     """Raise identity_mismatch unless the live Agent matches its binding."""
     role = get_role(run, role_name)
     if not identity_pins_complete(role):
         raise GuardError("identity_mismatch",
                          f"role {role_name} has incomplete identity pins in the ledger")
-    problems = live_identity_problems(role)
+    problems = live_identity_problems(role, session=session)
     if problems:
         raise GuardError("identity_mismatch",
                          f"role {role_name} live identity does not match: {','.join(problems)}")
@@ -2239,7 +2587,12 @@ def run_recover_attempt(args):
     """T7: retain a NEW attempt and issue per-role one-shot slots. Never prompts."""
     request_source = [args.dispatch_id, args.evidence]
     with locked():
-        run = require_run(args.run_id)
+        # Tier A: recovery deliberately runs when a Worker has already been
+        # abandoned, so a ledger-level anchor cannot be required. Its own
+        # `require_live_identity` check below is per required role and raises a
+        # precise `identity_mismatch` for drift; a blunter check here would mask
+        # that diagnosis.
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="A")
         # A terminal Run is refused before anything else, including an R1 replay:
         # no token may resurrect or act on a finished/cancelled ledger.
         if run.get("status") in ("finished", "cancelled"):
@@ -2288,7 +2641,7 @@ def run_recover_attempt(args):
             raise GuardError("policy_forbidden", "no required role could be derived for this group")
         for name in required:
             # The ledger must be complete AND the live Agent must match it.
-            require_live_identity(run, name)
+            require_live_identity(run, name, session=herdr_session)
         # Only now, after every precondition passed, persist the group. A
         # refused recovery must not leave a ledger side effect behind.
         group = record_group(run, transient)
@@ -2356,7 +2709,8 @@ def _recovery_result(run, auth, replay=False):
 
 
 def run_dispatch(args):
-    run = require_run(args.run_id)
+    run, herdr_session, _own = _require_run_with_session(
+        args.run_id, tier="C", target_role=args.role)
     check_transition(run, "dispatch")
     # A fault group freezes ordinary dispatch. Only a dispatch covered by the
     # current recovery authorization's per-role one-shot slot may proceed.
@@ -2409,9 +2763,9 @@ def run_dispatch(args):
                  and x["stage_index"] == run["stage_index"]]
     if approval_required and not approvals:
         raise Error(f"Approval required: run approve --run-id {args.run_id} --role {args.role} --effect {args.effect} --reason <user-authorized-reference>")
-    if not verify_existing(role):
+    if not verify_existing(role, session=herdr_session):
         raise Error(f"Agent {role['agent_name']} is not live; do not send to an unknown terminal")
-    live = lookup_agent(role["agent_name"])
+    live = lookup_agent(role["agent_name"], session=herdr_session)
     live_status = agent_status_of(live)
     if live_status not in ("idle", "done"):
         raise Error(f"Agent {role['agent_name']} is {live_status}; inspect before sending a new task")
@@ -2431,7 +2785,7 @@ def run_dispatch(args):
             f"List any unverified claims and blockers. Never falsify test results.\n\n{args.message}")
     slot_auth = None
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         if run["status"] not in ("active", "recovery_active") or run["stage_index"] != expected_index \
                 or run["stage_attempt"] != expected_attempt:
             # The attempt must match too: a stale prompt prepared for attempt N
@@ -2462,7 +2816,7 @@ def run_dispatch(args):
             verify_receipt_still_valid(run, current_auth, "recovery-dispatch", role=args.role,
                                        effect=args.effect)
             # Re-observe the live Agent under the lock; the receipt echo is not proof.
-            require_live_identity(run, args.role)
+            require_live_identity(run, args.role, session=herdr_session)
         if any(x["role"] == args.role and x["stage_index"] == run["stage_index"]
                and x["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain") for x in run["dispatches"]):
             raise Error("Concurrent dispatch already pending for this Worker")
@@ -2527,7 +2881,7 @@ def run_dispatch(args):
         """
         try:
             with locked():
-                current = require_run(args.run_id)
+                current = require_run(args.run_id, tier="C")
                 rec = next((x for x in current["dispatches"] if x["id"] == stamp), None)
                 if rec is None:
                     return None
@@ -2553,7 +2907,7 @@ def run_dispatch(args):
             return None
 
     try:
-        result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0))
+        result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0), session=herdr_session)
         if args.no_wait:
             if finalize(lambda _run, _rec: {"status": "submitted_unsettled"}) is None:
                 return {"dispatch_id": stamp, "status": "terminal",
@@ -2581,7 +2935,7 @@ def herdr_read(name):
                    timeout=30, raw=True)[-50000:]
 
 
-def late_artifact_notice(run, rec):
+def late_artifact_notice(run, rec, session=None):
     """Historical uncertain/abandoned + late report: retain evidence, change nothing.
 
     A report that arrives after the dispatch became history is evidence only.
@@ -2593,7 +2947,7 @@ def late_artifact_notice(run, rec):
         raise GuardError("stale_snapshot",
                          f"dispatch {rec['id']} is historical ({rec['status']}); "
                          "decided records are not re-collected")
-    presence = agent_presence(get_role(run, rec["role"]))
+    presence = agent_presence(get_role(run, rec["role"]), session=session)
     evidence = collect_evidence(run, rec, presence, snapshot, "late_artifact_rejected", git_evidence(rec))
     raise GuardError("history_unresolved",
                      f"late artifact for historical {rec['status']} dispatch retained as evidence "
@@ -2602,9 +2956,12 @@ def late_artifact_notice(run, rec):
 
 
 def run_collect(args):
-    run = require_run(args.run_id)
+    run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
     rec = next((x for x in reversed(run["dispatches"]) if x["id"] == args.dispatch_id), None)
     if rec is None: raise Error("Unknown dispatch ID")
+    # The dispatch is what identifies the Worker here, so the target check has to
+    # happen after resolving it rather than at ledger-load time.
+    require_target_role(run, herdr_session, rec["role"], run_file(args.run_id))
     if not is_current(run, rec):
         # T18: an abandoned dispatch is terminal; a historical uncertain one may
         # only retain a late artifact. Neither is ever re-collected.
@@ -2614,7 +2971,7 @@ def run_collect(args):
                 rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
                 if is_current(run, rec):
                     raise GuardError("stale_snapshot", "dispatch became current again; re-run collect")
-                late_artifact_notice(run, rec)
+                late_artifact_notice(run, rec, herdr_session)
         if rec["status"] == "blocked" and not has_valid_report(rec):
             # Historical legacy blocked: T5 recheck only (adopt a valid report
             # as blocked(valid), otherwise diagnose). Not a current collect.
@@ -2652,7 +3009,7 @@ def run_collect(args):
             # Keep an ACTUAL snapshot of a late report, not just a note.
             snapshot = result_snapshot(run, rec)
             if snapshot.get("valid"):
-                presence = agent_presence(get_role(run, rec["role"]))
+                presence = agent_presence(get_role(run, rec["role"]), session=herdr_session)
                 retained = collect_evidence(run, rec, presence, snapshot,
                                             "late_artifact_current_abandoned",
                                             git_evidence(rec))["snapshot_id"]
@@ -2672,7 +3029,7 @@ def run_collect(args):
         if snapshot.get("valid"):
             pass  # fall through to the normal collect below
         else:
-            presence = agent_presence(get_role(run, rec["role"]))
+            presence = agent_presence(get_role(run, rec["role"]), session=herdr_session)
             with locked():
                 run = require_run(args.run_id)
                 rec = next((x for x in run["dispatches"] if x["id"] == args.dispatch_id), None)
@@ -2695,11 +3052,11 @@ def run_collect(args):
     # so a valid complete report settles it instead of staying a permanent lock.
     legacy_collect = rec["status"] == "blocked" and not has_valid_report(rec)
     role = get_role(run, rec["role"])
-    if not verify_existing(role): raise Error("Registered Agent is no longer live")
-    agent = lookup_agent(role["agent_name"])
+    if not verify_existing(role, session=herdr_session): raise Error("Registered Agent is no longer live")
+    agent = lookup_agent(role["agent_name"], session=herdr_session)
     st = agent_status_of(agent)
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
         check_transition(run, "collect", rec)
         if rec["status"] in ("settled", "abandoned") or (
@@ -2818,7 +3175,7 @@ def recovery_business_negatives(run, auth):
     return negatives
 
 
-def gate_fault_group(run, decision):
+def gate_fault_group(run, decision, session=None):
     """Fault-group rules for a gate decision (T10/T11/T12/T13/T21).
 
     Returns the group that this decision closes, or None. A decision that would
@@ -2837,7 +3194,7 @@ def gate_fault_group(run, decision):
         validate_recovery_authorization(run, auth)
         verify_receipt_still_valid(run, auth, "recovery-gate")
         for role in auth["required_roles"]:
-            require_live_identity(run, role)
+            require_live_identity(run, role, session=session)
             slot = auth["slots"][role]
             if slot.get("status") != "consumed":
                 raise GuardError("recovery_authorization_invalid",
@@ -2863,7 +3220,7 @@ def gate_fault_group(run, decision):
 
 def run_gate(args):
     with locked():
-        run = require_run(args.run_id)
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
         check_transition(run, "gate")
         stage = stage_info(run)
         actor = stage["actor"]
@@ -2876,7 +3233,7 @@ def run_gate(args):
             # restricted state may only pass, or escalate/cancel.
             raise GuardError("run_state_forbidden",
                              "recovery_active may not revise; escalate or cancel instead")
-        closing_group = gate_fault_group(run, args.decision)
+        closing_group = gate_fault_group(run, args.decision, session=herdr_session)
         if recovery and args.decision == "revise":
             auth = recovery_authorization_for(run)
             if not recovery_business_negatives(run, auth):
@@ -3013,11 +3370,11 @@ def run_drive(args):
     detail = None
     deadline = time.monotonic() + args.deadline_seconds
 
-    def check_identity(role):
+    def check_identity(role, herdr_session):
         try:
-            if not verify_existing(role):
+            if not verify_existing(role, session=herdr_session):
                 raise Error("not live or identity cannot be verified")
-            live = lookup_agent(role["agent_name"])
+            live = lookup_agent(role["agent_name"], session=herdr_session)
             pane = live.get("pane") if isinstance(live, dict) else None
             pane_id = (live.get("pane_id") or (pane.get("pane_id") if isinstance(pane, dict) else None)) if isinstance(live, dict) else None
             session = live.get("agent_session") if isinstance(live, dict) else None
@@ -3070,7 +3427,7 @@ def run_drive(args):
             return result()
         try:
             with locked():
-                run = require_run(runid)
+                run = require_run(runid, tier="C")
                 events = [e for e in run["events"] if e.get("type") in ("driver_started", "driver_stopped")]
                 if events and events[-1]["type"] == "driver_started" and not args.resume:
                     reason, detail = "resume_required", "Previous drive interrupted; use --resume"
@@ -3089,7 +3446,10 @@ def run_drive(args):
                 save(path, run)
                 started = True
             while True:
-                run = require_run(runid)
+                # Ownership was proven once before entering the loop; re-proving it
+                # on every iteration would repeat the same Herdr round-trips. The
+                # per-iteration identity check below still guards each Worker.
+                run, herdr_session, _own = _require_run_with_session(runid, tier="A")
                 if run["status"] not in ("active", "recovery_active"):
                     reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
                     break
@@ -3103,7 +3463,7 @@ def run_drive(args):
                 if pending:
                     rec = pending[0]
                     try:
-                        check_identity(get_role(run, rec["role"]))
+                        check_identity(get_role(run, rec["role"]), herdr_session)
                     except Error as e:
                         reason, detail = "identity", str(e)
                         break
@@ -3148,7 +3508,7 @@ def run_drive(args):
                 if remediation or not own:
                     role = get_role(run, target)
                     try:
-                        check_identity(role)
+                        check_identity(role, herdr_session)
                     except Error as e:
                         reason, detail = "identity", str(e)
                         break
@@ -3234,12 +3594,25 @@ def run_drive(args):
                 if rec["id"] not in dispatches:
                     dispatches.append(rec["id"])
         except (Error, OSError, KeyError, TypeError, ValueError) as e:
-            reason, detail = "error", str(e)
+            # Ledger/Worker identity failures are a distinct, actionable stop
+            # reason; collapsing them into "error" hides why the driver refused.
+            # `AgentUnobservable` is the precise signal; the markers only label a
+            # ledger-level rejection. This is a diagnostic label for the stop
+            # reason and never gates access -- access decisions are made by
+            # _inspect_roles, which classifies by exception type.
+            message = str(e)
+            if isinstance(e, AgentUnobservable):
+                reason = "identity_unavailable"
+            elif isinstance(e, LedgerIdentityError):
+                reason = "identity"
+            else:
+                reason = "error"
+            detail = message
         finally:
             if started:
                 try:
                     with locked():
-                        run = require_run(runid)
+                        run = require_run(runid, tier="B")
                         run["events"].append({"type": "driver_stopped", "at": now(), "reason": reason})
                         save(path, run)
                 except (Error, OSError, KeyError, TypeError, ValueError) as e:
@@ -3251,7 +3624,7 @@ def run_drive(args):
 
 def run_finish(args):
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         check_transition(run, "finish")
         open_groups = [g for g in run.get("fault_groups", []) if g.get("status") == "open"]
         if open_groups:
@@ -3308,14 +3681,25 @@ def run_finish(args):
 
 
 def run_pause(args, paused):
+    # Pausing is the fail-safe stop and stays available when identity cannot be
+    # proven (tier B); resuming re-arms dispatch, so it requires proof (tier C).
     with locked():
-        run = require_run(args.run_id)
+        run, _session, ownership = _require_run_with_session(
+            args.run_id, tier="B" if paused else "C")
         if paused:
             if run["status"] == "recovery_active":
                 raise GuardError("run_state_forbidden",
                                  "recovery_active may not be paused; pass, escalate or cancel")
             if run["status"] != "active": raise Error("Only active run can be paused")
             run["status"] = "paused"
+            # Record the identity confidence actually achieved, not just the
+            # absence of a session tag: a `verified` ledger whose Workers all
+            # contradict could otherwise pause silently and look audited.
+            verified, _total, conflicts, _unavailable = _inspect_roles(run, _session)
+            event = {"at": now(), "type": "pause",
+                     "identity": "verified" if (ownership == "verified" and verified and not conflicts)
+                     else "unverified"}
+            run["events"].append(event)
         else:
             if run["status"] not in ("paused", "blocked", "blocked_round_limit"):
                 raise Error("Only paused/blocked run can resume")
@@ -3324,14 +3708,15 @@ def run_pause(args, paused):
             if args.extend_rounds:
                 raise Error("Round-limit extension disabled until independent Owner authentication is available")
             run["status"] = "active"
-        run["events"].append({"at": now(), "type": "pause" if paused else "resume"})
+            run["events"].append({"at": now(), "type": "resume"})
         save(run_file(args.run_id), run)
-    return {"status": run["status"], "run_id": args.run_id}
+    return {"status": run["status"], "run_id": args.run_id, "ledger_session": ownership}
 
 
 def run_list():
     """Discover orphaned/paused work without performing any new dispatch."""
-    ctx = context()
+    identity = lead_identity()
+    ctx, current = identity["context"], identity["session"]
     result = []
     with locked():
         for p in sorted((STATE / "runs").glob("*.json")):
@@ -3349,6 +3734,7 @@ def run_list():
             abandoned = [d["id"] for d in run.get("dispatches", []) if d.get("status") == "abandoned"]
             result.append({"run_id": run["id"], "status": run["status"],
                            "stage": stage_info(run)["stage"], "pending_dispatches": pending,
+                           "ledger_session": ledger_ownership(run, current, p),
                            "historical_decided": historical, "abandoned_dispatches": abandoned,
                            "open_fault_groups": [{"id": g["id"], "stage_index": g["stage_index"],
                                                   "root_attempt": g["root_attempt"]}
@@ -3360,7 +3746,7 @@ def run_list():
 def run_recover(args):
     """Read-only reconciliation hint. Never resend uncertain prompts."""
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="A")
         pending = [d for d in run.get("dispatches", []) if is_current(run, d) and d["status"] not in DECIDED]
         historical = [d for d in run.get("dispatches", []) if not is_current(run, d) and d["status"] != "settled"]
         abandoned = [d for d in run.get("dispatches", []) if d.get("status") == "abandoned"]
@@ -3404,7 +3790,13 @@ def _next_hint(run, rec):
 def run_cancel(args):
     """Explicitly mark a Run abandoned; never claim completion or delete workers."""
     with locked():
-        run = require_run(args.run_id)
+        # Tier is decided AFTER loading, because T17 class A (no execution
+        # history) has no executor to own: a ledger that dispatched nothing
+        # cannot belong to a foreign session's running agents, so requiring
+        # Worker UUIDs there would reintroduce the very lock-up Issue #2 removes.
+        # Class B always demands tier C. Load once at the weaker tier, then
+        # escalate based on the record itself.
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="A")
         check_transition(run, "cancel")
         if args.confirm_run_id != args.run_id or len(args.reason.strip()) < 12:
             raise Error("Cancellation requires --confirm-run-id matching --run-id and specific --reason")
@@ -3436,6 +3828,10 @@ def run_cancel(args):
             save(run_file(args.run_id), run)
             return {"run_id": args.run_id, "status": "cancelled", "finished": False,
                     "cancel_scope": cancel_scope}
+        # Class B: execution history exists, so the ledger may describe another
+        # session's real executors. Prove ownership through Worker UUIDs before
+        # touching it.
+        require_roles_owned(run, herdr_session, run_file(args.run_id))
         # Class B: this Run has execution history, so every actor it may have
         # started must be proven stopped/isolated with known side effects before
         # the reservation is released. A fault-group context is included as
@@ -3581,20 +3977,20 @@ def main():
         if args.cmd == "adopt": emit(adopt(cfg, args)); return 0
         if args.cmd == "name-lead": emit(name_lead(args)); return 0
         if args.cmd == "status":
-            team = current_team()
+            team, herdr_session, ownership = _current_team_with_session(tier="A")
             live = []
             for r in team["roles"]:
-                actual = lookup_agent(r["agent_name"])
+                actual = lookup_agent(r["agent_name"], session=herdr_session)
                 live.append({"role": r["role"], "agent_name": r["agent_name"],
                              "registered_pane": r["pane_id"], "live": bool(actual),
                              "observed_state": agent_status_of(actual) if isinstance(actual, dict) else "missing"})
             emit({"template": team["template"], "stored_status": team["status"], "agents": live,
-                  "worktree": team.get("worktree")}); return 0
+                  "worktree": team.get("worktree"), "ledger_session": ownership}); return 0
         if args.cmd == "run":
             if args.run_cmd == "start": emit(run_start(cfg, args)); return 0
             if args.run_cmd == "list": emit(run_list()); return 0
             if args.run_cmd in ("status", "stage"):
-                run = require_run(args.run_id)
+                run = require_run(args.run_id, tier="A")
                 emit(run if args.run_cmd == "status" else stage_info(run)); return 0
             action = {"approve": run_approve, "dispatch": run_dispatch, "collect": run_collect, "gate": run_gate,
                       "finish": run_finish, "pause": lambda a: run_pause(a,True),
