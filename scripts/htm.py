@@ -383,20 +383,32 @@ def _inspect_roles(data, session):
     return verified, total, conflicts, unavailable
 
 
-def require_roles_owned(data, session, path):
+def require_roles_owned(data, session, path, require_anchor=True):
     """Prove ledger ownership through Worker agent_session UUIDs.
 
     A session name alone is weak evidence: a session can be stopped and recreated
     under the same name with the same IDs but different agents. Callers therefore
     invoke this for tier C regardless of whether the ledger recorded a session.
 
-    A single matching UUID anchors ownership because workers can legitimately
-    die. Any identity contradiction rejects the whole ledger, because it means
-    these are demonstrably not the agents the ledger describes.
+    Two separate obligations, deliberately not collapsed:
+
+      contradictions -- an observed Worker that contradicts the ledger. This
+                        means the ledger is demonstrably *not* these agents, so
+                        it rejects unconditionally. `require_anchor` never
+                        relaxes it.
+      anchor         -- positive proof that the ledger is ours (>=1 live UUID).
+                        Workers legitimately die; the operations that must work
+                        *because* they died (diagnose, abandon, recover-attempt)
+                        cannot demand a survivor or they would reintroduce the
+                        Issue #2 lock-up. Those pass require_anchor=False and
+                        rely on the session tag, the pane context and the
+                        contradiction check instead.
     """
     verified, total, conflicts, unavailable = _inspect_roles(data, session)
     if conflicts:
         raise Error(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
+    if not require_anchor:
+        return verified, unavailable
     if total == 0:
         raise Error(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
     if verified == 0:
@@ -1261,13 +1273,27 @@ def name_lead(args):
             "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
 
 
+IDENTITY_TIERS = ("A", "B", "C-", "C")
+
+
 def _require_run_with_session(runid, tier="C", target_role=None):
     """Load a Run and enforce ledger ownership for the caller's tier.
 
-    tier 'A' (read-only) and 'B' (safe stop) tolerate an unprovable ledger;
-    'C' covers every state-changing or dispatching operation and always proves
-    ownership through Worker UUIDs -- a matching session name is never enough on
-    its own, since the session may have been recreated with the same name.
+    Tiers, by what the caller is about to do:
+
+      'A'  read-only, no state written. No ownership check.
+      'B'  fail-safe stop (pause). Tolerates an unprovable ledger.
+      'C-' writes that exist *because* Workers died (diagnose, abandon,
+           recover-attempt). Rejects any identity contradiction, but does not
+           require a live UUID anchor -- demanding a survivor here would make
+           recovery impossible exactly when it is needed.
+      'C'  state-changing operations whose execution depends on the Workers
+           being who the ledger says (dispatch, collect, gate, finish, cancel
+           of a Run with execution history, resume). Requires a live UUID
+           anchor as well as no contradiction.
+
+    A matching session name is never sufficient on its own at any tier, since
+    the session may have been recreated under the same name.
     """
     path = run_file(runid)
     data = load(path)
@@ -1278,8 +1304,9 @@ def _require_run_with_session(runid, tier="C", target_role=None):
     if data.get("context") != ctx:
         raise Error("Run belongs to a different Lead pane/session")
     ownership = ledger_ownership(data, identity["session"], path)
-    if tier == "C":
-        require_roles_owned(data, identity["session"], path)
+    if tier in ("C", "C-"):
+        require_roles_owned(data, identity["session"], path,
+                            require_anchor=(tier == "C"))
         if target_role is not None:
             require_target_role(data, identity["session"], target_role, path)
     return data, identity["session"], ownership
@@ -1653,9 +1680,16 @@ def git_evidence(rec):
 
 
 def diagnose_dispatch(run_id, dispatch_id):
-    """Read-only: classify one unresolved dispatch and record evidence."""
+    """Read-only: classify one unresolved dispatch and record evidence.
+
+    Tier A on purpose. Diagnose is the tool you reach for precisely when an agent
+    has been replaced or is unreachable, so refusing it on an identity
+    contradiction would remove the only way to inspect such a ledger. It cannot
+    change Run state, and the snapshot it writes is not self-authorising:
+    `abandon` re-validates the target under tier C- before consuming it.
+    """
     with locked():
-        run = require_run(run_id)
+        run = require_run(run_id, tier="A")
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
@@ -1702,7 +1736,10 @@ def run_abandon(args):
     valid report exists. Does not dispatch, approve or claim success.
     """
     with locked():
-        run = require_run(args.run_id)
+        # Tier C-: abandon is irreversible and consumes a diagnose snapshot. It
+        # must work when the Worker is gone, so it rejects contradictions but
+        # does not demand a live UUID.
+        run = require_run(args.run_id, tier="C-")
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
@@ -2510,7 +2547,12 @@ def run_recover_attempt(args):
     """T7: retain a NEW attempt and issue per-role one-shot slots. Never prompts."""
     request_source = [args.dispatch_id, args.evidence]
     with locked():
-        run = require_run(args.run_id)
+        # Tier A: recovery deliberately runs when a Worker has already been
+        # abandoned, so a ledger-level anchor cannot be required. Its own
+        # `require_live_identity` check below is per required role and raises a
+        # precise `identity_mismatch` for drift; a blunter check here would mask
+        # that diagnosis.
+        run = require_run(args.run_id, tier="A")
         # A terminal Run is refused before anything else, including an R1 replay:
         # no token may resurrect or act on a finished/cancelled ledger.
         if run.get("status") in ("finished", "cancelled"):
@@ -3704,7 +3746,13 @@ def _next_hint(run, rec):
 def run_cancel(args):
     """Explicitly mark a Run abandoned; never claim completion or delete workers."""
     with locked():
-        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
+        # Tier is decided AFTER loading, because T17 class A (no execution
+        # history) has no executor to own: a ledger that dispatched nothing
+        # cannot belong to a foreign session's running agents, so requiring
+        # Worker UUIDs there would reintroduce the very lock-up Issue #2 removes.
+        # Class B always demands tier C. Load once at the weaker tier, then
+        # escalate based on the record itself.
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="A")
         check_transition(run, "cancel")
         if args.confirm_run_id != args.run_id or len(args.reason.strip()) < 12:
             raise Error("Cancellation requires --confirm-run-id matching --run-id and specific --reason")
@@ -3736,6 +3784,10 @@ def run_cancel(args):
             save(run_file(args.run_id), run)
             return {"run_id": args.run_id, "status": "cancelled", "finished": False,
                     "cancel_scope": cancel_scope}
+        # Class B: execution history exists, so the ledger may describe another
+        # session's real executors. Prove ownership through Worker UUIDs before
+        # touching it.
+        require_roles_owned(run, herdr_session, run_file(args.run_id))
         # Class B: this Run has execution history, so every actor it may have
         # started must be proven stopped/isolated with known side effects before
         # the reservation is released. A fault-group context is included as

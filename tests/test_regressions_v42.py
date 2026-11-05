@@ -1875,6 +1875,38 @@ class LedgerIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(h.Error, '身份冲突'):
             h.require_run(self.rid, tier='C')
 
+    def test_cancel_of_cost_only_run_does_not_need_a_live_anchor(self):
+        # T17 class A must stay reachable even when every Worker is gone: the
+        # Run dispatched nothing, so there is no executor to own. Requiring a
+        # live UUID here reintroduced exactly the lock-up Issue #2 removes.
+        data = self.ledger_with_uuids()
+        data['dispatches'] = []
+        data.pop('fault_groups', None)
+        data.pop('recovery_authorizations', None)
+        h.run_file(self.rid).write_text(json.dumps(data))
+        for name in list(self.live):
+            self.live[name] = None
+        out = h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
+                              reason='Release a Run that never dispatched anything'))
+        self.assertEqual(out['status'], 'cancelled')
+        self.assertEqual(out['cancel_scope'], 'no_execution_history')
+
+    def test_cancel_of_dispatched_run_still_requires_an_anchor(self):
+        # Class B is the opposite obligation: the ledger describes real
+        # executors, so ownership must be proven before touching it.
+        data = self.ledger_with_uuids()
+        # Any dispatch record is enough to make this class B: the ledger now
+        # describes an executor that may exist elsewhere.
+        data['dispatches'] = [{'id': 'cccccccccc', 'stage_index': 0, 'stage_attempt': 1,
+                               'role': data['roles'][0]['role'], 'effect': 'write',
+                               'remediation': False, 'status': 'settled', 'created_at': h.now()}]
+        h.run_file(self.rid).write_text(json.dumps(data))
+        for name in list(self.live):
+            self.live[name] = None
+        with self.assertRaisesRegex(h.Error, '无法证明|身份冲突'):
+            h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
+                            reason='Attempt to cancel a foreign dispatched Run'))
+
     def test_cwd_mismatch_is_a_conflict_not_unobservable(self):
         # Regression: contradiction detection used to be a message-substring
         # whitelist, so a same-UUID agent living in a different checkout fell
