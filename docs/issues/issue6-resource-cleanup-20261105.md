@@ -106,3 +106,45 @@ fault group，而 `run_gate` / `run_cancel` / `run_finish` 都要求 abandoned �
 四个已完成的验收/回归 Run 账本已复制到 `docs/evidence/i6-20261105/`（字节一致，含五阶段
 `pass` 记录）。`~/.local/state/herdr-team-i6-{accept,final,native,review}/` 的原始目录
 **全部保留**，因为其中仍含未结束 Run（`34a8d36b6947`、`ee42ec1a96ce`）。
+
+---
+
+## 7. 最终状态（PR #21 合并后）
+
+Issue #6 已通过 PR #21 合并（merge commit `3701732`）并关闭。在干净 main 快照上
+验证 `442 passed, 1 skipped, 173 subtests passed`。
+
+### 已清理
+
+- 临时目录：`/tmp/i6-accept-work`、`/tmp/i6-native-work`、`/tmp/htm-review-probe`、
+  `/tmp/htm-skill-verify`、`/tmp/htm-upgrade`、`/tmp/i6-detach-result.txt`、
+  `htm_{d5,g,head,s,t17}.py`、`probe*.py` 等全部测试脚本与产物。
+- Herdr：`w0:p4`~`w0:p9`（6 个无引用 Pane）、`w16`、`w18`、`i6-accept` 会话。
+
+### 保留（附原因）
+
+| 资源 | 原因 |
+|---|---|
+| `w0`（p1/p2/p3） | 承载锁死 Run `73d77630456f` 的现场。 |
+| `w14` | Run `34a8d36b6947` 仍 `active`，含 uncertain 派单 `d847ed6e17`（API 断流现场）。 |
+| `w19` | 主项目 `~/dev/herdr-team` 的团队，与 Issue #6 无关。 |
+| `w12` / `w13` | 其他项目（shipyard-ai-research、pagi）。 |
+| `w1A` | 收尾用的 dev-lite 团队；本次会话正在此 Pane 中运行。 |
+| `~/dev/herdr-team-happier-i6-isolated-...` | Git Worktree。**本会话自身运行在该目录内**，无法自删。合并后工作区干净、提交全部在远程 main，需在退出会话后手动移除。 |
+| `~/dev/herdr-team-happier` | 含 WIP 提交 `8cf13c2`（另一条未采用的原生分支方案）与 `.incident-evidence/issue6-1d0debfb70e0/` 事故现场。 |
+| `~/dev/herdr-team-issue2-recovery` | 与 main 同步（PR #20 已合并），工作区干净，作为 Issue #2 恢复链路参照。 |
+| `herdr-team-archive`、`herdr-team-itest`、`htm-issue2-evidence.w2uitn` | 非 Git 仓库，内容是 Issue #2 与早期联调证据，本轮不动。 |
+
+### 仍需人工处理
+
+```
+# 退出本会话后执行（worktree 内不能自删）
+cd ~/dev/herdr-team
+git worktree remove ~/dev/herdr-team-happier-i6-isolated-20261104044949
+```
+
+### 新增的未结束 Run
+
+`4d36bf75eca2`（本次合并前审查）在 `w1A` 上，因 uncertain 派单 `41b12db5aa` 被
+Issue #2 的生产门禁锁死（`TRUSTED_CONTROL=None` 无法 recover-attempt）。其审查
+结论已通过直接读取工件取得并全部处理完毕，账本保留作为该缺陷的又一实例。
