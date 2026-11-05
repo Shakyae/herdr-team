@@ -155,6 +155,39 @@ class Base(unittest.TestCase):
         return h.run_abandon(ns(**base))
 
 
+class LegacyLedgerSessionTests(Base):
+    """A legacy ledger has no session key; observation must still use the
+    session the process actually resolved."""
+
+    def test_abandon_uses_resolved_session_for_a_legacy_ledger(self):
+        # Regression: reading the session from `run["session"]` yields None on a
+        # legacy ledger, so the presence probe silently hit the DEFAULT server.
+        # A live `working` Worker then looked `confirmed_absent` and the working
+        # fence never fired.
+        self.make_run()
+        run = h.require_run(RID)
+        run.pop('session', None)
+        h.save(h.run_file(RID), run)
+        self.agent['agent_status'] = 'working'
+        snap = self.diagnose()['evidence']['snapshot_id']
+        probed = []
+
+        def fake(*argv, **kw):
+            if argv[:2] in (('agent', 'get'), ('pane', 'get')):
+                probed.append(kw.get('session'))
+            return self.base_fake(*argv, **kw)
+
+        self.base_fake = h.herdr.side_effect
+        with patch.object(h, 'herdr', side_effect=fake):
+            with self.assertRaises(h.GuardError) as ctx:
+                self.abandon(evidence=snap, confirm_untracked=True)
+        self.assertEqual(ctx.exception.code, 'execution_not_fenced')
+        self.assertIn('working', str(ctx.exception))
+        self.assertTrue(probed)
+        self.assertTrue(all(s == 'default' for s in probed),
+                        f'presence probe lost the resolved session: {probed}')
+
+
 class PresenceTests(Base):
     def test_present_with_matching_identity(self):
         out = h.agent_presence(self.role())

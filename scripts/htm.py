@@ -1339,10 +1339,16 @@ def _require_run_with_session(runid, tier="C", target_role=None):
 
 
 def require_run(runid, tier="A", target_role=None):
-    """Load a Run for callers that do not need the Herdr session.
+    """Load a Run without exposing its Herdr session.
 
     Defaults to read-only tier so that purely informational paths never gain
     state-changing authority by accident.
+
+    Callers that must OBSERVE a Worker (agent_presence, live_identity_problems)
+    need the session the process actually resolved, not `run["session"]`: a
+    legacy ledger has no session key at all, so reading it from the record
+    yields None and silently probes the default server. Use
+    `_require_run_with_session` for those.
     """
     return _require_run_with_session(runid, tier=tier, target_role=target_role)[0]
 
@@ -1715,13 +1721,13 @@ def diagnose_dispatch(run_id, dispatch_id):
     `abandon` re-validates the target under tier C- before consuming it.
     """
     with locked():
-        run = require_run(run_id, tier="A")
+        run, herdr_session, _own = _require_run_with_session(run_id, tier="A")
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
         check_transition(run, "diagnose", rec, allow_history=True)
         role = get_role(run, rec["role"])
-        presence = agent_presence(role, session=run.get("session"))
+        presence = agent_presence(role, session=herdr_session)
         snapshot = result_snapshot(run, rec)
         classification = classify_diagnosis(presence, snapshot)
         git = git_evidence(rec)
@@ -1729,7 +1735,7 @@ def diagnose_dispatch(run_id, dispatch_id):
         # Tier C- does not demand a live UUID anchor, so the caller must be able
         # to see how much proof of ownership this ledger actually carries.
         return {"dispatch_id": dispatch_id, "status": rec["status"],
-                "ledger_session": _ownership_label(run, run.get("session")),
+                "ledger_session": _ownership_label(run, herdr_session),
                 "stage_index": rec.get("stage_index"),
                 "stage_attempt": rec.get("stage_attempt", 1), "is_current": is_current(run, rec),
                 "presence": presence, "artifact": snapshot, "diagnosis": classification,
@@ -1769,7 +1775,7 @@ def run_abandon(args):
         # Tier C-: abandon is irreversible and consumes a diagnose snapshot. It
         # must work when the Worker is gone, so it rejects contradictions but
         # does not demand a live UUID.
-        run = require_run(args.run_id, tier="C-")
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C-")
         rec = next((x for x in reversed(run.get("dispatches", [])) if x["id"] == args.dispatch_id), None)
         if rec is None:
             raise Error("Unknown dispatch ID")
@@ -1777,7 +1783,7 @@ def run_abandon(args):
         if len(args.reason.strip()) < 12:
             raise GuardError("policy_forbidden", "abandon requires a specific --reason (12+ chars)")
         role = get_role(run, rec["role"])
-        presence = agent_presence(role, session=run.get("session"))
+        presence = agent_presence(role, session=herdr_session)
         snapshot = validate_abandon_target(run, rec, args.quarantine_invalid)
         evidence_dir = STATE / "evidence" / run["id"] / rec["id"] / args.evidence
         if not (evidence_dir / "manifest.json").is_file():
@@ -1796,7 +1802,7 @@ def run_abandon(args):
                     # Abandon runs at tier C-, which trades a live UUID anchor for
                     # reachability. Record what ownership evidence existed so a
                     # `legacy`-ledger abandonment stays visible in the audit trail.
-                    "abandon_ledger_session": _ownership_label(run, run.get("session")),
+                    "abandon_ledger_session": _ownership_label(run, herdr_session),
                     "abandon_presence": presence, "abandon_fence_verified": False,
                     "abandon_owner_authorized": False,
                     "abandon_risk_accepted": bool(args.confirm_untracked)})
@@ -1930,13 +1936,13 @@ def live_identity_problems(role, session=None):
     return problems
 
 
-def require_live_identity(run, role_name):
+def require_live_identity(run, role_name, session=None):
     """Raise identity_mismatch unless the live Agent matches its binding."""
     role = get_role(run, role_name)
     if not identity_pins_complete(role):
         raise GuardError("identity_mismatch",
                          f"role {role_name} has incomplete identity pins in the ledger")
-    problems = live_identity_problems(role, session=run.get("session"))
+    problems = live_identity_problems(role, session=session)
     if problems:
         raise GuardError("identity_mismatch",
                          f"role {role_name} live identity does not match: {','.join(problems)}")
@@ -2586,7 +2592,7 @@ def run_recover_attempt(args):
         # `require_live_identity` check below is per required role and raises a
         # precise `identity_mismatch` for drift; a blunter check here would mask
         # that diagnosis.
-        run = require_run(args.run_id, tier="A")
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="A")
         # A terminal Run is refused before anything else, including an R1 replay:
         # no token may resurrect or act on a finished/cancelled ledger.
         if run.get("status") in ("finished", "cancelled"):
@@ -2635,7 +2641,7 @@ def run_recover_attempt(args):
             raise GuardError("policy_forbidden", "no required role could be derived for this group")
         for name in required:
             # The ledger must be complete AND the live Agent must match it.
-            require_live_identity(run, name)
+            require_live_identity(run, name, session=herdr_session)
         # Only now, after every precondition passed, persist the group. A
         # refused recovery must not leave a ledger side effect behind.
         group = record_group(run, transient)
@@ -2810,7 +2816,7 @@ def run_dispatch(args):
             verify_receipt_still_valid(run, current_auth, "recovery-dispatch", role=args.role,
                                        effect=args.effect)
             # Re-observe the live Agent under the lock; the receipt echo is not proof.
-            require_live_identity(run, args.role)
+            require_live_identity(run, args.role, session=herdr_session)
         if any(x["role"] == args.role and x["stage_index"] == run["stage_index"]
                and x["status"] in ("submission_uncertain", "submitted_unsettled", "uncertain") for x in run["dispatches"]):
             raise Error("Concurrent dispatch already pending for this Worker")
@@ -2929,7 +2935,7 @@ def herdr_read(name):
                    timeout=30, raw=True)[-50000:]
 
 
-def late_artifact_notice(run, rec):
+def late_artifact_notice(run, rec, session=None):
     """Historical uncertain/abandoned + late report: retain evidence, change nothing.
 
     A report that arrives after the dispatch became history is evidence only.
@@ -2941,7 +2947,7 @@ def late_artifact_notice(run, rec):
         raise GuardError("stale_snapshot",
                          f"dispatch {rec['id']} is historical ({rec['status']}); "
                          "decided records are not re-collected")
-    presence = agent_presence(get_role(run, rec["role"]), session=run.get("session"))
+    presence = agent_presence(get_role(run, rec["role"]), session=session)
     evidence = collect_evidence(run, rec, presence, snapshot, "late_artifact_rejected", git_evidence(rec))
     raise GuardError("history_unresolved",
                      f"late artifact for historical {rec['status']} dispatch retained as evidence "
@@ -2965,7 +2971,7 @@ def run_collect(args):
                 rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
                 if is_current(run, rec):
                     raise GuardError("stale_snapshot", "dispatch became current again; re-run collect")
-                late_artifact_notice(run, rec)
+                late_artifact_notice(run, rec, herdr_session)
         if rec["status"] == "blocked" and not has_valid_report(rec):
             # Historical legacy blocked: T5 recheck only (adopt a valid report
             # as blocked(valid), otherwise diagnose). Not a current collect.
@@ -3003,7 +3009,7 @@ def run_collect(args):
             # Keep an ACTUAL snapshot of a late report, not just a note.
             snapshot = result_snapshot(run, rec)
             if snapshot.get("valid"):
-                presence = agent_presence(get_role(run, rec["role"]), session=run.get("session"))
+                presence = agent_presence(get_role(run, rec["role"]), session=herdr_session)
                 retained = collect_evidence(run, rec, presence, snapshot,
                                             "late_artifact_current_abandoned",
                                             git_evidence(rec))["snapshot_id"]
@@ -3023,7 +3029,7 @@ def run_collect(args):
         if snapshot.get("valid"):
             pass  # fall through to the normal collect below
         else:
-            presence = agent_presence(get_role(run, rec["role"]), session=run.get("session"))
+            presence = agent_presence(get_role(run, rec["role"]), session=herdr_session)
             with locked():
                 run = require_run(args.run_id)
                 rec = next((x for x in run["dispatches"] if x["id"] == args.dispatch_id), None)
@@ -3169,7 +3175,7 @@ def recovery_business_negatives(run, auth):
     return negatives
 
 
-def gate_fault_group(run, decision):
+def gate_fault_group(run, decision, session=None):
     """Fault-group rules for a gate decision (T10/T11/T12/T13/T21).
 
     Returns the group that this decision closes, or None. A decision that would
@@ -3188,7 +3194,7 @@ def gate_fault_group(run, decision):
         validate_recovery_authorization(run, auth)
         verify_receipt_still_valid(run, auth, "recovery-gate")
         for role in auth["required_roles"]:
-            require_live_identity(run, role)
+            require_live_identity(run, role, session=session)
             slot = auth["slots"][role]
             if slot.get("status") != "consumed":
                 raise GuardError("recovery_authorization_invalid",
@@ -3214,7 +3220,7 @@ def gate_fault_group(run, decision):
 
 def run_gate(args):
     with locked():
-        run = require_run(args.run_id, tier="C")
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
         check_transition(run, "gate")
         stage = stage_info(run)
         actor = stage["actor"]
@@ -3227,7 +3233,7 @@ def run_gate(args):
             # restricted state may only pass, or escalate/cancel.
             raise GuardError("run_state_forbidden",
                              "recovery_active may not revise; escalate or cancel instead")
-        closing_group = gate_fault_group(run, args.decision)
+        closing_group = gate_fault_group(run, args.decision, session=herdr_session)
         if recovery and args.decision == "revise":
             auth = recovery_authorization_for(run)
             if not recovery_business_negatives(run, auth):
