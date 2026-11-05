@@ -351,9 +351,13 @@ class AgentUnobservable(Error):
     """The agent could not be observed. Not evidence of anything."""
 
 
-# Diagnostic-only: recognises a ledger-level identity rejection when labelling a
-# `run drive` stop reason. It does NOT decide whether an action is allowed.
-_IDENTITY_STOP_MARKERS = ("身份冲突", "无法证明该账本", "属于 session")
+class LedgerIdentityError(Error):
+    """The ledger itself was refused on ownership grounds.
+
+    A distinct type so `run drive` can label the stop reason precisely instead
+    of pattern-matching Chinese error text -- a message rewrite must never
+    silently reclassify a refusal as a generic error.
+    """
 
 
 def _inspect_roles(data, session):
@@ -406,14 +410,14 @@ def require_roles_owned(data, session, path, require_anchor=True):
     """
     verified, total, conflicts, unavailable = _inspect_roles(data, session)
     if conflicts:
-        raise Error(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
+        raise LedgerIdentityError(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
     if not require_anchor:
         return verified, unavailable
     if total == 0:
-        raise Error(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
+        raise LedgerIdentityError(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
     if verified == 0:
         detail = ("；不可观察：" + "；".join(unavailable)) if unavailable else ""
-        raise Error(f"账本 {path} 的 Worker 均无法在当前 session 内验证身份；无法证明该账本属于当前 session。"
+        raise LedgerIdentityError(f"账本 {path} 的 Worker 均无法在当前 session 内验证身份；无法证明该账本属于当前 session。"
                     f"如确认应归属当前 session，请检查 Worker 是否仍在运行{detail}")
     return verified, unavailable
 
@@ -431,9 +435,9 @@ def require_target_role(data, session, role_name, path):
         # in the ledger cannot be dispatched anyway.
         return None
     if not (role.get("agent_session") or {}).get("value"):
-        raise Error(f"账本 {path} 的角色 {role_name} 未记录 Worker 身份；无法验证目标 Worker，拒绝执行")
+        raise LedgerIdentityError(f"账本 {path} 的角色 {role_name} 未记录 Worker 身份；无法验证目标 Worker，拒绝执行")
     if not verify_existing(role, session=session):
-        raise Error(f"目标 Worker {role.get('agent_name')} 不在当前 session 内，拒绝针对它的操作")
+        raise LedgerIdentityError(f"目标 Worker {role.get('agent_name')} 不在当前 session 内，拒绝针对它的操作")
     return role
 
 
@@ -3567,7 +3571,7 @@ def run_drive(args):
             message = str(e)
             if isinstance(e, AgentUnobservable):
                 reason = "identity_unavailable"
-            elif any(m in message for m in _IDENTITY_STOP_MARKERS):
+            elif isinstance(e, LedgerIdentityError):
                 reason = "identity"
             else:
                 reason = "error"
