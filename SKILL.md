@@ -46,7 +46,10 @@ python3 /path/to/herdr-team/scripts/htm.py run finish --run-id <RUN_ID>
 - `run collect`：**只**根据任务专属 JSON + 已知 Agent 状态完成结算，终端快照不算证据。
 - `run pause/resume`：管理已保存的执行状态；不会自动启动或杀死 Worker。
 - `run list/recover`：断线重连时只读列出未结束 Run 和待回收派单，不自动重发。
-- `run cancel --run-id ID --confirm-run-id ID --reason '...'`：明确放弃且所有 Worker 已停止工作时释放 Team，**不是成功完成**。
+- `run diagnose --run-id ID --dispatch-id ID`：只读诊断未决派单，收集证据快照并分类为 `completed_report_lost` / `partial_execution` / `not_executed` / `undetermined`。不修改账本；Agent 的 done 状态、空 diff 或 503 文本都不能单独作为完成/未执行的证明。
+- `run abandon --run-id ID --dispatch-id ID --reason '...' --evidence <snapshot-id>`：终结该派单的结果资格，**不是成功、不是审批、也不证明 Worker 已停止**。必须先 `diagnose` 取得证据快照。`present + working` 时即使带 `--confirm-untracked` 也拒绝。abandoned 派单是终态，迟到工件只留证。存在 abandoned 派单的 attempt 里，普通 `dispatch` 一律拒绝。
+- `run recover-attempt --run-id ID --dispatch-id ID --evidence <snapshot-id>`：为含 abandoned 成员的故障组保留新 attempt 与一次性角色槽，**不发送 prompt**，之后仍须正规 `run dispatch`。需要可信执行控制面签发的绑定回执；当前生产环境 `TRUSTED_CONTROL = None`，该命令一律 `execution_not_fenced` 拒绝，只能升级 Owner。
+- `run cancel --run-id ID --confirm-run-id ID --reason '...'`：标记 Run 为 cancelled，**不是成功完成**，也**不释放 Team、不删除 Worker、不证明后台任务已停止**。按 T17 分级：无执行历史（从未派单、无故障组、无恢复授权）的 Run 可直接取消；有执行历史的 Run 需要可信执行隔离证明，当前生产环境 `TRUSTED_CONTROL = None` 时一律 fail closed 并升级 Owner。
 
 ## Worker 报告契约（由调度器在派单时自动传给 Worker）
 

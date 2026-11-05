@@ -4,6 +4,47 @@
 
 - Worktree `--repo` is optional: detect the Git root from the Lead `--cwd` (or current directory); an explicit exact-root `--repo` takes priority. Development `auto` with `--task` now errors outside a Git repository instead of silently returning no worktree. `on` still requires `--task`; existing safety checks remain in force.
 
+### Issue #2 M2 — uncertain-dispatch safe recovery (stage delivery, not a release)
+
+Issue #2 remains **open**. This stage delivers the recovery primitives and their guards, not production automatic recovery.
+
+**Implemented and independently reviewed**
+
+- `agent_presence` three-state classification based only on `error.code` (`present` / `confirmed_absent` / `unavailable`).
+- `run diagnose`: read-only evidence snapshot plus classification into `completed_report_lost` / `partial_execution` / `not_executed` / `undetermined`. A `done` agent state, an empty diff or a 503 string is never proof on its own.
+- `run abandon`: terminates the result eligibility of one dispatch with an auditable evidence snapshot. Requires a prior `diagnose`; refuses when the Worker is `present + working`, even with `--confirm-untracked`. Never a success, an approval or proof that the Worker stopped.
+- Fault groups keyed by run + stage index + logical attempt root, with non-collapsible membership snapshots.
+- R1 per-role retry budget (`1 + max_retries` per logical root), consumed atomically and never refunded. Any role out of budget refuses the whole group.
+- One-shot per-role recovery slots: concurrent and replayed requests return the same authorization and the same slot.
+- `run recover-attempt`: atomically retains a new attempt and its slots; never sends a prompt.
+- Fault-group closure with verifiable proof (member hashes must match collected reports, the named gate event must exist, no slot may remain unconsumed).
+- Late artifacts for historical uncertain/abandoned dispatches are retained as evidence only; they never flip status, never set report/hash and never become gate evidence.
+- B1: `cancel` accepts an explicit status whitelist (`active` / `blocked` / `blocked_round_limit` / `paused`); unknown, missing, `None` or empty statuses fail closed and leave the ledger byte-identical.
+- B2: `present + working` refuses abandon before the `--confirm-untracked` branch.
+- B3: a `blocked` dispatch with a valid report and `artifact_sha256` can never be collected again; the re-check inside the lock matches the one outside.
+- T17 cancel grading: a Run with no execution history (no dispatches, no fault groups, no recovery authorizations) may be cancelled without an isolation proof — the obligation has no object because no prompt was ever sent (`run_dispatch` saves the dispatch to the ledger before it sends the prompt). A Run with execution history keeps the full trusted stop/isolation requirement. Both classes record `cancel_scope` in the ledger.
+
+**Verified only against a mocked Herdr and a fake trusted control plane**
+
+Test counts: 370 passed / 1 skipped / 159 subtests without PyYAML; 371 passed / 159 subtests with it. These numbers prove the guards behave as designed. They do **not** prove real execution isolation, authorization or side-effect deduplication.
+
+**Not available in production**
+
+`TRUSTED_CONTROL` is fixed at `None`. Every path that needs real execution isolation fails closed with `execution_not_fenced` and escalates to the Owner:
+
+- cancel of a Run that has execution history (class B)
+- `run recover-attempt`
+- recovery gate authentication
+- `blocked_round_limit` technical over-limit recovery
+
+A Run whose dispatch already failed therefore still cannot be recovered by HTM. The lock-up Issue #2 exists to remove persists for class B; what changed is that it now fails closed with a stable reason code instead of hanging silently.
+
+**Not accepted**
+
+- The real API 503 four-scenario end-to-end matrix has not been run at all.
+- Trusted execution isolation is tracked separately in Issue #19.
+- No claim is made that production automatic recovery works.
+
 ## v4.2.0-beta.2 (2026-11-01) — Real Herdr end-to-end acceptance
 
 This pre-release records the first real Herdr end-to-end acceptance runs. It remains a pre-release: Hermes, OS sandbox isolation and exactly-once delivery are still unverified, and it is not suitable for unattended production use.
