@@ -1,9 +1,13 @@
 ---
 name: herdr-team
-description: 在 Herdr TUI 中管理配置化多 Agent 团队，通过可追踪派单报告、状态账本和必要的独立审查辅助 Lead 协调任务。显式使用 /herdr-team。
+description: "在 Herdr TUI 中管理配置化多 Agent 团队：创建 dev-lite 等团队、按阶段派单给 Developer/Reviewer、用账本与结构化报告跟踪进度并做独立审查。仅当用户明确要求使用 Herdr Team / HTM 团队、点名本 Skill 或要求由多 Agent 团队完成工作时才使用；不要因为任务适合并行、适合委派或适合后台执行就自动调用。需要 HERDR_ENV=1 且由用户授权启动团队。"
 argument-hint: "init <template> [--dry-run] | run -- <goal> | status | templates | pause | resume"
-disable-model-invocation: true
+user-invocable: true
 ---
+
+> **模型调用前提**：只有用户明确授权使用 HTM 团队时，本 Skill 才可由模型主动调用。授权是指用户说了「用团队」「用 HTM」「让 dev-lite 做」这类明确意图，或点名 `/herdr-team`。仅仅因为任务可以拆给多个 Agent、或者任务看起来像开发工作，**不构成**授权。
+>
+> **Skill 入口授权 ≠ 内部执行审批**：允许模型调用本 Skill，不会放宽任何 HTM 治理规则。`approval=boundary` 等策略、`run_approve` 的 fail-closed、gate 证据要求、身份核验与隔离检查全部照旧生效。自动调用所能做到的，最多是替用户敲下他本就要敲的命令，而不是替他做审批。
 
 # Herdr Team Manager v4.2.0-beta.2 — Lead 操作协议
 
@@ -46,7 +50,10 @@ python3 /path/to/herdr-team/scripts/htm.py run finish --run-id <RUN_ID>
 - `run collect`：**只**根据任务专属 JSON + 已知 Agent 状态完成结算，终端快照不算证据。
 - `run pause/resume`：管理已保存的执行状态；不会自动启动或杀死 Worker。
 - `run list/recover`：断线重连时只读列出未结束 Run 和待回收派单，不自动重发。
-- `run cancel --run-id ID --confirm-run-id ID --reason '...'`：明确放弃且所有 Worker 已停止工作时释放 Team，**不是成功完成**。
+- `run diagnose --run-id ID --dispatch-id ID`：只读诊断未决派单，收集证据快照并分类为 `completed_report_lost` / `partial_execution` / `not_executed` / `undetermined`。不修改账本；Agent 的 done 状态、空 diff 或 503 文本都不能单独作为完成/未执行的证明。
+- `run abandon --run-id ID --dispatch-id ID --reason '...' --evidence <snapshot-id>`：终结该派单的结果资格，**不是成功、不是审批、也不证明 Worker 已停止**。必须先 `diagnose` 取得证据快照。`present + working` 时即使带 `--confirm-untracked` 也拒绝。abandoned 派单是终态，迟到工件只留证。存在 abandoned 派单的 attempt 里，普通 `dispatch` 一律拒绝。
+- `run recover-attempt --run-id ID --dispatch-id ID --evidence <snapshot-id>`：为含 abandoned 成员的故障组保留新 attempt 与一次性角色槽，**不发送 prompt**，之后仍须正规 `run dispatch`。需要可信执行控制面签发的绑定回执；当前生产环境 `TRUSTED_CONTROL = None`，该命令一律 `execution_not_fenced` 拒绝，只能升级 Owner。
+- `run cancel --run-id ID --confirm-run-id ID --reason '...'`：标记 Run 为 cancelled，**不是成功完成**，也**不释放 Team、不删除 Worker、不证明后台任务已停止**。按 T17 分级：无执行历史（从未派单、无故障组、无恢复授权）的 Run 可直接取消；有执行历史的 Run 需要可信执行隔离证明，当前生产环境 `TRUSTED_CONTROL = None` 时一律 fail closed 并升级 Owner。
 
 ## Worker 报告契约（由调度器在派单时自动传给 Worker）
 
