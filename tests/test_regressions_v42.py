@@ -1907,6 +1907,56 @@ class LedgerIdentityTests(unittest.TestCase):
             h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
                             reason='Attempt to cancel a foreign dispatched Run'))
 
+    def test_tier_c_minus_rejects_contradictions_without_an_anchor(self):
+        # C- exists so abandon/diagnose work when Workers died. It must still
+        # refuse a ledger whose live agents contradict it.
+        data = self.ledger_with_uuids()
+        name = data['roles'][0]['agent_name']
+        self.live[name] = dict(self.live[name], cwd='/some/other/checkout')
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C-')
+
+    def test_tier_c_minus_allows_a_ledger_with_no_live_worker(self):
+        # The opposite half: no survivor is not itself a contradiction.
+        self.ledger_with_uuids()
+        for name in list(self.live):
+            self.live[name] = None
+        self.assertEqual(h.require_run(self.rid, tier='C-')['id'], self.rid)
+
+    def test_presence_probe_carries_the_bound_session(self):
+        # Regression: `role` has no session key -- the session lives on the Run.
+        # Passing role.get('session') silently sent session=None, so a named
+        # session's probe hit the default server and could report a live Worker
+        # as confirmed_absent (the evidence the abandon fence trusts).
+        role = h.require_run(self.rid)['roles'][0]
+        calls = []
+
+        def fake(*argv, **kw):
+            calls.append((argv, kw.get('session')))
+            if argv[:2] == ('agent', 'get'):
+                return {'agent': {'name': role['agent_name'], 'pane_id': role['pane_id'],
+                                  'agent': role['kind'], 'agent_status': 'idle',
+                                  'cwd': role['cwd'],
+                                  'agent_session': role['agent_session']}}
+            return {'pane': {'pane_id': role['pane_id']}}
+
+        with patch.object(h, 'herdr', side_effect=fake):
+            h.agent_presence(role, session='alpha')
+        self.assertTrue(calls)
+        self.assertTrue(all(s == 'alpha' for _argv, s in calls),
+                        f'session was dropped: {calls}')
+
+    def test_cancel_cost_only_still_rejects_a_foreign_ledger(self):
+        # Class A must not become a blanket bypass: a ledger that records a
+        # different session is still refused by ledger_ownership.
+        data = self.ledger_with_uuids()
+        data['dispatches'] = []
+        data['session'] = 'another-session'
+        h.run_file(self.rid).write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '属于 session|跨 session'):
+            h.run_cancel(ns(run_id=self.rid, confirm_run_id=self.rid,
+                            reason='Attempt to cancel a foreign session ledger'))
+
     def test_cwd_mismatch_is_a_conflict_not_unobservable(self):
         # Regression: contradiction detection used to be a message-substring
         # whitelist, so a same-UUID agent living in a different checkout fell

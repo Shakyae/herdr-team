@@ -753,7 +753,7 @@ def verify_existing(team_role, session=None):
     return True
 
 
-def agent_presence(role):
+def agent_presence(role, session=None):
     """Three-state observation of a bound Worker. Never proof that it stopped.
 
     Rules (design §3): confirmed_absent requires BOTH `agent get` returning
@@ -767,7 +767,7 @@ def agent_presence(role):
         # named session's call would query the default server, and a live
         # Worker could produce agent_not_found + pane_not_found there -- i.e.
         # `confirmed_absent` -- which is exactly what the abandon fence trusts.
-        found = herdr("agent", "get", role["agent_name"], session=role.get("session"))
+        found = herdr("agent", "get", role["agent_name"], session=session)
     except HerdrError as e:
         code = e.code
         if code != "agent_not_found":
@@ -805,7 +805,7 @@ def agent_presence(role):
         return {"state": "present", "code": None, "status": agent_status_of(found)}
     # agent_not_found: only a matching pane_not_found proves absence.
     try:
-        herdr("pane", "get", role["pane_id"], session=role.get("session"))
+        herdr("pane", "get", role["pane_id"], session=session)
     except HerdrError as e:
         if e.code == "pane_not_found":
             return {"state": "confirmed_absent", "code": "agent_not_found"}
@@ -1703,7 +1703,7 @@ def diagnose_dispatch(run_id, dispatch_id):
             raise Error("Unknown dispatch ID")
         check_transition(run, "diagnose", rec, allow_history=True)
         role = get_role(run, rec["role"])
-        presence = agent_presence(role)
+        presence = agent_presence(role, session=run.get("session"))
         snapshot = result_snapshot(run, rec)
         classification = classify_diagnosis(presence, snapshot)
         git = git_evidence(rec)
@@ -1755,7 +1755,7 @@ def run_abandon(args):
         if len(args.reason.strip()) < 12:
             raise GuardError("policy_forbidden", "abandon requires a specific --reason (12+ chars)")
         role = get_role(run, rec["role"])
-        presence = agent_presence(role)
+        presence = agent_presence(role, session=run.get("session"))
         snapshot = validate_abandon_target(run, rec, args.quarantine_invalid)
         evidence_dir = STATE / "evidence" / run["id"] / rec["id"] / args.evidence
         if not (evidence_dir / "manifest.json").is_file():
@@ -1857,7 +1857,7 @@ def role_identity(role):
     return pins
 
 
-def live_identity_problems(role):
+def live_identity_problems(role, session=None):
     """Strict observation of the LIVE Agent. The ledger echo is never proof.
 
     Recovery authorization and slot use must verify the actual Agent: a
@@ -1865,7 +1865,7 @@ def live_identity_problems(role):
     (for Hermes) a matching profile. Missing or drifted fields fail closed.
     """
     try:
-        found = agent_data(herdr("agent", "get", role["agent_name"], session=role.get("session")))
+        found = agent_data(herdr("agent", "get", role["agent_name"], session=session))
     except HerdrError as e:
         return [f"agent get failed: {e.code or 'error'}"]
     except Error as e:
@@ -1910,7 +1910,7 @@ def require_live_identity(run, role_name):
     if not identity_pins_complete(role):
         raise GuardError("identity_mismatch",
                          f"role {role_name} has incomplete identity pins in the ledger")
-    problems = live_identity_problems(role)
+    problems = live_identity_problems(role, session=run.get("session"))
     if problems:
         raise GuardError("identity_mismatch",
                          f"role {role_name} live identity does not match: {','.join(problems)}")
@@ -2915,7 +2915,7 @@ def late_artifact_notice(run, rec):
         raise GuardError("stale_snapshot",
                          f"dispatch {rec['id']} is historical ({rec['status']}); "
                          "decided records are not re-collected")
-    presence = agent_presence(get_role(run, rec["role"]))
+    presence = agent_presence(get_role(run, rec["role"]), session=run.get("session"))
     evidence = collect_evidence(run, rec, presence, snapshot, "late_artifact_rejected", git_evidence(rec))
     raise GuardError("history_unresolved",
                      f"late artifact for historical {rec['status']} dispatch retained as evidence "
@@ -2977,7 +2977,7 @@ def run_collect(args):
             # Keep an ACTUAL snapshot of a late report, not just a note.
             snapshot = result_snapshot(run, rec)
             if snapshot.get("valid"):
-                presence = agent_presence(get_role(run, rec["role"]))
+                presence = agent_presence(get_role(run, rec["role"]), session=run.get("session"))
                 retained = collect_evidence(run, rec, presence, snapshot,
                                             "late_artifact_current_abandoned",
                                             git_evidence(rec))["snapshot_id"]
@@ -2997,7 +2997,7 @@ def run_collect(args):
         if snapshot.get("valid"):
             pass  # fall through to the normal collect below
         else:
-            presence = agent_presence(get_role(run, rec["role"]))
+            presence = agent_presence(get_role(run, rec["role"]), session=run.get("session"))
             with locked():
                 run = require_run(args.run_id)
                 rec = next((x for x in run["dispatches"] if x["id"] == args.dispatch_id), None)
