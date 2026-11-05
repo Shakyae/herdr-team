@@ -77,3 +77,32 @@ fault group，而 `run_gate` / `run_cancel` / `run_finish` 都要求 abandoned �
 - `run abandon` 锁死缺陷未修复，`73d77630456f` 与 `1d0debfb70e0` 仍无法安全结算。
 - `SKILL.md` 的 Happier 支持范围说明未随本次合并发布，待在正式发布时与生产 Skill
   一同更新。
+
+---
+
+## 6. 实际执行（2026-11-05）
+
+### 已关闭
+
+| 资源 | 类型 | 依据 |
+|---|---|---|
+| `w0:p4` ~ `w0:p9` | Pane（6 个） | 无任何账本引用（team/run 的 roles 均指向 p1–p3），全部 `idle`。关闭后 `w0` 从 9 个 Pane 收敛到 3 个。 |
+| `w16` | Workspace | Run `ee42ec1a96ce` 无未决派单；其审查工件已随账本固化到 `docs/evidence/i6-20261105/`。 |
+| `w18` | Workspace | Run `ab79b30029ab` 为 `finished`，五阶段 `pass`。 |
+| `i6-accept` | Herdr Session | `session stop`（非 delete，保留目录可恢复）。三个 Pane 均为 `done`，唯一使用方是该验收 Run，已 `finished`。 |
+
+### 保留
+
+| 资源 | 原因 |
+|---|---|
+| `w0`（p1/p2/p3） | `w0:p1` 是锁死 Run `73d77630456f` 的 Lead Pane，`p2`/`p3` 是其角色 Pane。关闭会破坏缺陷现场的可复现性。 |
+| `w14` | Run `34a8d36b6947` 仍为 `active`，含 uncertain 派单 `d847ed6e17`（reviewer，API 断流现场）。 |
+| `w19` | 主项目 `~/dev/herdr-team` 的 dev-lite 团队，与 Issue #6 无关。 |
+| `w12` / `w13` | 其他项目（shipyard-ai-research、pagi），与本次无关。 |
+| `w1A` | 本次收尾新建的 dev-lite 团队，正在执行合并前独立审查 Run `4d36bf75eca2`。 |
+
+### 证据固化
+
+四个已完成的验收/回归 Run 账本已复制到 `docs/evidence/i6-20261105/`（字节一致，含五阶段
+`pass` 记录）。`~/.local/state/herdr-team-i6-{accept,final,native,review}/` 的原始目录
+**全部保留**，因为其中仍含未结束 Run（`34a8d36b6947`、`ee42ec1a96ce`）。
