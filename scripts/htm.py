@@ -759,7 +759,11 @@ def agent_presence(role):
     """
     code = None
     try:
-        found = herdr("agent", "get", role["agent_name"])
+        # The Worker binding must be read from ITS session. Without this, a
+        # named session's call would query the default server, and a live
+        # Worker could produce agent_not_found + pane_not_found there -- i.e.
+        # `confirmed_absent` -- which is exactly what the abandon fence trusts.
+        found = herdr("agent", "get", role["agent_name"], session=role.get("session"))
     except HerdrError as e:
         code = e.code
         if code != "agent_not_found":
@@ -797,7 +801,7 @@ def agent_presence(role):
         return {"state": "present", "code": None, "status": agent_status_of(found)}
     # agent_not_found: only a matching pane_not_found proves absence.
     try:
-        herdr("pane", "get", role["pane_id"])
+        herdr("pane", "get", role["pane_id"], session=role.get("session"))
     except HerdrError as e:
         if e.code == "pane_not_found":
             return {"state": "confirmed_absent", "code": "agent_not_found"}
@@ -1857,7 +1861,7 @@ def live_identity_problems(role):
     (for Hermes) a matching profile. Missing or drifted fields fail closed.
     """
     try:
-        found = agent_data(herdr("agent", "get", role["agent_name"]))
+        found = agent_data(herdr("agent", "get", role["agent_name"], session=role.get("session")))
     except HerdrError as e:
         return [f"agent get failed: {e.code or 'error'}"]
     except Error as e:
