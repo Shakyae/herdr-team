@@ -1,9 +1,13 @@
 ---
 name: herdr-team
-description: 在 Herdr TUI 中管理配置化多 Agent 团队，通过可追踪派单报告、状态账本和必要的独立审查辅助 Lead 协调任务。显式使用 /herdr-team。
+description: "在 Herdr TUI 中管理配置化多 Agent 团队：创建 dev-lite 等团队、按阶段派单给 Developer/Reviewer、用账本与结构化报告跟踪进度并做独立审查。仅当用户明确要求使用 Herdr Team / HTM 团队、点名本 Skill 或要求由多 Agent 团队完成工作时才使用；不要因为任务适合并行、适合委派或适合后台执行就自动调用。需要 HERDR_ENV=1 且由用户授权启动团队。"
 argument-hint: "init <template> [--dry-run] | run -- <goal> | status | templates | pause | resume"
-disable-model-invocation: true
+user-invocable: true
 ---
+
+> **模型调用前提**：只有用户明确授权使用 HTM 团队时，本 Skill 才可由模型主动调用。授权是指用户说了「用团队」「用 HTM」「让 dev-lite 做」这类明确意图，或点名 `/herdr-team`。仅仅因为任务可以拆给多个 Agent、或者任务看起来像开发工作，**不构成**授权。
+>
+> **Skill 入口授权 ≠ 内部执行审批**：允许模型调用本 Skill，不会放宽任何 HTM 治理规则。`approval=boundary` 等策略、`run_approve` 的 fail-closed、gate 证据要求、身份核验与隔离检查全部照旧生效。自动调用所能做到的，最多是替用户敲下他本就要敲的命令，而不是替他做审批。
 
 # Herdr Team Manager v4.2.0-beta.2 — Lead 操作协议
 
