@@ -148,3 +148,8 @@ git worktree remove ~/dev/herdr-team-happier-i6-isolated-20261104044949
 `4d36bf75eca2`（本次合并前审查）在 `w1A` 上，因 uncertain 派单 `41b12db5aa` 被
 Issue #2 的生产门禁锁死（`TRUSTED_CONTROL=None` 无法 recover-attempt）。其审查
 结论已通过直接读取工件取得并全部处理完毕，账本保留作为该缺陷的又一实例。
+
+### 补充：w1A 的复核 Pane
+
+收尾期间为绕开 `4d36bf75eca2` 的锁死，在 `w1A` 临时拆出 `p6` 启动独立复核
+Agent。审查结论取回后已关闭，`w1A` 恢复为 p1/p2/p3（dev-lite 团队本体）。
