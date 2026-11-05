@@ -2014,6 +2014,47 @@ class LedgerIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
                     h.require_run(self.rid, tier=tier)
 
+    def test_herdr_failure_is_reported_as_unobservable_not_absent(self):
+        # `lookup_agent` used to swallow every Error, so a herdr timeout and a
+        # genuinely absent agent both arrived as None. At tier C- (no anchor
+        # required) that turned "could not look" into "no contradiction" and
+        # waved the ledger through. The two must stay distinguishable.
+        role = h.require_run(self.rid)['roles'][0]
+        data = {'version': 3, 'roles': [role]}
+
+        # The class setUp already patches lookup_agent, so drive the inner
+        # herdr call the way a real failure would arrive.
+        def boom(*a, **kw):
+            raise h.HerdrError('herdr timed out', code='timeout')
+
+        def gone(*a, **kw):
+            raise h.HerdrError('not found', code='agent_not_found')
+
+        def failing_lookup(name, session=None, on_error=None):
+            try:
+                raise boom()
+            except h.Error as e:
+                if on_error is not None:
+                    on_error(e)
+                return None
+
+        def absent_lookup(name, session=None, on_error=None):
+            try:
+                raise gone()
+            except h.HerdrError as e:
+                if e.code == 'agent_not_found':
+                    return None
+                raise
+
+        with patch.object(h, 'lookup_agent', side_effect=failing_lookup):
+            _v, _t, conflicts, unavailable = h._inspect_roles(data, 'default')
+        self.assertEqual(conflicts, [])
+        self.assertTrue(unavailable, 'a herdr failure must be recorded as unobservable')
+
+        with patch.object(h, 'lookup_agent', side_effect=absent_lookup):
+            _v, _t, conflicts, unavailable = h._inspect_roles(data, 'default')
+        self.assertEqual((conflicts, unavailable), ([], []))
+
     def test_presence_probe_carries_the_bound_session(self):
         # Regression: `role` has no session key -- the session lives on the Run.
         # Passing role.get('session') silently sent session=None, so a named

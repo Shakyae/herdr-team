@@ -704,10 +704,25 @@ def agent_status_of(obj):
     return status if isinstance(status, str) and status else "unknown"
 
 
-def lookup_agent(name, session=None):
+def lookup_agent(name, session=None, on_error=None):
+    """Return the agent mapping, or None when it is absent.
+
+    A herdr failure other than `agent_not_found` is an OBSERVABILITY failure,
+    not evidence that the Worker is gone. Callers that treat absence and
+    unobservability differently (the identity checks do) pass `on_error` to see
+    the exception; everything else keeps the plain None contract.
+    """
     try:
         return agent_data(herdr("agent", "get", name, session=session))
-    except Error:
+    except HerdrError as e:
+        if e.code == "agent_not_found":
+            return None
+        if on_error is not None:
+            on_error(e)
+        return None
+    except Error as e:
+        if on_error is not None:
+            on_error(e)
         return None
 
 
@@ -752,10 +767,9 @@ def verify_existing(team_role, session=None):
     # agent and a genuinely absent one arrive here identically as a falsy value.
     # Ownership checks must not treat "could not look" as "does not match"; the
     # caller in _inspect_roles separates the two by exception type.
-    try:
-        found = lookup_agent(team_role["agent_name"], session=session)
-    except Error as e:
+    def unobservable(e):
         raise AgentUnobservable(str(e)) from e
+    found = lookup_agent(team_role["agent_name"], session=session, on_error=unobservable)
     if not found or not isinstance(found, dict):
         return False
     pane = found.get("pane")
@@ -1312,9 +1326,6 @@ def name_lead(args):
     return {"dry_run": not args.apply, "current": current, "new": name, "pane_id": pane_id,
             "team": str(path) if team is not None else None,
             "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
-
-
-IDENTITY_TIERS = ("A", "B", "C-", "C")
 
 
 def _require_run_with_session(runid, tier="C", target_role=None):
