@@ -235,8 +235,14 @@ class RuntimeTests(unittest.TestCase):
                     raise h.HerdrError('not found', code='agent_not_found')
                 return {'agent': self.started[argv[2]]}
             if argv[:2] == ('agent','start'):
+                # Real agents report a stable agent_session. C-tier ledger
+                # operations verify it, so the fake must expose one too.
                 self.started[argv[2]] = {'pane_id': argv[argv.index('--pane')+1],
-                                          'kind': argv[argv.index('--kind')+1], 'status':'idle'}
+                                          'kind': argv[argv.index('--kind')+1], 'status':'idle',
+                                          'agent_session': {'agent': argv[argv.index('--kind')+1],
+                                                            'kind': 'id',
+                                                            'source': 'herdr:claude',
+                                                            'value': 'fake-session-' + argv[2]}}
                 return {'agent': self.started[argv[2]]}
             if argv[:2] == ('agent','prompt'):
                 prompt = argv[3]

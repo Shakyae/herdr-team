@@ -1,8 +1,8 @@
 # Happier 内 `/herdr-team init` 的最小可实施修复路径
 
-- 状态：设计文档（未改正式代码、未提交、未发版）
+- 状态：设计文档 + 已落地实现 + **真实端到端验收通过**（分支 `fix/issue6-session-isolation-20261104044949`，未合并 main）
 - 证据标签：**[实测]** 本机真实执行并核对；**[源码]** 从已安装产物读到；**[推断]** 基于前两者的推理，未端到端验证
-- 版本：Herdr 0.9.5（protocol 22）、Happier 0.2.17、HTM v4.2
+- 版本：Herdr 0.9.5（protocol 22）、Happier **0.2.20**（端到端验收版本；早期根因分析基于 0.2.17）、HTM v4.2
 
 ---
 
@@ -18,11 +18,14 @@
 
 | 层 | 事实 | 证据 |
 |---|---|---|
-| 环境 | Happier 启动的 claude 子进程（pid 29187）环境中没有 `HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_WORKSPACE_ID`/`HERDR_TAB_ID`/`HERDR_SOCKET_PATH`，也没有 `CLAUDE_CODE_SESSION_ID` | **[实测]** `ps eww` 逐键核对 |
-| 代码 | Happier 两处白名单丢弃 `HERDR_*`：`stripNestedSessionDetectionEnv` 显式 `delete HERDR_ENV`；`buildClaudeSubprocessEnv` 的 exact/prefix 白名单不含 `HERDR_` 前缀；统一终端路径另用 `buildTerminalLauncherProcessEnv` | **[源码]** `api-BJP7Fl6P.mjs:95121`、`:95566`；`command-1D3NR-aN.mjs:21362` |
-| HTM | `context()` 读 `HERDR_ENV` 与三个 ID，缺失即抛 `Must run inside Herdr: HERDR_ENV=1`；`--dry-run` 不调 `context()` 所以能过 | **[实测]** 移除 `HERDR_*` 后 `status` rc=2；**[源码]** `scripts/htm.py:247-265` |
+| 环境（**0.2.20 实测，当前结论**） | Happier 启动的 claude 子进程中，**只有 `HERDR_ENV` 缺失**；`HERDR_PANE_ID`/`HERDR_WORKSPACE_ID`/`HERDR_TAB_ID`/`HERDR_SOCKET_PATH`/`HERDR_SESSION` **全部存在且值正确**（例如 `HERDR_SESSION=i6-accept`、`HERDR_SOCKET_PATH=~/.config/herdr/sessions/i6-accept/herdr.sock`）。`CLAUDE_CODE_SESSION_ID` 仍然缺失 | **[实测]** 2026-11-05 `ps eww` 逐键核对 claude 子进程 pid 31563 |
+| 环境（0.2.17 早期记录，**已过时**） | 早期分析记录的是 claude 子进程**整体没有** `HERDR_*` 五个变量。该描述对应 Happier 0.2.17，**不适用于 0.2.20** | **[实测]** 2026-11-04 旧记录 |
+| 代码 | Happier 白名单丢弃 `HERDR_*`：`stripNestedSessionDetectionEnv` 显式 `delete HERDR_ENV`；`buildClaudeSubprocessEnv` 的 exact/prefix 白名单不含 `HERDR_` 前缀；统一终端路径另用 `buildTerminalLauncherProcessEnv` | **[源码]** `api-BJP7Fl6P.mjs:95121`、`:95566`；`command-1D3NR-aN.mjs:21362`（0.2.17 产物） |
+| HTM（修复前） | `context()` 读 `HERDR_ENV` 与三个 ID，缺失即报错；`--dry-run` 不调 `context()` 所以能过。当前实现已改为进程归属探测（§4） | **[实测]** 修复前移除 `HERDR_*` 后 `status` rc=2；**[源码]** 当前 `scripts/htm.py:262-304` |
 
-**关键事实**：`HERDR_*` 只在 claude 子进程层丢失。Happier 自己的 runner（pid 29054）环境中 `HERDR_ENV=1`、`HERDR_PANE_ID=wH:p5`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH` 全在。**[实测]** 因此 Pane 归属在 Happier 侧是确定的，只是没有合法通道传给 HTM。
+**关键事实**：无论哪个版本，`HERDR_ENV` 在 claude 子进程层都不可用。Happier 自己的 runner 环境中 `HERDR_ENV=1` 与全部 ID 都在。**[实测 0.2.20]** 因此 Pane 归属在 Happier 侧是确定的，只是缺少 `HERDR_ENV` 这个开关；其余 ID 虽被继承，但按 §5.1 不能单独作为身份证据，仍必须由父链探测交叉确认。
+
+**剥离范围收窄的后果**：0.2.20 下派生路径会在「其余 `HERDR_*` 存在」的情况下被触发，这是设计时未显式列举的组合。实测两条证据链结论一致（探测 session `i6-accept` 与 `HERDR_SESSION` 相同、socket 解析一致），未出现冲突；但**这不改变 §4.2 的分支判定规则**——仍以 `HERDR_ENV` 是否存在决定走哪条路径。
 
 ---
 
@@ -44,7 +47,7 @@ Herdr 0.9.5 **没有**可信调用者身份接口：**[实测]** `herdr api sche
 
 ### 4.1 新增 `pane_of_current_process()`
 
-位置：`context()` 之后（约 267 行）。职责：**不读不写任何 `HERDR_*`**，返回 `{"session", "workspace", "tab", "pane"}`。
+**[源码]** 位置：`socket_session()` 在 247 行，`lead_identity()` 在 262 行，`context()` 在 303 行，`pane_of_current_process()` 在 395 行。`socket_session()` 按 socket 查询唯一 session；`lead_identity()` 内部对原生和派生路径均做两次探测，原生路径随后按需调用 `socket_session()`；`context()` 仅返回其 context。探测函数不读写 `HERDR_*`，返回 `{"session", "workspace", "tab", "pane"}`。
 
 1. `herdr session list --json` → 取 `running: true` 的 session。**[实测]** 当前返回 `[{name:"default", running:true, socket_path:"..."}]`。
 2. 对每个 session 执行 `herdr --session <name> pane list`。**[实测]** 无 `HERDR_*` 环境下 rc=0。
@@ -55,9 +58,11 @@ Herdr 0.9.5 **没有**可信调用者身份接口：**[实测]** `herdr api sche
 
 可靠性依据：`ppid` 由内核在 fork 时写入，进程无法自报；`process-info` 的 pid 来自 Herdr 服务端自己的 PTY 记录。两侧同时命中才成立。
 
-**[实测]** 本进程唯一命中 `wS:p2`；Happier 的 claude（29187）与 MCP 桥（29222）为种子均唯一命中 `wH:p5`；原生 claude（93044）唯一命中 `wS:p3`。11 个 Pane 全量扫描耗时 0.065s。
+**[实测，2026-11-04 历史样本]** 本进程唯一命中 `wS:p2`；Happier 的 claude（29187）与 MCP 桥（29222）为种子均唯一命中 `wH:p5`；原生 claude（93044）唯一命中 `wS:p3`。11 个 Pane 全量扫描耗时 0.065s。
 
-### 4.2 修改 `context(require=True)`（247-265）
+**[实测，2026-11-05 双 session 复核]** 在 `default`（`wX`/`w0`/`w12`，7 个 Pane）与 `i6-accept`（`w1`，1 个 Pane）同时 running 的条件下，`default` 内的 `pane_of_current_process()` 仍唯一定位到 `w0:p1`，未因多 server 扫描而误判或报"身份不唯一"。上述历史样本的 PID 与 Pane ID 属当时现场，现已不可复现，仅作方法学证据保留。
+
+### 4.2 `lead_identity(require=True)` 与 `context()`（262-304）
 
 **分支顺序与现有代码一致；原生分支保留原有校验，并新增一次真实进程归属交叉检查；无 `HERDR_ENV` 时才走派生兜底：**
 
@@ -75,7 +80,14 @@ Herdr 0.9.5 **没有**可信调用者身份接口：**[实测]** `herdr api sche
 3. 环境 `HERDR_SOCKET_PATH` 非空时，必须用 `herdr session list --json` 中**`socket_path` 与它逐字节相等的唯一 session 名**证明该名字等于探测 session；0 个或多个匹配、名字为空、或匹配到的 session 与探测不符一律 `raise Error`。**不把缺失值默认成 `default`**。（socket 路径由 Herdr 自己生成，属比较即可；若出现规范化差异会因 0 匹配而 fail closed。）
 4. 探测结果自身必须通过既有 ID 正则与 workspace 前缀校验。
 
-**行为后果（有意）**：原生路径现在要求调用进程确实位于该 Pane 的进程树内。若有人用 `setsid`/`nohup` 等脱离 Pane 的方式运行 HTM 却仍保留 `HERDR_*`，将 fail closed 而不再"看似成功"。这是本方案要的语义：身份必须有内核证据，不能只靠环境变量。
+**行为后果（有意）**：原生路径现在要求调用进程确实位于该 Pane 的进程树内。若用**真正脱离 Pane 进程树**的方式运行 HTM（例如双 `fork` + `setsid`），将 fail closed 而不再"看似成功"。这是本方案要的语义：身份必须有内核证据，不能只靠环境变量。
+
+**[实测 2026-11-05] 脱离方式的边界**：
+- 双 `fork` + `setsid`，且在干净环境（无 `HERDR_*`）下 → `FAIL_CLOSED: 无法定位 Herdr pane: no matching pane` ✅ 符合预期
+- `nohup` **不会**改变 ppid，进程仍在 Pane 的进程树内 → 定位**仍然成功**。`nohup` 只是忽略 SIGHUP、重定向 stdio，不改变父链归属
+- 即使显式 `env -u` 清空全部 `HERDR_*`，只要进程仍在 Pane 进程树内，派生探测就会成功——这是设计语义（证明"我在这里"），不是漏洞
+
+因此**不要把 `nohup` 当作"脱离 Pane"的例子**；判断依据是内核 ppid 链，不是 shell 的重定向或信号处理。
 
 **`require=False` 契约保持不变**：返回 `{"workspace","lead_tab","lead_pane"}` 三键，提前返回、不解析 session、不探测、不调 herdr。
 
@@ -85,7 +97,7 @@ Herdr 0.9.5 **没有**可信调用者身份接口：**[实测]** `herdr api sche
 
 ### 4.3 session 维度
 
-`context()` **永远不包含 session**。原因：它的返回值被 `scripts/htm.py` 705/869/986 原样落盘，被 904/943/964 精确相等比较。任何新增顶层键都会让全部既有账本失效——**[实测]** 现有 3 个 team 与 6 个 run 的 `context` 均为恰好 3 键，其中 wS 的 `95fd9bc7acd24c75` 正被 Run `bdd4938067b5` 使用。
+`context()` **永远不包含 session**。原因：它的返回值用于落盘和精确相等比较（本节旧行号为设计时的历史定位，不代表当前源码行号）。任何新增顶层键都会让全部既有账本失效——**[实测，2026-11-04 历史样本]** 当时现有 3 个 team 与 6 个 run 的 `context` 均为恰好 3 键，其中 wS 的 `95fd9bc7acd24c75` 正被 Run `bdd4938067b5` 使用。**[实测，2026-11-05]** 隔离 session 新建的 team 与 Run 同样为恰好 3 键，契约未变。
 
 改为平行返回：
 
@@ -94,7 +106,7 @@ def lead_identity(require=True) -> dict:
     """{"context": {"workspace","lead_tab","lead_pane"}, "session": str}"""
 ```
 
-`context()` 成为 `lead_identity()["context"]` 的薄封装，因此**所有既有落盘与 `!=` 比较零改动，三个既有 team 与六个 run 都不需要迁移**。`state_file` 的 key 仍是 `sha256("workspace|lead_pane")[:16]`（269-271），不分裂。
+`context()` 成为 `lead_identity()["context"]` 的薄封装，因此**所有既有落盘与 `!=` 比较零改动，三个既有 team 与六个 run 都不需要迁移**。`state_file` 的 key 仍是 `sha256("workspace|lead_pane")[:16]`（当前 311-313 行），不分裂。
 
 **session 取值规则（按分支）**
 
@@ -108,9 +120,9 @@ def lead_identity(require=True) -> dict:
 **旧结论作废**：原 §4.3 写"原生分支 `session` 恒为 `""`、不反查"。该写法**已废弃**，与 §4.2 的交叉检查冲突。现规则是：原生分支只要探测成功就返回已确认的 session（`default` 或其它），并由调用链显式传给 `herdr()`；这样即使 `HERDR_SOCKET_PATH` 指向别的 server，CLI 也不会连错。
 
 **fail closed 规则（两条路径共用）**：
-- `herdr session list --json` **命令本身失败**（非零退出、超时、输出不是合法 JSON）→ 直接 `raise Error`。`scripts/htm.py:314-339` 的 `process()` 已对这三类情况抛 `Error`/`HerdrError`，**不得捕获后降级为"找不到 session 所以跳过"**——那会把环境故障伪装成"无身份"，从而放行。
+- `herdr session list --json` **命令本身失败**（非零退出、超时、输出不是合法 JSON）→ 直接 `raise Error`。`scripts/htm.py:356-381` 的 `process()` 已对这三类情况抛 `Error`/`HerdrError`，**不得捕获后降级为"找不到 session 所以跳过"**——那会把环境故障伪装成"无身份"，从而放行。
 - `session list` 成功但返回 0 个 running session → `raise Error`。
-- 派生路径下多 session 且出现同名 Pane → `raise Error`（冲突存在时不做猜测）。
+- 扫描到的多个 running session 之间出现相同 `(workspace_id, pane_id)` 或 `(workspace_id, tab_id)` → `raise Error`（冲突存在时不做猜测）。该检查位于 `pane_of_current_process()`（395 起）内部的 panes 扫描循环（425-429），**没有分支判断，原生与派生两条路径都生效**，且即使冲突键不属于命中 Pane 也拒绝；同一 session 内共享 Tab 不触发。
 
 **为什么不用 `HERDR_SESSION_NAME`**：**[实测]** Herdr 注入的 `HERDR_*` 只有 6 个（`HERDR_BIN_PATH`/`ENV`/`PANE_ID`/`SOCKET_PATH`/`TAB_ID`/`WORKSPACE_ID`），无此变量。
 
@@ -124,7 +136,7 @@ def herdr(*args, timeout=40, session=None):
 
 必须用**非空真值**判断：**[实测]** `herdr --session "" pane list` → `session name cannot be empty`；`herdr --session " " pane list` → `session name may only contain ASCII letters, numbers, '.', '_' and '-'`。默认 `session=None` 时拼出的 argv 与现在逐字节相同，15 处既有调用全部不受影响。session 名以 `herdr session list --json` 返回值为准，正则 `[A-Za-z0-9._-]+` 只是把 CLI 自身规则前置成 `Error`；两条路径都只传入探测确认过的非空名字。
 
-**需要透传 session 的位置**（6 个既有 `context()` 调用点之外还有间接链）：
+**需要透传 session 的位置**（下表行号为修复前设计时的历史定位，当前实现行号已变化；6 个既有 `context()` 调用点之外还有间接链）：
 
 | 位置 | 用途 | 需 session |
 |---|---|---|
@@ -151,7 +163,7 @@ def herdr(*args, timeout=40, session=None):
 | S2 | **第 2 轮完整探测**，要求与 S1 逐项相同（`session`/`workspace`/`tab`/`pane`） | **报错，此时尚未产生任何副作用** |
 | S3 | `init` 现有流程（创建 partial 账本、`git worktree add`、首个 Herdr 写操作） | 现有逻辑 |
 
-**关键：第 2 轮必须在 `scripts/htm.py:707-708` 的 `save(path, team)`（首次落盘 partial 账本）之前完成。** 原因是可以避免一个无法恢复的状态：
+**关键：第 2 轮必须在 `save(path, team)`（首次落盘 partial 账本）之前完成。** 下列行号为修复前设计时的历史定位；原因是可以避免一个无法恢复的状态：
 
 - `init` 在 `:707-708` 先写 `status: "partial"` 账本，随后 `:718-719` 可能创建 worktree，再在 `:720+` 写 Herdr；
 - 而 `:680-681` 对已存在的 partial 账本**直接拒绝重试**（`Previous init is partial...`），没有自动恢复路径；
@@ -161,7 +173,7 @@ def herdr(*args, timeout=40, session=None):
 
 **代价**：第 2 轮与首个 Herdr 写操作之间隔了 `git worktree add`（可能秒级），窗口比"紧贴写操作"更大。这是有意取舍——**用更大的窗口换"失败零残留"**。若 Owner 更看重窗口大小，替代方案是保留原位但**必须额外定义 partial 的可恢复语义**（例如记录 `phase` 字段并在下次 init 时按 phase 清理），属未设计的扩展，本轮不采纳。
 
-至此 S3 内部的首个写操作**依配置而变**：`layout.mode == "tab"` 时是 `tab create`（`scripts/htm.py:721-723`），否则是 `pane split`（`:726-728`）。
+至此 S3 内部的首个写操作**依配置而变**：`layout.mode == "tab"` 时是 `tab create`（当前 `scripts/htm.py:836-838`），否则是 `pane split`（当前 `:841-842`）。
 
 ### 4.5 竞争窗口（如实表述）
 
@@ -203,9 +215,9 @@ def herdr(*args, timeout=40, session=None):
 
 ## 6. 验证（隔离 Workspace）
 
-**V0** `uv run pytest -q` → 基线 `204 passed, 116 subtests passed`（**[实测]**）。实现后只应增加。
+**V0** 本分支 `uv run pytest -q` → `239 passed, 1 skipped, 127 subtests passed`（**[实测]**）。
 
-**V1** 复现：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_TAB_ID -u HERDR_SOCKET_PATH python3 scripts/htm.py status` → rc=2，stderr 为 `Must run inside Herdr: HERDR_ENV=1`（**[实测]**）。
+**V1** 修复前复现（历史记录，非当前预期）：`env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_TAB_ID -u HERDR_SOCKET_PATH python3 scripts/htm.py status` → rc=2，stderr 为 `Must run inside Herdr: HERDR_ENV=1`（**[实测]**）。
 
 **V2** `herdr workspace create --label htm-once-<slug>`，记录返回的 workspace id；在其中用 `happier claude` 启动 Lead。`init dev-lite --dry-run` 应返回 `requires_herdr: true`、`no_mutations: true`。
 
@@ -226,27 +238,74 @@ def herdr(*args, timeout=40, session=None):
 
 判定标准一句话：**移除全部 `HERDR_*` 后 `init` 与 `status` 仍成功，同时非 Pane 环境下严格失败。两条必须同时成立。**
 
+### 6.1 真实端到端验收结果（2026-11-05，**[实测]**）
+
+**环境**：Herdr 0.9.5、Happier 0.2.20、claude 2.1.311、分支 `fix/issue6-session-isolation-20261104044949` @ `b03f537`。独立命名 session `i6-accept`（`~/.config/herdr/sessions/i6-accept/`，独立 socket 与 session.json），与 `default` 同时运行。
+
+| 项 | 值 |
+|---|---|
+| Session | `i6-accept`（非默认） |
+| Workspace / Tab / Pane | `w1` / `w1:t1` / `w1:p1` |
+| Team 文件 | `<隔离状态目录>/teams/5940f14f4143682b.json`，`status=ready` |
+| Run | `e1f66ce5dfab`，`status=finished`，`stage_index=5` |
+| 隔离状态目录 | `~/.local/state/herdr-team-i6-accept/` |
+
+**Team 与身份绑定**：
+
+| 角色 | Agent | Pane | `agent_session.value` |
+|---|---|---|---|
+| developer | `developer-w1p2` | `w1:p2` | `b5cd4a03-75b4-451d-a7a3-57209e9cdbe2` |
+| reviewer | `reviewer-w1p3` | `w1:p3` | `17d02554-084b-4bff-b68e-828021a91c56` |
+| Lead | （Happier claude） | `w1:p1` | **`None`** — Happier 不上报 |
+
+**Run 五阶段**：`plan_brief` → `implement` → `self_test` → `code_review` → `accept`，全部 `pass`。
+
+| Dispatch | 角色 | 阶段 | 状态 | `artifact_sha256` 前缀 |
+|---|---|---|---|---|
+| `89aaacccb6` | developer | implement | settled | `bd7b9fd36c59` |
+| `672b3b1311` | developer | self_test | settled | `86961494cc4e` |
+| `05345cf8f9` | reviewer | code_review | settled | `d5b116b0a16c` |
+
+**关键结论**：
+1. **Happier 无需 `HERDR_*` 即可 `init` 成功**（口径修正：0.2.20 实际只缺 `HERDR_ENV`，见 §2）。`lead_identity()` 返回 `session=i6-accept, workspace=w1, pane=w1:p1`，两次探测一致。
+2. **Developer / Reviewer 创建正确且 session 有效**，两者 `agent_session` 均为真实 UUID。
+3. **`plan_brief` 的 Lead 保护实测生效**：对 developer 派单返回 `ERROR: Current stage 'plan_brief' expects lead` + `exit=2`，未被误派。
+4. **真实产物**：`/private/tmp/i6-accept-work/i6-accept-out.txt`，内容 `I6 ACCEPTANCE OK`，17 字节，sha256 `24fbb4a7…`。Reviewer 独立执行 `cat`/`wc -c`/`wc -l`/`od -c`/`md5`/`file` 六条命令核验，未采信转述。
+5. **零错误路由**：`--session` 实测覆盖继承 socket；隔离账本 6 个文件全部写在隔离目录；生产目录 `~/.local/state/herdr-team/` 在验收窗口内零写入；隔离 Run 在 default 视角不可见。
+6. **`artifact_sha256` 是报告 JSON 的哈希，不是产物文件哈希**——两者本就不同对象，已在验收中核对澄清，避免误判。
+
+**原生路径未退化回归（同窗口实测）**：
+- `default` 的 `w0:p1` 内 `HERDR_ENV=1`，`lead_identity()` → `{workspace: w0, lead_pane: w0:p1, session: default}`，两次探测一致 ✅
+- `HERDR_SESSION=fake-session` → `FAIL CLOSED: Herdr 进程归属 session 与环境不一致: 'fake-session' != 'default'` ✅
+- 双 fork 脱离进程树 + 清空 `HERDR_*` → `FAIL CLOSED: 无法定位 Herdr pane: no matching pane` ✅
+- 清空全部 `HERDR_*` 但仍在 Pane 内 → 派生路径成功定位 ✅
+- `uv run pytest -q` → `239 passed, 1 skipped, 127 subtests passed`；`-k native` 20 passed、`-k derived` 16 passed + 11 subtests ✅
+
+**仍未覆盖**：原生 Herdr 路径的**完整 Run**（五阶段）未在本轮重跑；本轮原生侧只做了身份与负例回归，完整 Run 的最近证据仍是 CHANGELOG 中 v4.2.0-beta.2 的 `wF` 联调。因此**不能把本轮 Happier 验收直接等同于"所有启动方式全通过"**。
+
 ---
 
 ## 7. 剩余障碍
 
-**已解决（B 落地后）**：真实 `init`、`status`、`run start`/`run list`、`run drive` 的 Lead 侧上下文；Workspace/Pane 归属不再依赖环境变量。
+**已实现并通过真实端到端验收（B）**：`init`、`status`、`run start`/`run list` 的 Lead 侧上下文可通过进程归属定位，不再依赖 `HERDR_ENV`。**[实测 2026-11-05]** 在 `i6-accept` 非默认 session 中完成 dev-lite 五阶段完整 Run（§6.1）。
 
-**仍需上游（Happier）**：`name-lead` 与 `adopt` 在 Happier 上仍不可用——Happier 的 claude 不上报 `agent_session`（**[实测]** `wH:p5` 为 `null`）。
+**受环境限制不可用（Happier 侧）**：`name-lead` 与 `adopt` 的能力本身已在代码中实现（`adopt` 起于 885，`name_lead` 起于 1018），但在 Happier 环境下不可用——Happier 的 claude 不上报 `agent_session`（**[实测 2026-11-05]** `w1:p1` 的 Lead 与 0.2.17 时的 `wH:p5` 均为 `null`），两个命令都会因身份不可核验而拒绝执行。这是环境限制，不是功能缺失。
+
+**`run drive` 自动模式在 Happier 下的行为**：`run drive` 预检要求全部 Worker 绑定 `agent_session`。本轮 team 的 Worker 是 Herdr 原生启动的 claude，**有**合法 `agent_session`（§6.1），因此该预检会通过；只有 Worker 也无绑定时才返回 `identity_unbound`。**不要预设它一定返回 `identity_unbound`**，应先读 team 文件确认。
 
 **Open Question（阻塞 A 落地，未实测）**：Happier 上报后同一 Pane 的 `agent_session.source` 最终是哪一个？
 
-按真实代码分三处看：
+按真实代码分三处看（行号为当前源码位置）：
 
 | 代码位置 | 比较内容 | 作用范围 | `source` 不同时 |
 |---|---|---|---|
-| `verify_existing`（496-501） | **只比 `value`** | team 角色登记 | 仍可通过 |
-| `name_lead`（919-921） | kind + **`value`**，**不含 source** | Lead 自身 | 仍可通过 |
-| `run_drive.check_identity`（1304-1308） | 逐字段比 `kind`/`source`/`value` | 仅 Run 的**工作角色** | 条件性拒绝 |
+| `verify_existing`（610-615） | **只比 `value`** | team 角色登记 | 仍可通过 |
+| `name_lead`（1041-1044） | kind + **`value`**，**不含 source** | Lead 自身 | 仍可通过 |
+| `run_drive.check_identity`（1436-1442） | 逐字段比 `kind`/`source`/`value` | 仅 Run 的**工作角色** | 条件性拒绝 |
 
 **方案 A 的影响是条件性的，不是全面的。** 具体：
 
-- `check_identity` 在整个 `run_drive` 中只被用于 Run 的工作角色——`:1360-1366` 是 drive 启动前对 `run["roles"]` 的 `identity_unbound` 预检，`:1385` 核对待结算派单的 `rec["role"]`，`:1423-1425` 核对返工目标角色。**Lead 不在这些检查的范围内**，因此 Lead 的 `source` 发生变化不必触发 `run drive` 失败。
+- `check_identity` 在整个 `run_drive` 中只被用于 Run 的工作角色——`:1493-1499` 是 drive 启动前对 `run["roles"]` 的 `identity_unbound` 预检，`:1518` 核对待结算派单的 `rec["role"]`，`:1558` 核对返工目标角色。**Lead 不在这些检查的范围内**，因此 Lead 的 `source` 发生变化不必触发 `run drive` 失败。
 - 只有当**某个工作角色**在登记时保存的 `source` 与实时读到的 `source` 不同时，该角色的 `check_identity` 才会拒绝——即 Happier 写入改变了**该 Worker 的** `agent_session.source` 且与登记值不一致。
 - 若团队在 Happier 环境下从零建立（Worker 登记时就已是 `"happier"`），保存值与实时值一致，`run drive` 可正常推进。
 
@@ -258,7 +317,7 @@ def herdr(*args, timeout=40, session=None):
 - B 扩张 `context()` 的拒绝条件边界；
 - 竞争窗口二选一（接受 / 终态复核）；
 - 跨机场景：iPhone 控制端 + Mac 执行端时，若命令仍在执行端 Mac 的 Pane 内运行，父链本机成立、B 可用；若命令运行在 Pane 之外（手机侧直连 daemon 下发），B 必然 0 命中并 fail closed —— **这是预期行为**，若要支持远端发起只能走方案 C；
-- `docs/trial-guide.md` 与 `SKILL.md` 的"Happier 不兼容"表述需同步收窄。
+- 真实环境验收计划及其资源、清理范围需 Owner 批准后执行（见 §10）。
 
 ---
 
@@ -290,11 +349,27 @@ accept 后取对端 pid（macOS `LOCAL_PEERPID` / Linux `SO_PEERCRED`），映�
 
 ## 9. 已知限制与未验证项
 
-**已知限制**：`state_file` 只以 `workspace|lead_pane` 为键（269-271），不含 session。若两个独立 Herdr server 出现相同的 workspace+pane ID，它们会命中**同一个账本文件**；当前无跨 session 账本防护。加防护必须给账本或其 key 引入 session 维度，与 §4.3 冲突。§4.3 的交叉检查能确认"我属于哪个 session"，但不改变账本键。
+**已知限制 [源码]**：`state_file` 只以 `workspace|lead_pane` 为键（311-313），不含 session。两个独立 server 出现相同 workspace+pane ID 时会命中同一账本路径。当前 panes 扫描对所有 running session 检查 `(workspace_id, pane_id)` 和 `(workspace_id, tab_id)`：同一键出现在不同 session 时，即使不是命中 Pane 也 fail closed；同一 session 内共享 Tab 不触发此跨 session 检查。它不能修复账本键本身：例如两个 session 不同时运行时仍可能复用同一路径。引入 session 维度需要处理 §4.3 的旧账本兼容问题。
+
+**[实测 2026-11-05] 该限制在有真实数据佐证**：隔离 session `i6-accept` 的 team key 为 `5940f14f4143682b`（`sha256("w1|w1:p1")[:16]`），而生产状态目录 `~/.local/state/herdr-team/teams/` 中**恰好存在同名 key 的旧文件**（2026-11-03 的 `dev-review` partial，context 同样是 `w1|w1:p1`）。本次靠 `HTM_STATE_DIR` 隔离而未互相影响，但**键本身不含 session 维度**——若两个 session 共用同一状态目录，会直接命中同一文件。已作为独立 P1 Issue 记录，见 `docs/issues/p1-cross-session-team-ledger-key.md`。
 
 **未验证项**（不得当作已完成）：
-- B 未落地代码，未在真实 Happier Lead 上端到端跑通；
+- B 已落地且有单测覆盖：原生分支双探测一致性、`HERDR_SESSION` / `HERDR_SOCKET_PATH` 冲突、socket 零或多个匹配、session list 失败 fail closed、第二轮探测失败无副作用、`require=False` 不探测、session 以 `--session` 注入 argv。**[实测 2026-11-05]** Happier + 非默认 session 的完整 Run 已通过（§6.1）；
+- **原生 Herdr 路径的完整 Run（五阶段）本轮未重跑**：只做了身份正确性与负例 fail closed 回归。最近一次原生完整 Run 证据仍是 v4.2.0-beta.2 的 `wF` 联调。**不得把本轮 Happier 验收等同于"所有启动方式全通过"**；
+- 跨 session 同名 Pane/Tab ID 的 fail closed 行为**只有单测覆盖**，本轮两个 session 的 ID 空间恰好无交集（`default`: `wX`/`w0`/`w12`；`i6-accept`: `w1`），**未在真实冲突条件下验证**；
 - `source` 仲裁未实测（§7）；
-- 跨 session Pane ID 是否唯一无证据（本机仅一台 running server）；
 - `happier session create --env` 能否让 `HERDR_*` 穿透统一终端白名单未实测，且即便可行也不应采纳（等同用户自报身份）；
-- `pane.report_agent` 与 `pane.report_agent_session` 是否互相覆盖状态未验证。
+- `pane.report_agent` 与 `pane.report_agent_session` 是否互相覆盖状态未验证；
+- **Happier Lead 仍会自发启动后台子代理**：本轮三次派单中有两次 Happier Lead 自动起了 `general-purpose` 子代理（14s / 32s 后返回，未卡死）。历史事故中的同款模式仍然存在，HTM 无法从 Worker 侧阻止，只能靠派单 prompt 约束。
+
+## 10. 实现与验收现状
+
+| 状态 | 范围 |
+|---|---|
+| **已真实端到端验收（Happier + 非默认 session）** | `i6-accept` 中执行 `init dev-lite --worktree off`、创建 developer/reviewer、完整走完 dev-lite 五阶段并 `run finish`（Run `e1f66ce5dfab`）。含真实产物、Reviewer 独立核验、零错误路由、账本全程写入隔离目录。证据见 §6.1。 |
+| 已实现并单测覆盖，真实冲突条件未验证 | 父链与 `process-info` 定位、原生身份交叉验证、两轮探测、`--session` 显式路由、`HERDR_SESSION`/`HERDR_SOCKET_PATH` 冲突 fail closed、跨 session Pane/Tab 冲突拒绝。其中**跨 session ID 冲突的 fail closed 只有单测**——本轮两个 session 的 ID 空间恰好无交集。 |
+| 原生路径：身份与负例已验证，完整 Run 未在本轮重跑 | `default` 内 `lead_identity()` 正确、`HERDR_SESSION` 冲突 fail closed、双 fork 脱离进程树 fail closed、清空 `HERDR_*` 后派生路径仍可定位。但原生侧**完整五阶段 Run** 的最近证据仍是 v4.2.0-beta.2 的 `wF` 联调。 |
+| 受环境限制不可用 | Happier 环境下 Lead/Worker 缺失 `agent_session` 时的 `name-lead`、`adopt`。**能力已在代码中实现**，仅因无 `agent_session` 可核验而按身份要求拒绝执行；属环境限制，不是功能缺失。 |
+| 已知设计限制（需独立 P1 Issue 解决） | 跨 session Team/Run 账本键冲突：`state_file` 键为 `sha256("workspace|lead_pane")[:16]`，不含 session 维度。见 `docs/issues/p1-cross-session-team-ledger-key.md`。 |
+
+**验收计划状态**：`docs/design/issue6-nondefault-session-acceptance-plan.md` 的 A–G 用例中，A（双 session 归属）、B（派生路径）、C（显式路由，以 `--session` 行为与返回值取证）、E（非 Pane 环境 fail closed）、G（Run 生命周期）已在 2026-11-05 实测覆盖；D（跨 session ID 冲突）因本轮 ID 空间无交集未触发，仍为单测覆盖；F（账本键限制）结论为「本项不可验证」，已被真实数据佐证为 P1 问题。

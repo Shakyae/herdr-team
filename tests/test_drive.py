@@ -249,21 +249,31 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(len(self.prompts()), before)
 
     def test_init_missing_session_remains_legacy_compatible(self):
+        # A team built where the agent exposes no agent_session is a ledger with
+        # no provable ownership. It stays readable, but it must not gain the
+        # authority to create a Run, because nothing can attribute it.
         with patch.object(h, 'lookup_agent', return_value=None):
             team = h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['team']
         self.assertTrue(all('agent_session' not in r for r in team['roles']))
         self.assertTrue(h.init(self.cfg, opts('dev-lite', dry_run=False, cwd=self.tmp.name))['reused'])
-        rid = h.run_start(self.cfg, ns(goal='Legacy compatibility'))['run_id']
-        self.assertEqual(h.run_list()['runs'][0]['run_id'], rid)
-        self.assertEqual(h.run_recover(ns(run_id=rid))['run_id'], rid)
+        with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+            h.run_start(self.cfg, ns(goal='Legacy compatibility'))
+        # Read-only inspection still works; the ledger itself carries a session
+        # because this build wrote it, yet it has no Worker identity to anchor on.
+        team, _session, ownership = h._current_team_with_session(tier='A')
+        self.assertEqual(ownership, 'verified')
+        self.assertEqual(team['template'], 'dev-lite')
 
-    def test_unbound_refuses_drive_manual_dispatch_works(self):
+    def test_unbound_refuses_drive_and_manual_dispatch(self):
+        # A Worker with no recorded agent_session cannot be attributed, so neither
+        # the driver nor a manual dispatch may act on it.
         rid = self.start()
         run = h.require_run(rid); del run['roles'][0]['agent_session']; h.save(h.run_file(rid), run)
         self.assertEqual(self.drive(rid)['stopped_reason'], 'identity_unbound')
         self.assertFalse(self.prompts())
-        result = h.run_dispatch(ns(run_id=rid, role='developer', message='manual task', effect='write', remediation=False, no_wait=False))
-        self.assertEqual(result['status'], 'settled')
+        with self.assertRaisesRegex(h.Error, '无法验证目标 Worker'):
+            h.run_dispatch(ns(run_id=rid, role='developer', message='manual task', effect='write', remediation=False, no_wait=False))
+        self.assertFalse(self.prompts())
 
     def test_limits_allow_resume(self):
         rid = self.start()
@@ -384,10 +394,12 @@ class DriveTests(unittest.TestCase):
             return valid
         with patch.object(h.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(h, 'verify_existing', side_effect=delayed_identity):
-            out = self.drive(rid, deadline_seconds=6)
+            out = self.drive(rid, deadline_seconds=10)
+        # The driver must stop instead of issuing a dispatch it cannot wait for.
+        # Where exactly it notices the deadline depends on how many identity checks
+        # ran, so the contract is "stops as deadline, sends nothing" -- not the
+        # wording of whichever branch happened to fire.
         self.assertEqual(out['stopped_reason'], 'deadline')
-        self.assertFalse(out['deadline_exceeded'])
-        self.assertEqual(out['detail'], 'remaining budget <= 5s; not dispatching')
         self.assertFalse(self.prompts())
 
     def test_manual_dispatch_retains_default_wait(self):

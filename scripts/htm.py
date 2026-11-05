@@ -319,6 +319,93 @@ def run_file(runid):
     return STATE / "runs" / (runid + ".json")
 
 
+def ledger_ownership(data, session, path):
+    """Classify ledger ownership: 'verified' | 'legacy'; raise when it belongs elsewhere.
+
+    The recorded session name is a weak signal -- a session can be stopped and
+    recreated under the same name with the same IDs but different agents. It is
+    therefore only used to reject ledgers that clearly belong to another session.
+    """
+    recorded = data.get("session")
+    if recorded is None:
+        return "legacy"
+    if recorded != session:
+        raise Error(f"账本 {path} 属于 session {recorded!r}，当前 session 为 {session!r}；"
+                    f"拒绝跨 session 操作。多 session 场景请为每个 session 设置独立的 HTM_STATE_DIR")
+    return "verified"
+
+
+# Only these verify_existing failures are contradictions about *who* the agents
+# are. Everything else (agent gone, pane lookup unavailable) is an observability
+# failure that must not be mislabelled as an ownership conflict.
+_IDENTITY_CONFLICT_MARKERS = ("identity changed", "unexpected pane", "unexpected kind",
+                              "identity or pane cannot be verified")
+
+
+def _inspect_roles(data, session):
+    """Classify each recorded Worker identity against the live Herdr state.
+
+    Returns (verified, total, conflicts, unavailable):
+      verified    -- UUID matched live
+      total       -- roles that recorded an agent_session at all
+      conflicts   -- identity contradictions (never tolerated)
+      unavailable -- role could not be observed (tolerable, workers die)
+    """
+    verified = total = 0
+    conflicts, unavailable = [], []
+    for role in data.get("roles", []):
+        if not (role.get("agent_session") or {}).get("value"):
+            continue
+        total += 1
+        try:
+            if verify_existing(role, session=session):
+                verified += 1
+        except Error as e:
+            message = str(e)
+            (conflicts if any(m in message for m in _IDENTITY_CONFLICT_MARKERS)
+             else unavailable).append(f"Agent {role.get('agent_name')}: {message}")
+    return verified, total, conflicts, unavailable
+
+
+def require_roles_owned(data, session, path):
+    """Prove ledger ownership through Worker agent_session UUIDs.
+
+    A session name alone is weak evidence: a session can be stopped and recreated
+    under the same name with the same IDs but different agents. Callers therefore
+    invoke this for tier C regardless of whether the ledger recorded a session.
+
+    A single matching UUID anchors ownership because workers can legitimately
+    die. Any identity contradiction rejects the whole ledger, because it means
+    these are demonstrably not the agents the ledger describes.
+    """
+    verified, total, conflicts, unavailable = _inspect_roles(data, session)
+    if conflicts:
+        raise Error(f"账本 {path} 存在角色身份冲突，拒绝执行：" + "；".join(conflicts))
+    if total == 0:
+        raise Error(f"账本 {path} 未记录任何 Worker 身份，无法证明归属；拒绝执行会产生副作用的操作")
+    if verified == 0:
+        detail = ("；不可观察：" + "；".join(unavailable)) if unavailable else ""
+        raise Error(f"账本 {path} 的 Worker 均无法在当前 session 内验证身份；无法证明该账本属于当前 session。"
+                    f"如确认应归属当前 session，请检查 Worker 是否仍在运行{detail}")
+    return verified, unavailable
+
+
+def require_target_role(data, session, role_name, path):
+    """Verify the specific Worker a dispatch/collect is about to act on.
+
+    Ledger-level anchoring is not enough: another role matching says nothing
+    about whether *this* Worker is the one the ledger named.
+    """
+    role = next((r for r in data.get("roles", []) if r.get("role") == role_name), None)
+    if role is None:
+        raise Error(f"Unknown worker role {role_name} in ledger {path}")
+    if not (role.get("agent_session") or {}).get("value"):
+        raise Error(f"账本 {path} 的角色 {role_name} 未记录 Worker 身份；无法验证目标 Worker，拒绝执行")
+    if not verify_existing(role, session=session):
+        raise Error(f"目标 Worker {role.get('agent_name')} 不在当前 session 内，拒绝针对它的操作")
+    return role
+
+
 def save(path, data):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=".htm-", dir=path.parent)
@@ -788,6 +875,10 @@ def init(cfg, args):
             old = load(path)
             if old.get("version") != 3:
                 raise Error("Legacy v4.1 team state cannot be automatically adopted; inspect/close existing sessions and migrate manually")
+            # Reusing a team is a state-changing action: a ledger that belongs to
+            # another session must never be adopted silently, even if its config
+            # happens to match.
+            ledger_ownership(old, herdr_session, path)
             if (old.get("template") != args.template or
                     json.dumps(old.get("plan"), sort_keys=True) != json.dumps(plan, sort_keys=True) or
                     old.get("cwd") != str(cwd) or old.get("worktree") != requested_wt):
@@ -817,7 +908,8 @@ def init(cfg, args):
         wt = requested_wt
         work_cwd = str(wt["path"]) if wt else str(cwd)
         roles = []
-        team = {"version": 3, "template": args.template, "context": ctx, "created_at": now(),
+        team = {"version": 3, "template": args.template, "context": ctx, "session": herdr_session,
+                "created_at": now(),
                 "status": "partial", "roles": roles, "plan": plan, "cwd": str(cwd), "worktree": wt,
                 "resources": [], "pending_operation": None}
         save(path, team)
@@ -982,7 +1074,8 @@ def adopt(cfg, args):
                 raise Error("Hermes profile mismatch")
             profile_check(role["profile"])
         roles.append(info)
-    team = {"version": 3, "template": args.template, "context": ctx, "created_at": now(),
+    team = {"version": 3, "template": args.template, "context": ctx, "session": herdr_session,
+            "created_at": now(),
             "status": "ready", "roles": roles, "plan": plan, "cwd": roles[0]["cwd"],
             "worktree": None, "resources": [], "pending_operation": None, "adopted": True}
     if args.dry_run:
@@ -1002,17 +1095,21 @@ def adopt(cfg, args):
     return {"adopted": True, "team": team}
 
 
-def _current_team_with_session():
+def _current_team_with_session(tier="C"):
     identity = lead_identity()
     ctx = identity["context"]
     path = state_file(ctx)
     if not path.exists():
         raise Error("No registered team for this Lead pane; use init first")
-    return load(path), identity["session"]
+    team = load(path)
+    ownership = ledger_ownership(team, identity["session"], path)
+    if tier == "C":
+        require_roles_owned(team, identity["session"], path)
+    return team, identity["session"], ownership
 
 
-def current_team():
-    return _current_team_with_session()[0]
+def current_team(tier="C"):
+    return _current_team_with_session(tier=tier)[0]
 
 
 def name_lead(args):
@@ -1078,24 +1175,42 @@ def name_lead(args):
             "agent_session": {k: session.get(k) for k in ("kind", "source", "value")}, "verified": True}
 
 
-def _require_run_with_session(runid):
-    data = load(run_file(runid))
+def _require_run_with_session(runid, tier="C", target_role=None):
+    """Load a Run and enforce ledger ownership for the caller's tier.
+
+    tier 'A' (read-only) and 'B' (safe stop) tolerate an unprovable ledger;
+    'C' covers every state-changing or dispatching operation and always proves
+    ownership through Worker UUIDs -- a matching session name is never enough on
+    its own, since the session may have been recreated with the same name.
+    """
+    path = run_file(runid)
+    data = load(path)
     if data.get("version") != 3:
         raise Error("Legacy Run state is not compatible with v4.2 result protocol; do not resend tasks automatically")
     identity = lead_identity()
     ctx = identity["context"]
     if data.get("context") != ctx:
         raise Error("Run belongs to a different Lead pane/session")
-    return data, identity["session"]
+    ownership = ledger_ownership(data, identity["session"], path)
+    if tier == "C":
+        require_roles_owned(data, identity["session"], path)
+        if target_role is not None:
+            require_target_role(data, identity["session"], target_role, path)
+    return data, identity["session"], ownership
 
 
-def require_run(runid):
-    return _require_run_with_session(runid)[0]
+def require_run(runid, tier="A", target_role=None):
+    """Load a Run for callers that do not need the Herdr session.
+
+    Defaults to read-only tier so that purely informational paths never gain
+    state-changing authority by accident.
+    """
+    return _require_run_with_session(runid, tier=tier, target_role=target_role)[0]
 
 
 def run_start(cfg, args):
     with locked():
-        team, herdr_session = _current_team_with_session()
+        team, herdr_session, _own = _current_team_with_session(tier="C")
         if team["status"] != "ready": raise Error("Team is not ready")
         for role in team["roles"]:
             if not verify_existing(role, session=herdr_session): raise Error(f"Agent {role['agent_name']} not available")
@@ -1110,7 +1225,8 @@ def run_start(cfg, args):
             if names & used:
                 raise Error(f"Worker(s) reserved by unfinished Run {other.get('id')}; inspect/resume it, do not start a conflicting Run")
         runid = uuid.uuid4().hex[:12]
-        run = {"version": 3, "id": runid, "team": team["template"], "context": team["context"], "goal": args.goal,
+        run = {"version": 3, "id": runid, "team": team["template"], "context": team["context"],
+               "session": herdr_session, "goal": args.goal,
                "status": "active", "created_at": now(), "stage_index": 0, "stage_attempt": 1, "round": 1,
                "stages": team["plan"]["workflow"], "stage_definitions": team["plan"]["stages"],
                "roles": team["roles"], "settings": copy.deepcopy(team["plan"]["settings"]),
@@ -1214,7 +1330,8 @@ def reconcile_result(run, rec, observed_status):
 
 
 def run_dispatch(args):
-    run, herdr_session = _require_run_with_session(args.run_id)
+    run, herdr_session, _own = _require_run_with_session(
+        args.run_id, tier="C", target_role=args.role)
     if run["status"] != "active": raise Error("Run is not active")
     stage = stage_info(run)
     expected_index = run["stage_index"]
@@ -1261,7 +1378,7 @@ def run_dispatch(args):
             f"A terminal message alone is not a report. This JSON is a worker assertion, not independent proof. "
             f"List any unverified claims and blockers. Never falsify test results.\n\n{args.message}")
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         if run["status"] != "active" or run["stage_index"] != expected_index:
             raise Error("Run changed before dispatch; inspect status")
         if any(x["role"] == args.role and x["stage_index"] == run["stage_index"]
@@ -1301,7 +1418,7 @@ def run_dispatch(args):
         result = herdr(*cmd, timeout=timeout_ms/1000 + (15 if wait_timeout is None else 0), session=herdr_session)
         if args.no_wait:
             with locked():
-                run = require_run(args.run_id)
+                run = require_run(args.run_id, tier="C")
                 rec = next(x for x in run["dispatches"] if x["id"] == stamp)
                 rec["status"] = "submitted_unsettled"
                 save(run_file(args.run_id), run)
@@ -1311,7 +1428,7 @@ def run_dispatch(args):
         # independently verified before settling.
         st = agent_status_of(result)
         with locked():
-            run = require_run(args.run_id)
+            run = require_run(args.run_id, tier="C")
             rec = next(x for x in run["dispatches"] if x["id"] == stamp)
             rec.update(reconcile_result(run, rec, st))
             save(run_file(args.run_id), run)
@@ -1323,7 +1440,7 @@ def run_dispatch(args):
         # survive even if re-reading the ledger fails (e.g. an unstable identity probe).
         try:
             with locked():
-                run = require_run(args.run_id)
+                run = require_run(args.run_id, tier="C")
                 rec = next(x for x in run["dispatches"] if x["id"] == stamp)
                 rec["error"] = str(e); save(run_file(args.run_id), run)
         except Error as recovery:
@@ -1339,15 +1456,18 @@ def herdr_read(name):
 
 
 def run_collect(args):
-    run, herdr_session = _require_run_with_session(args.run_id)
+    run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
     rec = next((x for x in reversed(run["dispatches"]) if x["id"] == args.dispatch_id), None)
     if rec is None: raise Error("Unknown dispatch ID")
+    # The dispatch is what identifies the Worker here, so the target check has to
+    # happen after resolving it rather than at ledger-load time.
+    require_target_role(run, herdr_session, rec["role"], run_file(args.run_id))
     role = get_role(run, rec["role"])
     if not verify_existing(role, session=herdr_session): raise Error("Registered Agent is no longer live")
     agent = lookup_agent(role["agent_name"], session=herdr_session)
     st = agent_status_of(agent)
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         rec = next(x for x in run["dispatches"] if x["id"] == args.dispatch_id)
         if rec["status"] != "settled":
             rec.update(reconcile_result(run, rec, st))
@@ -1359,7 +1479,7 @@ def run_collect(args):
 
 def run_gate(args):
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         if run["status"] != "active": raise Error("Run is not active")
         stage = stage_info(run)
         actor = stage["actor"]
@@ -1482,7 +1602,7 @@ def run_drive(args):
             return result()
         try:
             with locked():
-                run = require_run(runid)
+                run = require_run(runid, tier="C")
                 events = [e for e in run["events"] if e.get("type") in ("driver_started", "driver_stopped")]
                 if events and events[-1]["type"] == "driver_started" and not args.resume:
                     reason, detail = "resume_required", "Previous drive interrupted; use --resume"
@@ -1501,7 +1621,10 @@ def run_drive(args):
                 save(path, run)
                 started = True
             while True:
-                run, herdr_session = _require_run_with_session(runid)
+                # Ownership was proven once before entering the loop; re-proving it
+                # on every iteration would repeat the same Herdr round-trips. The
+                # per-iteration identity check below still guards each Worker.
+                run, herdr_session, _own = _require_run_with_session(runid, tier="A")
                 if run["status"] != "active":
                     reason = "round_limit" if run["status"] == "blocked_round_limit" else "run_not_active"
                     break
@@ -1641,12 +1764,16 @@ def run_drive(args):
                 if rec["id"] not in dispatches:
                     dispatches.append(rec["id"])
         except (Error, OSError, KeyError, TypeError, ValueError) as e:
-            reason, detail = "error", str(e)
+            # Ledger/Worker identity failures are a distinct, actionable stop
+            # reason; collapsing them into "error" hides why the driver refused.
+            message = str(e)
+            reason = "identity" if any(m in message for m in _IDENTITY_CONFLICT_MARKERS) else "error"
+            detail = message
         finally:
             if started:
                 try:
                     with locked():
-                        run = require_run(runid)
+                        run = require_run(runid, tier="B")
                         run["events"].append({"type": "driver_stopped", "at": now(), "reason": reason})
                         save(path, run)
                 except (Error, OSError, KeyError, TypeError, ValueError) as e:
@@ -1658,7 +1785,7 @@ def run_drive(args):
 
 def run_finish(args):
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="C")
         if run["status"] != "active": raise Error(f"Run status {run['status']}; cannot finish")
         if run["stage_index"] != len(run["stages"]):
             raise Error(f"Cannot finish; next required stage is {stage_info(run)['stage']}")
@@ -1673,11 +1800,18 @@ def run_finish(args):
 
 
 def run_pause(args, paused):
+    # Pausing is the fail-safe stop and stays available when identity cannot be
+    # proven (tier B); resuming re-arms dispatch, so it requires proof (tier C).
     with locked():
-        run = require_run(args.run_id)
+        run, _session, ownership = _require_run_with_session(
+            args.run_id, tier="B" if paused else "C")
         if paused:
             if run["status"] != "active": raise Error("Only active run can be paused")
             run["status"] = "paused"
+            event = {"at": now(), "type": "pause"}
+            if ownership == "legacy":
+                event["identity"] = "unverified"
+            run["events"].append(event)
         else:
             if run["status"] not in ("paused", "blocked", "blocked_round_limit"):
                 raise Error("Only paused/blocked run can resume")
@@ -1686,14 +1820,15 @@ def run_pause(args, paused):
             if args.extend_rounds:
                 raise Error("Round-limit extension disabled until independent Owner authentication is available")
             run["status"] = "active"
-        run["events"].append({"at": now(), "type": "pause" if paused else "resume"})
+            run["events"].append({"at": now(), "type": "resume"})
         save(run_file(args.run_id), run)
-    return {"status": run["status"], "run_id": args.run_id}
+    return {"status": run["status"], "run_id": args.run_id, "ledger_session": ownership}
 
 
 def run_list():
     """Discover orphaned/paused work without performing any new dispatch."""
-    ctx = context()
+    identity = lead_identity()
+    ctx, current = identity["context"], identity["session"]
     result = []
     with locked():
         for p in sorted((STATE / "runs").glob("*.json")):
@@ -1704,14 +1839,15 @@ def run_list():
                 continue
             pending = [d["id"] for d in run.get("dispatches", []) if d["status"] not in ("settled",)]
             result.append({"run_id": run["id"], "status": run["status"],
-                           "stage": stage_info(run)["stage"], "pending_dispatches": pending})
+                           "stage": stage_info(run)["stage"], "pending_dispatches": pending,
+                           "ledger_session": ledger_ownership(run, current, p)})
     return {"runs": result, "unfinished": [x for x in result if x["status"] not in ("finished", "cancelled")]}
 
 
 def run_recover(args):
     """Read-only reconciliation hint. Never resend uncertain prompts."""
     with locked():
-        run = require_run(args.run_id)
+        run = require_run(args.run_id, tier="A")
         pending = [d for d in run.get("dispatches", []) if d["status"] not in ("settled",)]
         return {"run_id": run["id"], "run_status": run["status"], "current_stage": stage_info(run),
                 "pending_dispatches": [{"id": d["id"], "role": d["role"],
@@ -1724,7 +1860,7 @@ def run_recover(args):
 def run_cancel(args):
     """Explicitly mark a Run abandoned; never claim completion or delete workers."""
     with locked():
-        run, herdr_session = _require_run_with_session(args.run_id)
+        run, herdr_session, _own = _require_run_with_session(args.run_id, tier="C")
         if run["status"] in ("finished", "cancelled"):
             raise Error("Run is already terminal")
         if args.confirm_run_id != args.run_id or len(args.reason.strip()) < 12:
@@ -1824,7 +1960,7 @@ def main():
         if args.cmd == "adopt": emit(adopt(cfg, args)); return 0
         if args.cmd == "name-lead": emit(name_lead(args)); return 0
         if args.cmd == "status":
-            team, herdr_session = _current_team_with_session()
+            team, herdr_session, ownership = _current_team_with_session(tier="A")
             live = []
             for r in team["roles"]:
                 actual = lookup_agent(r["agent_name"], session=herdr_session)
@@ -1832,12 +1968,12 @@ def main():
                              "registered_pane": r["pane_id"], "live": bool(actual),
                              "observed_state": agent_status_of(actual) if isinstance(actual, dict) else "missing"})
             emit({"template": team["template"], "stored_status": team["status"], "agents": live,
-                  "worktree": team.get("worktree")}); return 0
+                  "worktree": team.get("worktree"), "ledger_session": ownership}); return 0
         if args.cmd == "run":
             if args.run_cmd == "start": emit(run_start(cfg, args)); return 0
             if args.run_cmd == "list": emit(run_list()); return 0
             if args.run_cmd in ("status", "stage"):
-                run = require_run(args.run_id)
+                run = require_run(args.run_id, tier="A")
                 emit(run if args.run_cmd == "status" else stage_info(run)); return 0
             action = {"approve": run_approve, "dispatch": run_dispatch, "collect": run_collect, "gate": run_gate,
                       "finish": run_finish, "pause": lambda a: run_pause(a,True),

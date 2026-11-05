@@ -888,10 +888,10 @@ class AdversarialTests(unittest.TestCase):
                 state['prompt_failed'] = True
                 raise h.Error('timeout')
             raise h.Error('identity probe unstable')
-        def require_run(runid):
+        def require_run(runid, **kwargs):
             if state['prompt_failed']:
                 raise h.Error('identity probe unstable')
-            return original_require_run(runid)
+            return original_require_run(runid, **kwargs)
         with patch.object(h, 'herdr', side_effect=broken), \
                 patch.object(h, 'require_run', side_effect=require_run):
             with self.assertRaisesRegex(h.Error, 'uncertain.*might have been sent.*State recheck also failed'):
@@ -1731,6 +1731,221 @@ class AdoptNamingTests(AdoptTests):
         with self.assertRaisesRegex(h.Error, 'missing'): self.adopt()
         # Rejected during validation; no Herdr read or write is attempted at all.
         self.assertFalse(self.calls)
+
+
+class LedgerIdentityTests(unittest.TestCase):
+    """Cross-session ledger ownership: session names are a weak signal only.
+
+    A Herdr session can be stopped and recreated under the same name with the
+    same workspace/pane IDs but entirely different agents, so ownership of a
+    legacy ledger must be proven through Worker agent_session UUIDs.
+    """
+
+    def setUp(self):
+        test_htm.RuntimeTests.setUp(self)
+        h.init(self.cfg, opts('research', dry_run=False, cwd=self.tmp.name))
+        self.rid = h.run_start(self.cfg, ns(goal='Ledger ownership regression'))['run_id']
+        # The fake Herdr does not report agent_session; supply the live UUIDs so
+        # verify_existing can exercise the real comparison logic.
+        self.live = {role['agent_name']: {'pane_id': role['pane_id'], 'kind': role['kind'],
+                                          'cwd': role['cwd'], 'status': 'idle',
+                                          'agent_session': {'agent': role['kind'], 'kind': 'id',
+                                                            'source': 'herdr:claude',
+                                                            'value': 'live-uuid-' + role['pane_id']}}
+                     for role in h.require_run(self.rid)['roles']}
+        live = self.live
+        lookup = patch.object(h, 'lookup_agent', side_effect=lambda n, **kw: live.get(n))
+        lookup.start(); self.addCleanup(lookup.stop)
+
+    def ledger(self, rid=None, **changes):
+        path = h.run_file(rid or self.rid)
+        data = json.loads(path.read_text())
+        data.update(changes)
+        path.write_text(json.dumps(data))
+        return path
+
+    def ledger_with_uuids(self, uuid_for=None):
+        """Rewrite the Run as a pre-fix (session-less) ledger with explicit Worker UUIDs.
+
+        The fake Herdr records each started agent without an agent_session, so the
+        ledger roles are seeded here: that is exactly the legacy shape under test.
+        """
+        path = h.run_file(self.rid)
+        data = json.loads(path.read_text())
+        data.pop('session', None)
+        for role in data['roles']:
+            role['agent_session'] = {'agent': role['kind'], 'kind': 'id', 'source': 'herdr:claude',
+                                     'value': (uuid_for or {}).get(role['role'], 'live-uuid-' + role['pane_id'])}
+        path.write_text(json.dumps(data))
+        return data
+
+    def test_new_ledger_records_session(self):
+        self.assertEqual(h.require_run(self.rid)['session'], 'default')
+        team = json.loads(h.state_file(h.context()).read_text())
+        self.assertEqual(team['session'], 'default')
+
+    def test_new_ledger_session_mismatch_rejects_every_tier(self):
+        self.ledger(session='other-session')
+        for tier in ('A', 'B', 'C'):
+            with self.subTest(tier=tier):
+                with self.assertRaisesRegex(h.Error, '属于 session'):
+                    h.require_run(self.rid, tier=tier)
+
+    def test_legacy_ledger_readonly_tier_allowed(self):
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_legacy_ledger_writable_when_uuid_matches(self):
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='C')['id'], self.rid)
+
+    def test_legacy_ledger_rejects_after_session_reuse(self):
+        # The original session is gone; a new single-session context reuses the
+        # same IDs but presents different Worker UUIDs. Counting running
+        # sessions would not catch this -- only UUID comparison does.
+        role = h.require_run(self.rid)['roles'][0]['role']
+        self.ledger_with_uuids({role: '00000000-dead-beef-0000-000000000000'})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+        # Read-only diagnostics still work.
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_same_name_session_recreated_different_uuid_rejected(self):
+        # Session name matches ('default') but the Workers are different agents.
+        # The session name alone must never be treated as proof of identity.
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '11111111-dead-beef-0000-000000000000' for r in data['roles']})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_verified_ledger_also_checks_worker_uuids(self):
+        # A ledger that records a matching session must still prove its Workers:
+        # the session could have been recreated under the same name.
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.assertEqual(data['session'], 'default')
+        for role in data['roles']:
+            role['agent_session'] = {'agent': role['kind'], 'kind': 'id', 'source': 'herdr:claude',
+                                     'value': '99999999-dead-beef-0000-000000000000'}
+        path = h.run_file(self.rid); path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+        # Read-only stays available.
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_verified_ledger_with_unbound_role_is_not_permissive(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        for role in data['roles']:
+            role.pop('agent_session', None)
+        path = h.run_file(self.rid); path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+            h.require_run(self.rid, tier='C')
+
+    def test_unobservable_worker_is_not_reported_as_conflict(self):
+        # A live-but-unreadable Worker is an observability gap, not a claim that
+        # the ledger belongs to someone else; tier C still has an anchor here.
+        role = h.require_run(self.rid)['roles'][0]
+        self.live[role['agent_name']] = {k: v for k, v in self.live[role['agent_name']].items()
+                                         if k != 'pane_id'}
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='C')['id'], self.rid)
+
+    def test_role_conflict_rejects_even_when_other_role_matches(self):
+        role = h.require_run(self.rid)['roles'][0]['role']
+        self.ledger_with_uuids({role: '22222222-dead-beef-0000-000000000000'})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.require_run(self.rid, tier='C')
+
+    def test_pause_allowed_without_identity_but_records_unverified(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '33333333-dead-beef-0000-000000000000' for r in data['roles']})
+        out = h.run_pause(ns(run_id=self.rid, extend_rounds=0), True)
+        self.assertEqual(out['status'], 'paused')
+        events = json.loads(h.run_file(self.rid).read_text())['events']
+        self.assertEqual(events[-1].get('identity'), 'unverified')
+
+    def test_resume_requires_identity(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '44444444-dead-beef-0000-000000000000' for r in data['roles']})
+        h.run_pause(ns(run_id=self.rid, extend_rounds=0), True)
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.run_pause(ns(run_id=self.rid, extend_rounds=0), False)
+
+    def test_finish_requires_identity(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '55555555-dead-beef-0000-000000000000' for r in data['roles']})
+        with self.assertRaisesRegex(h.Error, '身份冲突'):
+            h.run_finish(ns(run_id=self.rid))
+
+    def test_legacy_ledger_without_any_worker_identity_rejected(self):
+        path = h.run_file(self.rid)
+        data = json.loads(path.read_text())
+        data.pop('session', None)
+        for role in data['roles']:
+            role.pop('agent_session', None)
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(h.Error, '未记录任何 Worker 身份'):
+            h.require_run(self.rid, tier='C')
+
+    def test_rejection_leaves_ledger_untouched(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '66666666-dead-beef-0000-000000000000' for r in data['roles']})
+        path = h.run_file(self.rid)
+        before = path.read_text()
+        with self.assertRaises(h.Error):
+            h.require_run(self.rid, tier='C')
+        self.assertEqual(path.read_text(), before)
+
+    def test_pause_does_not_derive_other_actions(self):
+        data = json.loads(h.run_file(self.rid).read_text())
+        self.ledger_with_uuids({r['role']: '77777777-dead-beef-0000-000000000000' for r in data['roles']})
+        before = len(self.actions)
+        h.run_pause(ns(run_id=self.rid, extend_rounds=0), True)
+        derived = [a for a in self.actions[before:] if a[:2] in (('agent','prompt'), ('agent','start'))]
+        self.assertFalse(derived)
+
+    def test_partial_roles_verified_allows_ops(self):
+        # One Worker is gone (unobservable), the other still anchors ownership.
+        roles = h.require_run(self.rid)['roles']
+        gone = roles[0]['agent_name']
+        del self.live[gone]
+        self.ledger_with_uuids()
+        self.assertEqual(h.require_run(self.rid, tier='C')['id'], self.rid)
+
+    def test_all_roles_dead_blocks_side_effects(self):
+        self.live.clear()
+        self.ledger_with_uuids()
+        with self.assertRaisesRegex(h.Error, '均无法在当前 session 内验证身份'):
+            h.require_run(self.rid, tier='C')
+        self.assertEqual(h.require_run(self.rid, tier='A')['id'], self.rid)
+
+    def test_dispatch_verifies_target_worker_not_just_any_role(self):
+        # One role keeps a matching UUID; the dispatch target does not. Ledger-level
+        # anchoring would pass, so the per-target check has to reject on its own.
+        roles = h.require_run(self.rid)['roles']
+        target = roles[0]['role']
+        self.ledger_with_uuids({target: '88888888-dead-beef-0000-000000000000'})
+        with self.assertRaisesRegex(h.Error, 'identity changed'):
+            h.run_dispatch(ns(run_id=self.rid, role=target, message='Never delivered',
+                              effect='read', no_wait=False, remediation=False,
+                              wait_timeout_seconds=None))
+
+
+class LedgerProbeTests(unittest.TestCase):
+    """The ownership probe itself, exercised without the boundary stub."""
+
+    def test_session_list_failure_fails_closed(self):
+        # A failing `herdr session list` must surface as an error, never as
+        # "no session found so skip the check".
+        def boom(*args, **kwargs):
+            raise h.Error('session list unavailable')
+        with patch.object(h, 'herdr', side_effect=boom):
+            with self.assertRaisesRegex(h.Error, '无法定位 Herdr pane'):
+                h.pane_of_current_process()
+
+    def test_zero_running_sessions_fails_closed(self):
+        with patch.object(h, 'herdr', return_value={'sessions': []}):
+            with self.assertRaisesRegex(h.Error, '无法定位 Herdr pane'):
+                h.pane_of_current_process()
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
